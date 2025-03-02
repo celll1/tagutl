@@ -207,6 +207,8 @@ class EVA02WithModuleLoRA(nn.Module):
         # モデルの期待する画像サイズを取得
         self.img_size = self.backbone.patch_embed.img_size
         self.pretrained_cfg = self.backbone.pretrained_cfg
+        self.transform = create_transform(**resolve_data_config(self.pretrained_cfg, model=self.backbone))
+
         print(f"モデルの期待する画像サイズ: {self.img_size}")
         
         # 特徴量の次元を取得
@@ -407,8 +409,25 @@ def load_model(model_path=None, device=torch_device):
     
     return model, labels
 
+# タグの正規化関数を拡張
+def normalize_tag(tag, remove_special_prefixes=True):
+    """タグを正規化する関数（スペースをアンダースコアに変換、エスケープ文字を処理など）"""
+    # スペースをアンダースコアに変換
+    tag = tag.replace(' ', '_')
+    
+    # エスケープされた文字を処理（例: \( → (）
+    tag = re.sub(r'\\(.)', r'\1', tag)
+    
+    # 特殊プレフィックス（a@, g@など）を削除するオプション
+    if remove_special_prefixes and re.match(r'^[a-zA-Z]@', tag):
+        tag = tag[2:]  # プレフィックスを削除
+    
+    # 連続するアンダースコアを1つに
+    tag = re.sub(r'_+', '_', tag)
+    
+    return tag
 
-def read_tags_from_file(image_path):
+def read_tags_from_file(image_path, remove_special_prefix=True):
     """画像に紐づくタグファイルを読み込む関数"""
     # 画像パスからタグファイルのパスを生成
     tag_path = os.path.splitext(image_path)[0] + '.txt'
@@ -429,10 +448,12 @@ def read_tags_from_file(image_path):
     else:
         # 行ごとに読み込み
         tags = [line.strip() for line in content.splitlines() if line.strip()]
+
+    # タグを正規化
+    tags = [normalize_tag(tag, remove_special_prefixes=remove_special_prefix) for tag in tags]
     
     print(f"Read {len(tags)} tags from {tag_path}")
     return tags
-
 
 def predict_image(image_path, model, labels, device=torch_device, gen_threshold=0.35, char_threshold=0.75):
     """画像からタグを予測する関数"""
@@ -921,8 +942,6 @@ class TagImageDataset(torch.utils.data.Dataset):
         tags_list, 
         tag_to_idx, 
         transform=None, 
-        min_tag_freq=1,
-        remove_special_prefix=True
     ):
         """
         画像とタグのデータセット
@@ -932,33 +951,14 @@ class TagImageDataset(torch.utils.data.Dataset):
             tags_list: 各画像に対応するタグのリスト（リストのリスト）
             tag_to_idx: タグから索引へのマッピング辞書
             transform: 画像変換関数
-            min_tag_freq: タグの最小出現頻度
-            remove_special_prefix: 特殊プレフィックス（例：a@、g@など）を除去するかどうか
         """
         self.image_paths = image_paths
         self.tags_list = tags_list
         self.tag_to_idx = tag_to_idx
         self.transform = transform
-        self.min_tag_freq = min_tag_freq
-        self.remove_special_prefix = remove_special_prefix
         
-        # タグの出現頻度を計算
-        self.tag_freq = {}
-        for tags in tags_list:
-            for tag in tags:
-                if self.remove_special_prefix and re.match(r'^[a-zA-Z]@', tag):
-                    continue  # 特殊プレフィックスを持つタグをスキップ
-                self.tag_freq[tag] = self.tag_freq.get(tag, 0) + 1
-        
-        # 最小出現頻度でフィルタリング
-        self.filtered_tag_to_idx = {
-            tag: idx for tag, idx in self.tag_to_idx.items() 
-            if tag in self.tag_freq and self.tag_freq[tag] >= self.min_tag_freq
-        }
-        
-        print(f"元のタグ数: {len(self.tag_to_idx)}")
-        print(f"フィルタリング後のタグ数: {len(self.filtered_tag_to_idx)}")
-    
+        print(f"データセットのタグ数: {len(self.tag_to_idx)}")
+
     def __len__(self):
         return len(self.image_paths)
     
@@ -1013,7 +1013,7 @@ def prepare_dataset(
                     
                     # タグファイルが存在する場合のみ処理
                     if os.path.exists(tag_file):
-                        tags = read_tags_from_file(tag_file)
+                        tags = read_tags_from_file(tag_file, remove_special_prefix=remove_special_prefix)
                         if tags:
                             image_paths.append(image_path)
                             tags_list.append(tags)
@@ -1028,11 +1028,15 @@ def prepare_dataset(
     
     # 最小頻度以上のタグを抽出
     filtered_tags = {tag for tag, freq in tag_freq.items() if freq >= min_tag_freq}
+
+    # a@, p@など英字1文字＋@から始まるタグを除外
+    if remove_special_prefix:
+        filtered_tags = {tag for tag in filtered_tags if not re.match(r'^[a-zA-Z]@', tag)}
     
     new_filtered_tags = filtered_tags - set(existing_tags)
     
     print(f"既存タグ数: {len(existing_tags)}")
-    print(f"新規タグ数: {len(new_filtered_tags)}")
+    print(f"最小頻度以上の新規タグ数: {len(new_filtered_tags)}")
     
     # タグをインデックスにマッピング
     # 既存タグは元のインデックスを維持し、新規タグは既存タグの後に追加
@@ -1801,8 +1805,6 @@ def debug_id_mapping():
         tags_list=tags_list,
         tag_to_idx=tag_to_idx,
         transform=transform,
-        min_tag_freq=1,  # 全タグ使用
-        remove_special_prefix=True  # 本来は学習からは除外すべきプレフィックス
     )
     
     print("\n【各サンプルのターゲットベクトル（nonzero indices）】")
@@ -2051,7 +2053,7 @@ def main():
         
         # 既存タグの数を記録
         existing_tags_count = len(existing_tags)
-        print(f"使用される既存タグ数: {len(set(existing_tags) & set(idx_to_tag.values()))}")
+        print(f"既存タグ数: {len(set(existing_tags) & set(idx_to_tag.values()))}")
         print(f"新規タグ数: {len(idx_to_tag) - len(set(existing_tags) & set(idx_to_tag.values()))}")
         
         # 3. モデルのヘッドを拡張（新規タグに対応）
@@ -2063,34 +2065,19 @@ def main():
         # データ変換の設定
         from timm.data import create_transform
         
-        train_transform = create_transform(
-            input_size=img_size,
-            is_training=True,
-            auto_augment='rand-m9-mstd0.5-inc1'
-        )
-        
-        val_transform = create_transform(
-            input_size=img_size,
-            is_training=False
-        )
-        
         # データセットの作成
         train_dataset = TagImageDataset(
             image_paths=train_image_paths,
             tags_list=train_tags_list,
             tag_to_idx=tag_to_idx,
-            transform=train_transform,
-            min_tag_freq=args.min_tag_freq,
-            remove_special_prefix=args.remove_special_prefix
+            transform=model.transform,
         )
         
         val_dataset = TagImageDataset(
             image_paths=val_image_paths,
             tags_list=val_tags_list,
             tag_to_idx=tag_to_idx,
-            transform=val_transform,
-            min_tag_freq=args.min_tag_freq,
-            remove_special_prefix=args.remove_special_prefix
+            transform=model.transform,
         )
         
         # データローダーの作成
