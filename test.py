@@ -181,7 +181,7 @@ def get_tags(
 class EVA02WithModuleLoRA(nn.Module):
     def __init__(
         self, 
-        num_classes, 
+        num_classes=None,  # 初期化時にはNoneでも可能に
         lora_rank=4, 
         lora_alpha=1.0, 
         lora_dropout=0.0,
@@ -201,11 +201,22 @@ class EVA02WithModuleLoRA(nn.Module):
             pretrained=pretrained
         )
         
+        # モデルの期待する画像サイズを取得
+        self.img_size = self.backbone.patch_embed.img_size
+        print(f"モデルの期待する画像サイズ: {self.img_size}")
+        
         # 特徴量の次元を取得
         self.feature_dim = self.backbone.head.in_features
         
         # 元のヘッドを保存
-        self.head = self.backbone.head
+        self.original_head = self.backbone.head
+        self.original_num_classes = self.original_head.out_features
+        
+        # 新しいヘッドを設定（初期状態では元のヘッドと同じ）
+        if num_classes is None:
+            num_classes = self.original_num_classes
+        
+        self.extend_head(num_classes)
         
         # ターゲットモジュールが指定されていない場合は、デフォルトのリストを使用
         if target_modules is None:
@@ -228,6 +239,36 @@ class EVA02WithModuleLoRA(nn.Module):
         
         # LoRAパラメータのみを訓練可能に設定
         self._freeze_non_lora_parameters()
+    
+    def extend_head(self, num_classes):
+        """
+        モデルのヘッドを拡張して新しいタグに対応する
+        
+        Args:
+            num_classes: 新しい総クラス数（既存タグ + 新規タグ）
+        """
+        # 元のヘッドの重みとバイアスを取得
+        original_weight = self.original_head.weight.data
+        original_bias = self.original_head.bias.data if self.original_head.bias is not None else None
+        
+        # 新しいヘッドを作成
+        new_head = nn.Linear(self.feature_dim, num_classes)
+        
+        # 既存タグの重みとバイアスを新しいヘッドにコピー
+        new_head.weight.data[:self.original_num_classes] = original_weight
+        if original_bias is not None:
+            new_head.bias.data[:self.original_num_classes] = original_bias
+        
+        # 新規タグの重みを初期化（Xavierの初期化）
+        if num_classes > self.original_num_classes:
+            nn.init.xavier_uniform_(new_head.weight.data[self.original_num_classes:])
+            if new_head.bias is not None:
+                nn.init.zeros_(new_head.bias.data[self.original_num_classes:])
+            
+            print(f"ヘッドを拡張しました: {self.original_num_classes} → {num_classes} クラス")
+        
+        # バックボーンのヘッドを新しいヘッドに置き換え
+        self.backbone.head = new_head
     
     def _apply_lora_to_modules(self):
         """モデルの各モジュールにLoRAを適用する"""
@@ -277,6 +318,10 @@ class EVA02WithModuleLoRA(nn.Module):
             if isinstance(module, LoRALayer):
                 for param in module.parameters():
                     param.requires_grad = True
+        
+        # ヘッドのパラメータも訓練可能に設定
+        for param in self.backbone.head.parameters():
+            param.requires_grad = True
     
     def forward(self, x):
         # モデル全体を通して推論
@@ -295,6 +340,15 @@ def load_model(model_path=None, device=torch_device):
         # LoRAモデルのチェックポイントを読み込む
         print(f"LoRAチェックポイントを読み込んでいます: {model_path}")
         checkpoint = torch.load(model_path, map_location=device)
+        
+        # タグマッピングを取得
+        tag_to_idx = checkpoint.get('tag_to_idx', None)
+        idx_to_tag = checkpoint.get('idx_to_tag', None)
+        
+        # 新しいクラス数を決定
+        if tag_to_idx is not None:
+            num_classes = len(tag_to_idx)
+            print(f"チェックポイントから読み込んだタグ数: {num_classes}")
         
         # LoRA設定を取得
         lora_rank = checkpoint.get('lora_rank', 4)
@@ -404,11 +458,13 @@ def visualize_predictions(image, tags, predictions, threshold=0.35, output_path=
     """
     caption, taglist, ratings, character, general, all_character, all_general = predictions
     
-    # タグの正規化（スペースを_に変換）
+    # タグの正規化（スペースを_に変換、エスケープされた括弧を通常の括弧に変換）
     normalized_tags = []
     for tag in tags:
         # スペースを_に変換
         normalized_tag = tag.replace(' ', '_')
+        # エスケープされた括弧を通常の括弧に変換
+        normalized_tag = normalized_tag.replace('\\(', '(').replace('\\)', ')')
         normalized_tags.append(normalized_tag)
     
     print(f"Normalized tags: {normalized_tags[:5]}...")
@@ -615,6 +671,671 @@ def analyze_model_structure():
     logger.info(f"\n分析が完了しました。ログは '{log_file}' に保存されています。")
     return result
 
+# トレーニング用のデータセットクラス
+class TagImageDataset(torch.utils.data.Dataset):
+    def __init__(
+        self, 
+        image_paths, 
+        tags_list, 
+        tag_to_idx, 
+        transform=None, 
+        min_tag_freq=1,
+        remove_special_prefix=True
+    ):
+        """
+        画像とタグのデータセット
+        
+        Args:
+            image_paths: 画像ファイルパスのリスト
+            tags_list: 各画像に対応するタグのリスト（リストのリスト）
+            tag_to_idx: タグから索引へのマッピング辞書
+            transform: 画像変換関数
+            min_tag_freq: タグの最小出現頻度
+            remove_special_prefix: 特殊プレフィックス（例：a@、g@など）を除去するかどうか
+        """
+        self.image_paths = image_paths
+        self.tags_list = tags_list
+        self.tag_to_idx = tag_to_idx
+        self.transform = transform
+        self.min_tag_freq = min_tag_freq
+        self.remove_special_prefix = remove_special_prefix
+        
+        # タグの出現頻度を計算
+        self.tag_freq = {}
+        for tags in tags_list:
+            for tag in tags:
+                if self.remove_special_prefix and re.match(r'^[a-zA-Z]@', tag):
+                    continue  # 特殊プレフィックスを持つタグをスキップ
+                self.tag_freq[tag] = self.tag_freq.get(tag, 0) + 1
+        
+        # 最小出現頻度でフィルタリング
+        self.filtered_tag_to_idx = {
+            tag: idx for tag, idx in self.tag_to_idx.items() 
+            if tag in self.tag_freq and self.tag_freq[tag] >= self.min_tag_freq
+        }
+        
+        print(f"元のタグ数: {len(self.tag_to_idx)}")
+        print(f"フィルタリング後のタグ数: {len(self.filtered_tag_to_idx)}")
+    
+    def __len__(self):
+        return len(self.image_paths)
+    
+    def __getitem__(self, idx):
+        # 画像の読み込みと前処理
+        img_path = self.image_paths[idx]
+        image = Image.open(img_path)
+        image = pil_ensure_rgb(image)
+        image = pil_pad_square(image)
+        
+        if self.transform:
+            image = self.transform(image)
+            # RGB to BGR for EVA02 model
+            image = image[[2, 1, 0]]
+        
+        # タグをone-hotエンコーディング
+        tags = self.tags_list[idx]
+        num_classes = len(self.tag_to_idx)
+        label = torch.zeros(num_classes)
+        
+        for tag in tags:
+            if tag in self.tag_to_idx:
+                label[self.tag_to_idx[tag]] = 1.0
+        
+        return image, label
+
+
+# データセットの準備関数
+def prepare_dataset(
+    image_dirs, 
+    existing_tags=None, 
+    val_split=0.1, 
+    min_tag_freq=5, 
+    remove_special_prefix=True,
+    seed=42
+):
+    """
+    画像とタグのデータセットを準備する
+    
+    Args:
+        image_dirs: 画像ディレクトリのリスト
+        existing_tags: 既存のタグリスト（Noneの場合は全てのタグを使用）
+        val_split: 検証データの割合
+        min_tag_freq: タグの最小出現頻度
+        remove_special_prefix: 特殊プレフィックスを除去するかどうか
+        seed: 乱数シード
+    
+    Returns:
+        train_dataset, val_dataset, tag_to_idx, idx_to_tag
+    """
+    # 乱数シードを設定
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    
+    # 画像ファイルとタグの収集
+    all_image_paths = []
+    all_tags_list = []
+    
+    # 画像拡張子
+    image_extensions = ['.jpg', '.jpeg', '.png', '.webp']
+    
+    print("画像とタグを収集しています...")
+    for image_dir in image_dirs:
+        image_dir = Path(image_dir)
+        
+        # 画像ファイルを再帰的に探索
+        for ext in image_extensions:
+            for img_path in image_dir.glob(f"**/*{ext}"):
+                # 対応するタグファイルを探す
+                tag_path = img_path.with_suffix('.txt')
+                
+                if tag_path.exists():
+                    # タグファイルを読み込む
+                    with open(tag_path, 'r', encoding='utf-8') as f:
+                        content = f.read().strip()
+                    
+                    # カンマ区切りのタグを処理
+                    if ',' in content:
+                        tags = [tag.strip() for tag in content.split(',') if tag.strip()]
+                    else:
+                        tags = [line.strip() for line in content.splitlines() if line.strip()]
+                    
+                    # 特殊プレフィックスの除去
+                    if remove_special_prefix:
+                        tags = [tag for tag in tags if not re.match(r'^[a-zA-Z]@', tag)]
+                    
+                    # スペースをアンダースコアに変換
+                    tags = [tag.replace(' ', '_') for tag in tags]
+                    
+                    all_image_paths.append(str(img_path))
+                    all_tags_list.append(tags)
+    
+    print(f"収集された画像数: {len(all_image_paths)}")
+    
+    # タグの出現頻度を計算
+    tag_freq = {}
+    for tags in all_tags_list:
+        for tag in tags:
+            tag_freq[tag] = tag_freq.get(tag, 0) + 1
+    
+    # 最小出現頻度でフィルタリング
+    filtered_tags = {tag for tag, freq in tag_freq.items() if freq >= min_tag_freq}
+    
+    # 既存タグと新規タグの分類
+    if existing_tags is not None:
+        existing_tags_set = set(existing_tags)
+        new_tags = filtered_tags - existing_tags_set
+        used_tags = filtered_tags & existing_tags_set
+        
+        print(f"既存タグ数: {len(existing_tags_set)}")
+        print(f"使用される既存タグ数: {len(used_tags)}")
+        print(f"新規タグ数: {len(new_tags)}")
+        
+        # タグから索引へのマッピング（既存タグを先に配置）
+        tag_to_idx = {tag: i for i, tag in enumerate(sorted(used_tags))}
+        # 新規タグを追加
+        for i, tag in enumerate(sorted(new_tags), start=len(tag_to_idx)):
+            tag_to_idx[tag] = i
+    else:
+        # 全てのタグを使用
+        tag_to_idx = {tag: i for i, tag in enumerate(sorted(filtered_tags))}
+    
+    # 索引からタグへのマッピング
+    idx_to_tag = {i: tag for tag, i in tag_to_idx.items()}
+    
+    print(f"使用されるタグの総数: {len(tag_to_idx)}")
+    
+    # データを訓練セットと検証セットに分割
+    indices = np.arange(len(all_image_paths))
+    np.random.shuffle(indices)
+    
+    split_idx = int(len(indices) * (1 - val_split))
+    train_indices = indices[:split_idx]
+    val_indices = indices[split_idx:]
+    
+    train_image_paths = [all_image_paths[i] for i in train_indices]
+    train_tags_list = [all_tags_list[i] for i in train_indices]
+    
+    val_image_paths = [all_image_paths[i] for i in val_indices]
+    val_tags_list = [all_tags_list[i] for i in val_indices]
+    
+    print(f"訓練データ数: {len(train_image_paths)}")
+    print(f"検証データ数: {len(val_image_paths)}")
+    
+    return train_image_paths, train_tags_list, val_image_paths, val_tags_list, tag_to_idx, idx_to_tag
+
+
+# 非対称損失関数（ASL）の実装
+class AsymmetricLoss(nn.Module):
+    def __init__(
+        self, 
+        gamma_neg=4, 
+        gamma_pos=1, 
+        clip=0.05, 
+        eps=1e-8, 
+        disable_torch_grad_focal_loss=False
+    ):
+        super(AsymmetricLoss, self).__init__()
+        self.gamma_neg = gamma_neg
+        self.gamma_pos = gamma_pos
+        self.clip = clip
+        self.eps = eps
+        self.disable_torch_grad_focal_loss = disable_torch_grad_focal_loss
+
+    def forward(self, x, y):
+        """"
+        非対称損失関数
+        Args:
+            x: 予測値 (logits)
+            y: 正解ラベル (0 or 1)
+        """
+        # Sigmoid関数を適用
+        xs_pos = torch.sigmoid(x)
+        xs_neg = 1.0 - xs_pos
+
+        # 正例と負例の分離
+        targets = y
+        anti_targets = 1.0 - targets
+
+        # クリッピング
+        if self.clip > 0:
+            xs_neg = (xs_neg + self.clip).clamp(max=1.0)
+
+        # 損失計算の準備
+        if self.disable_torch_grad_focal_loss:
+            with torch.no_grad():
+                pt_pos = xs_pos * targets
+                pt_neg = xs_neg * anti_targets
+                pt_pos = pt_pos.clamp(min=self.eps)
+                pt_neg = pt_neg.clamp(min=self.eps)
+                
+                # 重みの計算
+                focal_weight_pos = pt_pos.pow(self.gamma_pos)
+                focal_weight_neg = pt_neg.pow(self.gamma_neg)
+            
+            # 損失計算
+            loss_pos = focal_weight_pos * torch.log(pt_pos)
+            loss_neg = focal_weight_neg * torch.log(pt_neg)
+        else:
+            pt_pos = xs_pos * targets
+            pt_neg = xs_neg * anti_targets
+            pt_pos = pt_pos.clamp(min=self.eps)
+            pt_neg = pt_neg.clamp(min=self.eps)
+            
+            # 重みの計算
+            focal_weight_pos = pt_pos.pow(self.gamma_pos)
+            focal_weight_neg = pt_neg.pow(self.gamma_neg)
+            
+            # 損失計算
+            loss_pos = focal_weight_pos * torch.log(pt_pos)
+            loss_neg = focal_weight_neg * torch.log(pt_neg)
+        
+        # 最終的な損失
+        loss = -loss_pos.sum() - loss_neg.sum()
+        return loss
+
+
+# 最適化された非対称損失関数
+class AsymmetricLossOptimized(nn.Module):
+    def __init__(
+        self, 
+        gamma_neg=4, 
+        gamma_pos=1, 
+        clip=0.05, 
+        eps=1e-8, 
+        disable_torch_grad_focal_loss=False
+    ):
+        super(AsymmetricLossOptimized, self).__init__()
+        self.gamma_neg = gamma_neg
+        self.gamma_pos = gamma_pos
+        self.clip = clip
+        self.eps = eps
+        self.disable_torch_grad_focal_loss = disable_torch_grad_focal_loss
+        self.targets = self.anti_targets = None
+        self.xs_pos = self.xs_neg = None
+
+    def forward(self, x, y):
+        """"
+        最適化された非対称損失関数
+        Args:
+            x: 予測値 (logits)
+            y: 正解ラベル (0 or 1)
+        """
+        self.targets = y
+        self.anti_targets = 1.0 - y
+
+        # Sigmoid関数を適用
+        self.xs_pos = torch.sigmoid(x)
+        self.xs_neg = 1.0 - self.xs_pos
+
+        # クリッピング
+        if self.clip > 0:
+            self.xs_neg.add_(self.clip).clamp_(max=1.0)
+
+        # 損失計算
+        loss = self._asymmetric_loss()
+        return loss
+
+    def _asymmetric_loss(self):
+        if self.disable_torch_grad_focal_loss:
+            with torch.no_grad():
+                pt_pos = self.xs_pos * self.targets
+                pt_neg = self.xs_neg * self.anti_targets
+                pt_pos = pt_pos.clamp(min=self.eps)
+                pt_neg = pt_neg.clamp(min=self.eps)
+                
+                # 重みの計算
+                focal_weight_pos = pt_pos.pow(self.gamma_pos)
+                focal_weight_neg = pt_neg.pow(self.gamma_neg)
+            
+            # 損失計算
+            loss_pos = focal_weight_pos * torch.log(pt_pos)
+            loss_neg = focal_weight_neg * torch.log(pt_neg)
+        else:
+            pt_pos = self.xs_pos * self.targets
+            pt_neg = self.xs_neg * self.anti_targets
+            pt_pos = pt_pos.clamp(min=self.eps)
+            pt_neg = pt_neg.clamp(min=self.eps)
+            
+            # 重みの計算
+            focal_weight_pos = pt_pos.pow(self.gamma_pos)
+            focal_weight_neg = pt_neg.pow(self.gamma_neg)
+            
+            # 損失計算
+            loss_pos = focal_weight_pos * torch.log(pt_pos)
+            loss_neg = focal_weight_neg * torch.log(pt_neg)
+        
+        # 最終的な損失
+        loss = -loss_pos.sum() - loss_neg.sum()
+        return loss
+
+
+# 評価指標の計算関数
+def compute_metrics(outputs, targets, thresholds=None):
+    """
+    評価指標を計算する関数
+    
+    Args:
+        outputs: モデルの出力（シグモイド適用済み）
+        targets: 正解ラベル
+        thresholds: 閾値のリスト（Noneの場合は[0.1, 0.2, ..., 0.9]）
+    
+    Returns:
+        metrics: 評価指標の辞書
+    """
+    if thresholds is None:
+        thresholds = np.arange(0.1, 0.95, 0.05)
+    
+    # CPU上のnumpy配列に変換
+    outputs_np = outputs.cpu().numpy()
+    targets_np = targets.cpu().numpy()
+    
+    # 各クラスのPR-AUCを計算
+    from sklearn.metrics import precision_recall_curve, auc
+    
+    pr_aucs = []
+    best_f1s = []
+    best_thresholds = []
+    
+    # 各クラスごとに計算
+    for i in range(targets_np.shape[1]):
+        # クラスiのデータが存在する場合のみ計算
+        if targets_np[:, i].sum() > 0:
+            precision, recall, pr_thresholds = precision_recall_curve(targets_np[:, i], outputs_np[:, i])
+            pr_auc = auc(recall, precision)
+            pr_aucs.append(pr_auc)
+            
+            # 各閾値でのF1スコアを計算
+            f1_scores = []
+            for threshold in thresholds:
+                predictions = (outputs_np[:, i] >= threshold).astype(int)
+                tp = np.sum((predictions == 1) & (targets_np[:, i] == 1))
+                fp = np.sum((predictions == 1) & (targets_np[:, i] == 0))
+                fn = np.sum((predictions == 0) & (targets_np[:, i] == 1))
+                
+                precision = tp / (tp + fp) if (tp + fp) > 0 else 0
+                recall = tp / (tp + fn) if (tp + fn) > 0 else 0
+                f1 = 2 * precision * recall / (precision + recall) if (precision + recall) > 0 else 0
+                f1_scores.append(f1)
+            
+            # 最良のF1スコアとその閾値
+            best_idx = np.argmax(f1_scores)
+            best_f1 = f1_scores[best_idx]
+            best_threshold = thresholds[best_idx]
+            
+            best_f1s.append(best_f1)
+            best_thresholds.append(best_threshold)
+    
+    # マクロ平均
+    macro_pr_auc = np.mean(pr_aucs) if pr_aucs else 0
+    macro_f1 = np.mean(best_f1s) if best_f1s else 0
+    mean_threshold = np.mean(best_thresholds) if best_thresholds else 0.5
+    
+    metrics = {
+        'pr_auc': macro_pr_auc,
+        'f1': macro_f1,
+        'threshold': mean_threshold,
+        'class_pr_aucs': pr_aucs,
+        'class_f1s': best_f1s,
+        'class_thresholds': best_thresholds
+    }
+    
+    return metrics
+
+
+# トレーニング関数
+def train_model(
+    model,
+    train_loader,
+    val_loader,
+    tag_to_idx,
+    idx_to_tag,
+    optimizer,
+    scheduler,
+    criterion,
+    num_epochs,
+    device,
+    output_dir,
+    save_best='f1',
+    checkpoint_interval=5,
+    mixed_precision=False,
+    tensorboard=True,
+    existing_tags_count=0
+):
+    """
+    モデルをトレーニングする関数
+    
+    Args:
+        model: トレーニングするモデル
+        train_loader: 訓練データローダー
+        val_loader: 検証データローダー
+        tag_to_idx: タグから索引へのマッピング
+        idx_to_tag: 索引からタグへのマッピング
+        optimizer: オプティマイザ
+        scheduler: 学習率スケジューラ
+        criterion: 損失関数
+        num_epochs: エポック数
+        device: デバイス
+        output_dir: 出力ディレクトリ
+        save_best: 最良モデルの保存基準 ('f1', 'loss', 'both')
+        checkpoint_interval: チェックポイント保存間隔
+        mixed_precision: 混合精度を使用するかどうか
+        tensorboard: TensorBoardを使用するかどうか
+        existing_tags_count: 既存タグの数
+    """
+    # 出力ディレクトリの作成
+    os.makedirs(output_dir, exist_ok=True)
+    
+    # TensorBoardの設定
+    if tensorboard:
+        from torch.utils.tensorboard import SummaryWriter
+        writer = SummaryWriter(log_dir=os.path.join(output_dir, 'tensorboard'))
+    
+    # 混合精度の設定
+    scaler = torch.cuda.amp.GradScaler() if mixed_precision and device.type != 'cpu' else None
+    
+    # 最良モデルの初期化
+    best_f1 = 0.0
+    best_loss = float('inf')
+    
+    # 初期評価
+    print("初期評価を実行しています...")
+    model.eval()
+    val_loss = 0.0
+    all_outputs = []
+    all_targets = []
+    
+    with torch.no_grad():
+        for inputs, targets in val_loader:
+            inputs, targets = inputs.to(device), targets.to(device)
+            outputs = model(inputs)
+            loss = criterion(outputs, targets)
+            val_loss += loss.item()
+            
+            # シグモイド関数を適用
+            probs = torch.sigmoid(outputs)
+            all_outputs.append(probs)
+            all_targets.append(targets)
+    
+    val_loss /= len(val_loader)
+    all_outputs = torch.cat(all_outputs, dim=0)
+    all_targets = torch.cat(all_targets, dim=0)
+    
+    # 評価指標の計算
+    metrics = compute_metrics(all_outputs, all_targets)
+    
+    print(f"初期評価: Loss={val_loss:.4f}, PR-AUC={metrics['pr_auc']:.4f}, F1={metrics['f1']:.4f}, Threshold={metrics['threshold']:.4f}")
+    
+    if tensorboard:
+        writer.add_scalar('Loss/val', val_loss, 0)
+        writer.add_scalar('Metrics/pr_auc', metrics['pr_auc'], 0)
+        writer.add_scalar('Metrics/f1', metrics['f1'], 0)
+        writer.add_scalar('Metrics/threshold', metrics['threshold'], 0)
+    
+    # トレーニングループ
+    for epoch in range(1, num_epochs + 1):
+        print(f"エポック {epoch}/{num_epochs}")
+        
+        # 訓練フェーズ
+        model.train()
+        train_loss = 0.0
+        
+        progress_bar = tqdm(train_loader, desc=f"Epoch {epoch}/{num_epochs} [Train]")
+        for inputs, targets in progress_bar:
+            inputs, targets = inputs.to(device), targets.to(device)
+            
+            # 勾配のリセット
+            optimizer.zero_grad()
+            
+            if mixed_precision and device.type != 'cpu':
+                # 混合精度での順伝播
+                with torch.cuda.amp.autocast():
+                    outputs = model(inputs)
+                    loss = criterion(outputs, targets)
+                
+                # スケーラーを使用して逆伝播
+                scaler.scale(loss).backward()
+                scaler.step(optimizer)
+                scaler.update()
+            else:
+                # 通常の順伝播と逆伝播
+                outputs = model(inputs)
+                loss = criterion(outputs, targets)
+                loss.backward()
+                optimizer.step()
+            
+            train_loss += loss.item()
+            progress_bar.set_postfix({'loss': loss.item()})
+        
+        train_loss /= len(train_loader)
+        
+        # 検証フェーズ
+        model.eval()
+        val_loss = 0.0
+        all_outputs = []
+        all_targets = []
+        
+        progress_bar = tqdm(val_loader, desc=f"Epoch {epoch}/{num_epochs} [Val]")
+        with torch.no_grad():
+            for inputs, targets in progress_bar:
+                inputs, targets = inputs.to(device), targets.to(device)
+                outputs = model(inputs)
+                loss = criterion(outputs, targets)
+                val_loss += loss.item()
+                
+                # シグモイド関数を適用
+                probs = torch.sigmoid(outputs)
+                all_outputs.append(probs)
+                all_targets.append(targets)
+                
+                progress_bar.set_postfix({'loss': loss.item()})
+        
+        val_loss /= len(val_loader)
+        all_outputs = torch.cat(all_outputs, dim=0)
+        all_targets = torch.cat(all_targets, dim=0)
+        
+        # 評価指標の計算
+        metrics = compute_metrics(all_outputs, all_targets)
+        
+        # 既存タグと新規タグの評価指標を分離
+        if existing_tags_count > 0:
+            existing_outputs = all_outputs[:, :existing_tags_count]
+            existing_targets = all_targets[:, :existing_tags_count]
+            new_outputs = all_outputs[:, existing_tags_count:]
+            new_targets = all_targets[:, existing_tags_count:]
+            
+            existing_metrics = compute_metrics(existing_outputs, existing_targets)
+            new_metrics = compute_metrics(new_outputs, new_targets)
+            
+            print(f"既存タグ: PR-AUC={existing_metrics['pr_auc']:.4f}, F1={existing_metrics['f1']:.4f}")
+            print(f"新規タグ: PR-AUC={new_metrics['pr_auc']:.4f}, F1={new_metrics['f1']:.4f}")
+            
+            if tensorboard:
+                writer.add_scalar('Metrics/existing_pr_auc', existing_metrics['pr_auc'], epoch)
+                writer.add_scalar('Metrics/existing_f1', existing_metrics['f1'], epoch)
+                writer.add_scalar('Metrics/new_pr_auc', new_metrics['pr_auc'], epoch)
+                writer.add_scalar('Metrics/new_f1', new_metrics['f1'], epoch)
+        
+        print(f"エポック {epoch}: Train Loss={train_loss:.4f}, Val Loss={val_loss:.4f}, PR-AUC={metrics['pr_auc']:.4f}, F1={metrics['f1']:.4f}, Threshold={metrics['threshold']:.4f}")
+        
+        # 学習率の更新
+        if scheduler is not None:
+            scheduler.step()
+            if tensorboard:
+                writer.add_scalar('LR', scheduler.get_last_lr()[0], epoch)
+        
+        # TensorBoardへの記録
+        if tensorboard:
+            writer.add_scalar('Loss/train', train_loss, epoch)
+            writer.add_scalar('Loss/val', val_loss, epoch)
+            writer.add_scalar('Metrics/pr_auc', metrics['pr_auc'], epoch)
+            writer.add_scalar('Metrics/f1', metrics['f1'], epoch)
+            writer.add_scalar('Metrics/threshold', metrics['threshold'], epoch)
+        
+        # 最良モデルの保存
+        save_model = False
+        if save_best == 'f1' and metrics['f1'] > best_f1:
+            best_f1 = metrics['f1']
+            save_model = True
+            print(f"新しい最良F1: {best_f1:.4f}")
+        elif save_best == 'loss' and val_loss < best_loss:
+            best_loss = val_loss
+            save_model = True
+            print(f"新しい最良損失: {best_loss:.4f}")
+        elif save_best == 'both':
+            if metrics['f1'] > best_f1:
+                best_f1 = metrics['f1']
+                save_model = True
+                print(f"新しい最良F1: {best_f1:.4f}")
+            if val_loss < best_loss:
+                best_loss = val_loss
+                save_model = True
+                print(f"新しい最良損失: {best_loss:.4f}")
+        
+        if save_model:
+            # モデルの保存
+            checkpoint = {
+                'epoch': epoch,
+                'model_state_dict': model.state_dict(),
+                'optimizer_state_dict': optimizer.state_dict(),
+                'scheduler_state_dict': scheduler.state_dict() if scheduler else None,
+                'loss': val_loss,
+                'f1': metrics['f1'],
+                'pr_auc': metrics['pr_auc'],
+                'threshold': metrics['threshold'],
+                'tag_to_idx': tag_to_idx,
+                'idx_to_tag': idx_to_tag,
+                'existing_tags_count': existing_tags_count
+            }
+            
+            # LoRAパラメータの保存（EVA02WithModuleLoRAの場合）
+            if hasattr(model, 'lora_rank'):
+                checkpoint['lora_rank'] = model.lora_rank
+                checkpoint['lora_alpha'] = model.lora_alpha
+                checkpoint['lora_dropout'] = model.lora_dropout
+                checkpoint['target_modules'] = model.target_modules
+            
+            torch.save(checkpoint, os.path.join(output_dir, 'best_model.pth'))
+            print(f"最良モデルを保存しました: {os.path.join(output_dir, 'best_model.pth')}")
+        
+        # 定期的なチェックポイントの保存
+        if epoch % checkpoint_interval == 0:
+            checkpoint = {
+                'epoch': epoch,
+                'model_state_dict': model.state_dict(),
+                'optimizer_state_dict': optimizer.state_dict(),
+                'scheduler_state_dict': scheduler.state_dict() if scheduler else None,
+                'loss': val_loss,
+                'f1': metrics['f1'],
+                'pr_auc': metrics['pr_auc'],
+                'threshold': metrics['threshold'],
+                'tag_to_idx': tag_to_idx,
+                'idx_to_tag': idx_to_tag,
+                'existing_tags_count': existing_tags_count
+            }
+            
+            torch.save(checkpoint, os.path.join(output_dir, f'checkpoint_epoch_{epoch}.pth'))
+            print(f"チェックポイントを保存しました: {os.path.join(output_dir, f'checkpoint_epoch_{epoch}.pth')}")
+
 
 def main():
     parser = argparse.ArgumentParser(description="SmilingWolf/wd-eva02-large-tagger-v3モデルを使用して画像のタグを推論し、LoRAトレーニングのための準備を行います。")
@@ -638,6 +1359,45 @@ def main():
     batch_parser.add_argument('--output_dir', type=str, default='predictions', help='予測結果を保存するディレクトリ')
     batch_parser.add_argument('--gen_threshold', type=float, default=0.35, help='一般タグの閾値')
     batch_parser.add_argument('--char_threshold', type=float, default=0.75, help='キャラクタータグの閾値')
+    
+    # トレーニングコマンド
+    train_parser = subparsers.add_parser('train', help='LoRAモデルをトレーニングします')
+    
+    # データセット関連の引数
+    train_parser.add_argument('--image_dirs', type=str, nargs='+', required=True, help='トレーニング画像のディレクトリ（複数指定可）')
+    train_parser.add_argument('--val_split', type=float, default=0.1, help='検証データの割合')
+    train_parser.add_argument('--min_tag_freq', type=int, default=5, help='タグの最小出現頻度')
+    train_parser.add_argument('--remove_special_prefix', action='store_true', help='特殊プレフィックス（例：a@、g@など）を除去する')
+    # train_parser.add_argument('--image_size', type=int, default=224, help='画像サイズ')
+    train_parser.add_argument('--batch_size', type=int, default=32, help='バッチサイズ')
+    train_parser.add_argument('--num_workers', type=int, default=4, help='データローダーのワーカー数')
+    
+    # モデル関連の引数
+    train_parser.add_argument('--lora_rank', type=int, default=4, help='LoRAのランク')
+    train_parser.add_argument('--lora_alpha', type=float, default=1.0, help='LoRAのアルファ値')
+    train_parser.add_argument('--lora_dropout', type=float, default=0.0, help='LoRAのドロップアウト率')
+    train_parser.add_argument('--target_modules_file', type=str, default=None, help='LoRAを適用するモジュールのリストを含むファイル')
+    
+    # トレーニング関連の引数
+    train_parser.add_argument('--num_epochs', type=int, default=10, help='エポック数')
+    train_parser.add_argument('--learning_rate', type=float, default=1e-3, help='学習率')
+    train_parser.add_argument('--weight_decay', type=float, default=0.01, help='重み減衰')
+    train_parser.add_argument('--checkpoint_interval', type=int, default=5, help='チェックポイント保存間隔（エポック）')
+    train_parser.add_argument('--save_best', type=str, default='f1', choices=['f1', 'loss', 'both'], help='最良モデルの保存基準')
+    train_parser.add_argument('--output_dir', type=str, default='lora_model', help='出力ディレクトリ')
+    
+    # 損失関数関連の引数
+    train_parser.add_argument('--loss_fn', type=str, default='bce', choices=['bce', 'asl', 'asl_optimized'], help='損失関数')
+    train_parser.add_argument('--gamma_neg', type=float, default=4, help='ASL: 負例のガンマ値')
+    train_parser.add_argument('--gamma_pos', type=float, default=1, help='ASL: 正例のガンマ値')
+    train_parser.add_argument('--clip', type=float, default=0.05, help='ASL: クリップ値')
+    
+    # その他のオプション
+    train_parser.add_argument('--mixed_precision', action='store_true', help='混合精度トレーニングを使用する')
+    train_parser.add_argument('--use_8bit_optimizer', action='store_true', help='8-bitオプティマイザを使用する')
+    train_parser.add_argument('--tensorboard', action='store_true', help='TensorBoardを使用する')
+    train_parser.add_argument('--tensorboard_port', type=int, default=6006, help='TensorBoardのポート番号')
+    train_parser.add_argument('--seed', type=int, default=42, help='乱数シード')
     
     args = parser.parse_args()
     
@@ -760,6 +1520,229 @@ def main():
                 json.dump(results, f, indent=2, ensure_ascii=False)
             
             print(f"処理が完了しました。結果は {args.output_dir} に保存されています。")
+    
+    elif args.command == 'train':
+        # 乱数シードの設定
+        np.random.seed(args.seed)
+        torch.manual_seed(args.seed)
+        if torch.cuda.is_available():
+            torch.cuda.manual_seed_all(args.seed)
+        
+        # デバイスの設定
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        print(f"使用デバイス: {device}")
+        
+        # 既存のタグリストを読み込む
+        print("既存のタグリストを読み込んでいます...")
+        labels = load_labels_hf(repo_id=MODEL_REPO)
+        existing_tags = labels.names
+        print(f"既存タグ数: {len(existing_tags)}")
+        
+        # ターゲットモジュールの読み込み
+        target_modules = None
+        if args.target_modules_file:
+            with open(args.target_modules_file, 'r') as f:
+                target_modules = [line.strip() for line in f.readlines() if line.strip()]
+            print(f"LoRAを適用するモジュール数: {len(target_modules)}")
+        
+        # 1. まずモデルを読み込む（この時点では既存タグのみ）
+        print("モデルを読み込んでいます...")
+        model = EVA02WithModuleLoRA(
+            num_classes=None,  # 初期状態では既存タグのみ
+            lora_rank=args.lora_rank,
+            lora_alpha=args.lora_alpha,
+            lora_dropout=args.lora_dropout,
+            target_modules=target_modules,
+            pretrained=True
+        )
+        
+        # モデルの期待する画像サイズを取得
+        img_size = model.img_size
+        print(f"モデルの期待する画像サイズを使用します: {img_size}")
+        
+        # 2. データセットの準備（新規タグが検出される）
+        print("データセットを準備しています...")
+        train_image_paths, train_tags_list, val_image_paths, val_tags_list, tag_to_idx, idx_to_tag = prepare_dataset(
+            image_dirs=args.image_dirs,
+            existing_tags=existing_tags,
+            val_split=args.val_split,
+            min_tag_freq=args.min_tag_freq,
+            remove_special_prefix=args.remove_special_prefix,
+            seed=args.seed
+        )
+        
+        # 既存タグの数を記録
+        existing_tags_count = len(set(existing_tags) & set(idx_to_tag.values()))
+        print(f"使用される既存タグ数: {existing_tags_count}")
+        print(f"新規タグ数: {len(idx_to_tag) - existing_tags_count}")
+        
+        # 3. モデルのヘッドを拡張（新規タグに対応）
+        print("モデルのヘッドを拡張しています...")
+        model.extend_head(num_classes=len(tag_to_idx))
+        model = model.to(device)
+        
+        # データ変換の設定
+        from timm.data import create_transform
+        
+        train_transform = create_transform(
+            input_size=img_size,
+            is_training=True,
+            auto_augment='rand-m9-mstd0.5-inc1'
+        )
+        
+        val_transform = create_transform(
+            input_size=img_size,
+            is_training=False
+        )
+        
+        # データセットの作成
+        train_dataset = TagImageDataset(
+            image_paths=train_image_paths,
+            tags_list=train_tags_list,
+            tag_to_idx=tag_to_idx,
+            transform=train_transform,
+            min_tag_freq=args.min_tag_freq,
+            remove_special_prefix=args.remove_special_prefix
+        )
+        
+        val_dataset = TagImageDataset(
+            image_paths=val_image_paths,
+            tags_list=val_tags_list,
+            tag_to_idx=tag_to_idx,
+            transform=val_transform,
+            min_tag_freq=args.min_tag_freq,
+            remove_special_prefix=args.remove_special_prefix
+        )
+        
+        # データローダーの作成
+        train_loader = torch.utils.data.DataLoader(
+            train_dataset,
+            batch_size=args.batch_size,
+            shuffle=True,
+            num_workers=args.num_workers,
+            pin_memory=True
+        )
+        
+        val_loader = torch.utils.data.DataLoader(
+            val_dataset,
+            batch_size=args.batch_size,
+            shuffle=False,
+            num_workers=args.num_workers,
+            pin_memory=True
+        )
+        
+        # 損失関数の設定
+        if args.loss_fn == 'bce':
+            criterion = nn.BCEWithLogitsLoss()
+        elif args.loss_fn == 'asl':
+            criterion = AsymmetricLoss(
+                gamma_neg=args.gamma_neg,
+                gamma_pos=args.gamma_pos,
+                clip=args.clip
+            )
+        elif args.loss_fn == 'asl_optimized':
+            criterion = AsymmetricLossOptimized(
+                gamma_neg=args.gamma_neg,
+                gamma_pos=args.gamma_pos,
+                clip=args.clip
+            )
+        
+        # オプティマイザの設定
+        if args.use_8bit_optimizer:
+            try:
+                import bitsandbytes as bnb
+                optimizer = bnb.optim.AdamW8bit(
+                    model.parameters(),
+                    lr=args.learning_rate,
+                    weight_decay=args.weight_decay
+                )
+                print("8-bitオプティマイザを使用します")
+            except ImportError:
+                print("bitsandbytesがインストールされていないため、通常のAdamWを使用します")
+                optimizer = torch.optim.AdamW(
+                    model.parameters(),
+                    lr=args.learning_rate,
+                    weight_decay=args.weight_decay
+                )
+        else:
+            optimizer = torch.optim.AdamW(
+                model.parameters(),
+                lr=args.learning_rate,
+                weight_decay=args.weight_decay
+            )
+        
+        # 学習率スケジューラの設定
+        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+            optimizer,
+            T_max=args.num_epochs
+        )
+        
+        # TensorBoardの設定
+        if args.tensorboard:
+            try:
+                import subprocess
+                tensorboard_process = subprocess.Popen(
+                    ['tensorboard', '--logdir', os.path.join(args.output_dir, 'tensorboard'), '--port', str(args.tensorboard_port)]
+                )
+                print(f"TensorBoardを起動しました: http://localhost:{args.tensorboard_port}")
+            except Exception as e:
+                print(f"TensorBoardの起動に失敗しました: {e}")
+        
+        # トレーニングの実行
+        print("トレーニングを開始します...")
+        train_model(
+            model=model,
+            train_loader=train_loader,
+            val_loader=val_loader,
+            tag_to_idx=tag_to_idx,
+            idx_to_tag=idx_to_tag,
+            optimizer=optimizer,
+            scheduler=scheduler,
+            criterion=criterion,
+            num_epochs=args.num_epochs,
+            device=device,
+            output_dir=args.output_dir,
+            save_best=args.save_best,
+            checkpoint_interval=args.checkpoint_interval,
+            mixed_precision=args.mixed_precision,
+            tensorboard=True,
+            existing_tags_count=existing_tags_count
+        )
+        
+        # 最終モデルの保存
+        final_checkpoint = {
+            'epoch': args.num_epochs,
+            'model_state_dict': model.state_dict(),
+            'optimizer_state_dict': optimizer.state_dict(),
+            'scheduler_state_dict': scheduler.state_dict(),
+            'tag_to_idx': tag_to_idx,
+            'idx_to_tag': idx_to_tag,
+            'existing_tags_count': existing_tags_count
+        }
+        
+        # LoRAパラメータの保存
+        if hasattr(model, 'lora_rank'):
+            final_checkpoint['lora_rank'] = model.lora_rank
+            final_checkpoint['lora_alpha'] = model.lora_alpha
+            final_checkpoint['lora_dropout'] = model.lora_dropout
+            final_checkpoint['target_modules'] = model.target_modules
+        
+        torch.save(final_checkpoint, os.path.join(args.output_dir, 'final_model.pth'))
+        print(f"最終モデルを保存しました: {os.path.join(args.output_dir, 'final_model.pth')}")
+        
+        # タグマッピングの保存
+        with open(os.path.join(args.output_dir, 'tag_mapping.json'), 'w', encoding='utf-8') as f:
+            json.dump({
+                'tag_to_idx': tag_to_idx,
+                'idx_to_tag': idx_to_tag,
+                'existing_tags_count': existing_tags_count
+            }, f, indent=2, ensure_ascii=False)
+        
+        print("トレーニングが完了しました！")
+        
+        # TensorBoardプロセスの終了
+        if args.tensorboard and 'tensorboard_process' in locals():
+            tensorboard_process.terminate()
     
     else:
         parser.print_help()
