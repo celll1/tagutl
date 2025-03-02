@@ -1,0 +1,43 @@
+# 指定されたディレクトリを無視
+images/
+lora_checkpoints/
+lora_model/
+old_files/
+prediction/
+predictions/
+venv/
+
+# 一般的な Python の無視ファイル
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# ログファイル
+*.log
+
+# 分析結果
+model_analysis*.json
+lora_target_layers.txt
+
+# 出力ファイル
+*.png
+*.jpg
+*.jpeg
+batch_results.json

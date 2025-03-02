@@ -1,0 +1,17 @@
+--find-links https://download.pytorch.org/whl/cu126
+torch
+torchvision
+torchaudio
+numpy>=1.20.0
+pandas>=1.3.0
+Pillow>=9.0.0
+tqdm>=4.60.0
+timm>=0.6.0
+matplotlib>=3.5.0
+scikit-learn>=1.0.0
+huggingface-hub>=0.10.0
+safetensors>=0.3.0
+transformers>=4.20.0
+tensorboard>=2.10.0
+tk>=0.1.0
+bitsandbytes>=0.41.1
