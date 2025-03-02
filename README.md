@@ -61,6 +61,8 @@ python test.py train --image_dirs path/to/images --output_dir lora_model --num_e
 - `--mixed_precision`: 混合精度トレーニングの有効化
 - `--tensorboard`: TensorBoardによるモニタリングの有効化
 
+そのほかはargs参照。
+
 ## ライセンス
 
 [Apache License 2.0](LICENSE)
