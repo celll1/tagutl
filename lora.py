@@ -26,9 +26,6 @@ from collections import defaultdict
 # デバイスの設定
 torch_device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-# モデルリポジトリの設定
-MODEL_REPO = "SmilingWolf/wd-eva02-large-tagger-v3"
-
 # LoRAモジュールの定義
 class LoRALayer(nn.Module):
     def __init__(self, in_features, out_features, rank=4, alpha=1.0):
@@ -185,6 +182,7 @@ def get_tags(
 class EVA02WithModuleLoRA(nn.Module):
     def __init__(
         self, 
+        base_model: str = 'SmilingWolf/wd-eva02-large-tagger-v3',
         num_classes=None,  # 初期化時にはNoneでも可能に
         lora_rank=4, 
         lora_alpha=1.0, 
@@ -201,7 +199,7 @@ class EVA02WithModuleLoRA(nn.Module):
         
         # バックボーンを作成
         self.backbone = timm.create_model(
-            'hf-hub:' + MODEL_REPO, 
+            'hf-hub:' + base_model, 
             pretrained=pretrained
         )
         
@@ -348,14 +346,14 @@ class EVA02WithModuleLoRA(nn.Module):
         return self.backbone(x)
 
 
-def load_model(model_path=None, metadata_path=None, device=torch_device):
+def load_model(model_path=None, metadata_path=None, base_model='SmilingWolf/wd-eva02-large-tagger-v3', device=torch_device):
     """モデルを読み込む関数"""
     print(f"モデルを読み込んでいます...")
 
     # huggingface のsmilingwolf のモデルの場合
     if model_path is None:
         # ラベルデータを読み込む
-        labels = load_labels_hf(repo_id=MODEL_REPO)
+        labels = load_labels_hf(repo_id=base_model)
         num_classes = len(labels.names)
         
         idx_to_tag = {i: name for i, name in enumerate(labels.names)}
@@ -922,7 +920,7 @@ def visualize_predictions_for_tensorboard(img_tensor, probs, idx_to_tag, thresho
     
     return img_tensor
 
-def analyze_model_structure():
+def analyze_model_structure(base_model='SmilingWolf/wd-eva02-large-tagger-v3'):
     """モデル構造を分析し、LoRAを適用すべき層を特定する関数"""
     import math
     import logging
@@ -948,19 +946,19 @@ def analyze_model_structure():
     file_handler.setFormatter(formatter)
     logger.addHandler(file_handler)
     
-    logger.info(f"モデル '{MODEL_REPO}' の構造を分析しています...")
+    logger.info(f"モデル '{base_model}' の構造を分析しています...")
     
     # モデルをロード
     try:
         logger.info(f"Hugging Face Hub からモデルをロードしています...")
-        model = timm.create_model('hf-hub:' + MODEL_REPO, pretrained=True)
+        model = timm.create_model('hf-hub:' + base_model, pretrained=True)
     except Exception as e:
         logger.error(f"モデルのロード中にエラーが発生しました: {e}")
         return
     
     # 結果を格納する辞書
     result = {
-        "model_name": MODEL_REPO,
+        "model_name": base_model,
         "total_parameters": sum(p.numel() for p in model.parameters()),
         "trainable_parameters": sum(p.numel() for p in model.parameters() if p.requires_grad),
         "modules": []
@@ -1790,164 +1788,162 @@ def train_model(
     
     return val_metrics
 
-def debug_model():
-    """
-    extend_head 前後の重みコピーおよび出力差分を比較するデバッグ関数
-    """
-    import copy
+# def debug_model():
+#     """
+#     extend_head 前後の重みコピーおよび出力差分を比較するデバッグ関数
+#     """
+#     import copy
     
-    # デバイスの設定
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+#     # デバイスの設定
+#     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     
-    print("【検証1】extend_head 前のモデル（baseline）の読み込み")
-    model_baseline = EVA02WithModuleLoRA(
-        num_classes=None,  # 既存ヘッドのみ（pre-trained 状態）
-        lora_rank=4,
-        lora_alpha=1.0,
-        lora_dropout=0.0,
-        target_modules=None,
-        pretrained=True
-    )
-    model_baseline = model_baseline.to(device)
-    model_baseline.eval()
+#     print("【検証1】extend_head 前のモデル（baseline）の読み込み")
+#     model_baseline = EVA02WithModuleLoRA(
+#         num_classes=None,  # 既存ヘッドのみ（pre-trained 状態）
+#         lora_rank=4,
+#         lora_alpha=1.0,
+#         lora_dropout=0.0,
+#         target_modules=None,
+#         pretrained=True
+#     )
+#     model_baseline = model_baseline.to(device)
+#     model_baseline.eval()
     
-    # baselineヘッドの重みを保持
-    baseline_head_weights = model_baseline.backbone.head.weight.data.clone()
-    baseline_head_bias = None
-    if model_baseline.backbone.head.bias is not None:
-        baseline_head_bias = model_baseline.backbone.head.bias.data.clone()
+#     # baselineヘッドの重みを保持
+#     baseline_head_weights = model_baseline.backbone.head.weight.data.clone()
+#     baseline_head_bias = None
+#     if model_baseline.backbone.head.bias is not None:
+#         baseline_head_bias = model_baseline.backbone.head.bias.data.clone()
     
-    print("Baseline existing head weight stats: mean = {:.6f}, std = {:.6f}".format(
-         baseline_head_weights.mean().item(), baseline_head_weights.std().item()))
+#     print("Baseline existing head weight stats: mean = {:.6f}, std = {:.6f}".format(
+#          baseline_head_weights.mean().item(), baseline_head_weights.std().item()))
     
-    # 既存タグ数はモデル内部に保持されている (pre-trained ヘッドの out_features)
-    original_num = model_baseline.original_num_classes
-    # ここではシミュレーションとして新規タグ461件を追加する
-    total_classes = original_num + 461
-    print(f"【検証2】ヘッド拡張: {original_num} -> {total_classes} (新規タグ数: 461)")
+#     # 既存タグ数はモデル内部に保持されている (pre-trained ヘッドの out_features)
+#     original_num = model_baseline.original_num_classes
+#     # ここではシミュレーションとして新規タグ461件を追加する
+#     total_classes = original_num + 461
+#     print(f"【検証2】ヘッド拡張: {original_num} -> {total_classes} (新規タグ数: 461)")
     
-    # baselineモデルをコピーして、ヘッド拡張を実施
-    model_extended = copy.deepcopy(model_baseline)
-    model_extended.extend_head(num_classes=total_classes)
-    model_extended = model_extended.to(device)
-    model_extended.eval()
+#     # baselineモデルをコピーして、ヘッド拡張を実施
+#     model_extended = copy.deepcopy(model_baseline)
+#     model_extended.extend_head(num_classes=total_classes)
+#     model_extended = model_extended.to(device)
+#     model_extended.eval()
     
-    ext_head_weights = model_extended.backbone.head.weight.data.clone()
-    ext_head_bias = None
-    if model_extended.backbone.head.bias is not None:
-        ext_head_bias = model_extended.backbone.head.bias.data.clone()
+#     ext_head_weights = model_extended.backbone.head.weight.data.clone()
+#     ext_head_bias = None
+#     if model_extended.backbone.head.bias is not None:
+#         ext_head_bias = model_extended.backbone.head.bias.data.clone()
     
-    # baselineの既存ヘッド部分と、extend後の既存ヘッド部分の差分を確認
-    diff_weights = ext_head_weights[:original_num] - baseline_head_weights
-    print("After extending head, difference stats for existing head portion:")
-    print("  - Difference weight: mean = {:.6f}, std = {:.6f}".format(
-         diff_weights.mean().item(), diff_weights.std().item()))
+#     # baselineの既存ヘッド部分と、extend後の既存ヘッド部分の差分を確認
+#     diff_weights = ext_head_weights[:original_num] - baseline_head_weights
+#     print("After extending head, difference stats for existing head portion:")
+#     print("  - Difference weight: mean = {:.6f}, std = {:.6f}".format(
+#          diff_weights.mean().item(), diff_weights.std().item()))
     
-    # ダミー入力を用意 (事前にモデルの期待する画像サイズを取得)
-    img_size = model_extended.img_size  # (height, width) 例：(448, 448)
-    dummy_input = torch.randn(1, 3, img_size[0], img_size[1]).to(device)
+#     # ダミー入力を用意 (事前にモデルの期待する画像サイズを取得)
+#     img_size = model_extended.img_size  # (height, width) 例：(448, 448)
+#     dummy_input = torch.randn(1, 3, img_size[0], img_size[1]).to(device)
     
-    with torch.no_grad():
-        baseline_output = model_baseline(dummy_input)
-        extended_output = model_extended(dummy_input)
+#     with torch.no_grad():
+#         baseline_output = model_baseline(dummy_input)
+#         extended_output = model_extended(dummy_input)
     
-    # 既存タグに該当する部分の出力を比較
-    baseline_existing = baseline_output[:, :original_num]
-    extended_existing = extended_output[:, :original_num]
+#     # 既存タグに該当する部分の出力を比較
+#     baseline_existing = baseline_output[:, :original_num]
+#     extended_existing = extended_output[:, :original_num]
     
-    diff_output = extended_existing - baseline_existing
-    print("Existing head output difference (after extend):")
-    print("  - Mean = {:.6f}, Std = {:.6f}".format(diff_output.mean().item(), diff_output.std().item()))
+#     diff_output = extended_existing - baseline_existing
+#     print("Existing head output difference (after extend):")
+#     print("  - Mean = {:.6f}, Std = {:.6f}".format(diff_output.mean().item(), diff_output.std().item()))
     
-    # 全体出力の統計も表示
-    print("Extended model overall output stats: mean = {:.6f}, std = {:.6f}".format(
-         extended_output.mean().item(), extended_output.std().item()))
-    
-    debug_id_mapping()
-    
-    print("\n【デバッグ検証終了】")
+#     # 全体出力の統計も表示
+#     print("Extended model overall output stats: mean = {:.6f}, std = {:.6f}".format(
+#          extended_output.mean().item(), extended_output.std().item()))
 
-def debug_id_mapping():
-    """
-    トレーニング時に用いられる tag_to_idx / idx_to_tag のマッピングが正しく構築されているかを確認するためのデバッグ関数
-    ＊ 特に、既存タグ（load_labels_hfで得られる）と、新規タグが正しく追加されているかを確認する
-    """
-    # 事前にload_labels_hfで得た既存のラベルリスト（pre-trainedで使われている順序）の取得
-    labels = load_labels_hf(repo_id=MODEL_REPO)
-    existing_tags = labels.names
-    num_existing = len(existing_tags)
-    print(f"pre-trainedから取得した既存タグ数: {num_existing}")
+#     print("\n【デバッグ検証終了】")
+
+# def debug_id_mapping():
+#     """
+#     トレーニング時に用いられる tag_to_idx / idx_to_tag のマッピングが正しく構築されているかを確認するためのデバッグ関数
+#     ＊ 特に、既存タグ（load_labels_hfで得られる）と、新規タグが正しく追加されているかを確認する
+#     """
+#     # 事前にload_labels_hfで得た既存のラベルリスト（pre-trainedで使われている順序）の取得
+#     labels = load_labels_hf(repo_id=MODEL_REPO)
+#     existing_tags = labels.names
+#     num_existing = len(existing_tags)
+#     print(f"pre-trainedから取得した既存タグ数: {num_existing}")
     
-    # ダミーの画像ディレクトリ（またはテスト用のタグリスト）を用意する
-    # ここでは既存タグに含まれていないタグを新規タグと仮定
-    # 例として、既存タグの一部だけ＆新規タグを含む簡易テストケースを作成します
-    image_paths = ["b.jpg", "f.jpg", "a.jpg"]
-    tags_list = [
-        # この画像は既存タグのみを含む
-        existing_tags[:10],
-        # この画像は既存タグと、新規タグ "new_tag_A", "new_tag_B" を含む
-        existing_tags[5:15] + ["new_tag_A", "new_tag_B"],
-        # この画像は新規タグのみ
-        ["new_tag_A", "new_tag_B", "new_tag_C"]
-    ]
+#     # ダミーの画像ディレクトリ（またはテスト用のタグリスト）を用意する
+#     # ここでは既存タグに含まれていないタグを新規タグと仮定
+#     # 例として、既存タグの一部だけ＆新規タグを含む簡易テストケースを作成します
+#     image_paths = ["b.jpg", "f.jpg", "a.jpg"]
+#     tags_list = [
+#         # この画像は既存タグのみを含む
+#         existing_tags[:10],
+#         # この画像は既存タグと、新規タグ "new_tag_A", "new_tag_B" を含む
+#         existing_tags[5:15] + ["new_tag_A", "new_tag_B"],
+#         # この画像は新規タグのみ
+#         ["new_tag_A", "new_tag_B", "new_tag_C"]
+#     ]
     
-    # prepare_dataset 内部ではファイル入出力がありますので、ここではその一部処理のみ、つまり
-    # タグの頻度計算、フィルタリング、既存／新規タグの分離、そしてマッピングの構築部のみをシミュレーションします
-    tag_freq = {}
-    for tags in tags_list:
-        for tag in tags:
-            tag_freq[tag] = tag_freq.get(tag, 0) + 1
-    # min_tag_freq を1として全てのタグを採用（テスト目的）
-    filtered_tags = {tag for tag, freq in tag_freq.items() if freq >= 1}
+#     # prepare_dataset 内部ではファイル入出力がありますので、ここではその一部処理のみ、つまり
+#     # タグの頻度計算、フィルタリング、既存／新規タグの分離、そしてマッピングの構築部のみをシミュレーションします
+#     tag_freq = {}
+#     for tags in tags_list:
+#         for tag in tags:
+#             tag_freq[tag] = tag_freq.get(tag, 0) + 1
+#     # min_tag_freq を1として全てのタグを採用（テスト目的）
+#     filtered_tags = {tag for tag, freq in tag_freq.items() if freq >= 1}
     
-    # 既存タグと新規タグの分離
-    existing_filtered_tags = set(existing_tags) & filtered_tags
-    new_filtered_tags = filtered_tags - set(existing_tags)
+#     # 既存タグと新規タグの分離
+#     existing_filtered_tags = set(existing_tags) & filtered_tags
+#     new_filtered_tags = filtered_tags - set(existing_tags)
     
-    print(f"フィルタリング後の既存タグ数: {len(existing_filtered_tags)}")
-    print(f"フィルタリング後の新規タグ数: {len(new_filtered_tags)}")
+#     print(f"フィルタリング後の既存タグ数: {len(existing_filtered_tags)}")
+#     print(f"フィルタリング後の新規タグ数: {len(new_filtered_tags)}")
     
-    # マッピング作成
-    # 既存タグはそのままの順序で
-    tag_to_idx = {tag: i for i, tag in enumerate(existing_tags)}
+#     # マッピング作成
+#     # 既存タグはそのままの順序で
+#     tag_to_idx = {tag: i for i, tag in enumerate(existing_tags)}
     
-    next_idx = num_existing
-    for tag in sorted(new_filtered_tags):
-        tag_to_idx[tag] = next_idx
-        next_idx += 1
-    idx_to_tag = {i: tag for tag, i in tag_to_idx.items()}
+#     next_idx = num_existing
+#     for tag in sorted(new_filtered_tags):
+#         tag_to_idx[tag] = next_idx
+#         next_idx += 1
+#     idx_to_tag = {i: tag for tag, i in tag_to_idx.items()}
     
-    total_tags = len(tag_to_idx)
-    print(f"最終的に使用されるタグの総数: {total_tags}")
+#     total_tags = len(tag_to_idx)
+#     print(f"最終的に使用されるタグの総数: {total_tags}")
     
-    # マッピングの先頭部分（既存タグ側）と後半部分（新規タグ側）を確認
-    print("\n【既存タグマッピング（一部表示）】")
-    for i in range(min(10, num_existing)):
-        print(f"Index: {i} → {idx_to_tag[i]}")
+#     # マッピングの先頭部分（既存タグ側）と後半部分（新規タグ側）を確認
+#     print("\n【既存タグマッピング（一部表示）】")
+#     for i in range(min(10, num_existing)):
+#         print(f"Index: {i} → {idx_to_tag[i]}")
         
-    print("\n【新規タグマッピング】")
-    for i in range(num_existing, total_tags):
-        print(f"Index: {i} → {idx_to_tag[i]}")
+#     print("\n【新規タグマッピング】")
+#     for i in range(num_existing, total_tags):
+#         print(f"Index: {i} → {idx_to_tag[i]}")
     
-    # 次に、シンプルな TagImageDataset を用いて、実際のターゲット生成結果を確認する
-    # 前処理に remove_special_prefix が有効の場合と無効の場合で確認可能
-    from torchvision import transforms
-    transform = transforms.Compose([
-        transforms.ToTensor()
-    ])
+#     # 次に、シンプルな TagImageDataset を用いて、実際のターゲット生成結果を確認する
+#     # 前処理に remove_special_prefix が有効の場合と無効の場合で確認可能
+#     from torchvision import transforms
+#     transform = transforms.Compose([
+#         transforms.ToTensor()
+#     ])
     
-    dataset = TagImageDataset(
-        image_paths=image_paths,
-        tags_list=tags_list,
-        tag_to_idx=tag_to_idx,
-        transform=transform,
-    )
+#     dataset = TagImageDataset(
+#         image_paths=image_paths,
+#         tags_list=tags_list,
+#         tag_to_idx=tag_to_idx,
+#         transform=transform,
+#     )
     
-    print("\n【各サンプルのターゲットベクトル（nonzero indices）】")
-    for idx in range(len(dataset)):
-        image_tensor, target = dataset[idx]
-        nz = target.nonzero(as_tuple=False).squeeze().tolist()
-        print(f"Sample {idx}: ターゲットindices = {nz}")
+#     print("\n【各サンプルのターゲットベクトル（nonzero indices）】")
+#     for idx in range(len(dataset)):
+#         image_tensor, target = dataset[idx]
+#         nz = target.nonzero(as_tuple=False).squeeze().tolist()
+#         print(f"Sample {idx}: ターゲットindices = {nz}")
     
 
 def load_tag_categories():
@@ -2011,10 +2007,12 @@ def main():
     # ここに必要な引数を追加します（省略）
     # 分析コマンド
     analyze_parser = subparsers.add_parser('analyze', help='モデル構造を分析します')
+    analyze_parser.add_argument('--base_model', type=str, default='SmilingWolf/wd-eva02-large-tagger-v3', help='使用するベースモデルのリポジトリ')
     
     # 推論コマンド
     predict_parser = subparsers.add_parser('predict', help='画像からタグを予測します')
     predict_parser.add_argument('--image', type=str, required=True, help='予測する画像ファイルのパス')
+    predict_parser.add_argument('--base_model', type=str, default='SmilingWolf/wd-eva02-large-tagger-v3', help='使用するベースモデルのリポジトリ')
     predict_parser.add_argument('--model_path', type=str, default=None, help='使用するLoRAモデルのパス（指定しない場合は元のモデルを使用）')
     predict_parser.add_argument('--metadata_path', type=str, default=None, help='モデルのメタデータファイルのパス（指定しない場合は元のモデルを使用）')
     predict_parser.add_argument('--output_dir', type=str, default='predictions', help='予測結果を保存するディレクトリ')
@@ -2024,6 +2022,7 @@ def main():
     # バッチ推論コマンド
     batch_parser = subparsers.add_parser('batch', help='複数の画像からタグを予測します')
     batch_parser.add_argument('--image_dir', type=str, required=True, help='予測する画像ファイルのディレクトリ')
+    batch_parser.add_argument('--base_model', type=str, default='SmilingWolf/wd-eva02-large-tagger-v3', help='使用するベースモデルのリポジトリ')
     batch_parser.add_argument('--model_path', type=str, default=None, help='使用するLoRAモデルのパス（指定しない場合は元のモデルを使用）')
     batch_parser.add_argument('--metadata_path', type=str, default=None, help='モデルのメタデータファイルのパス（指定しない場合は元のモデルを使用）')
     batch_parser.add_argument('--output_dir', type=str, default='predictions', help='予測結果を保存するディレクトリ')
@@ -2032,7 +2031,11 @@ def main():
     
     # トレーニングコマンド
     train_parser = subparsers.add_parser('train', help='LoRAモデルをトレーニングします')
-    
+
+    train_parser.add_argument('--base_model', type=str, default='SmilingWolf/wd-eva02-large-tagger-v3', help='使用するベースモデルのリポジトリ')
+    train_parser.add_argument('--model_path', type=str, default=None, help='使用するLoRAモデルのパス（指定しない場合は元のモデルを使用）')
+    train_parser.add_argument('--metadata_path', type=str, default=None, help='モデルのメタデータファイルのパス（指定しない場合は_metadata.jsonを使用）')
+
     # データセット関連の引数
     train_parser.add_argument('--image_dirs', type=str, nargs='+', required=True, help='トレーニング画像のディレクトリ（複数指定可）')
     train_parser.add_argument('--val_split', type=float, default=0.1, help='検証データの割合')
@@ -2081,11 +2084,11 @@ def main():
     
     if args.command == 'analyze':
         # モデル構造の分析
-        analyze_model_structure()
+        analyze_model_structure(base_model=args.base_model)
     
     elif args.command == 'predict':
         # 単一画像の予測
-        model, labels = load_model(args.model_path, args.metadata_path)
+        model, labels = load_model(args.model_path, args.metadata_path, base_model=args.base_model)
         
         # 画像に紐づくタグを読み込む
         actual_tags = read_tags_from_file(args.image)
@@ -2138,7 +2141,7 @@ def main():
     
     elif args.command == 'batch':
         # モデルの読み込み
-        model, labels = load_model(args.lora_model)
+        model, labels = load_model(args.model_path, args.metadata_path, base_model=args.base_model)
         
         # 画像ファイルのリストを取得
         import glob
@@ -2212,7 +2215,7 @@ def main():
         
         # 既存のタグリストを読み込む
         print("既存のタグリストを読み込んでいます...")
-        labels = load_labels_hf(repo_id=MODEL_REPO)
+        labels = load_labels_hf(repo_id=args.base_model)
         existing_tags = labels.names
         print(f"既存タグ数: {len(existing_tags)}")
         
