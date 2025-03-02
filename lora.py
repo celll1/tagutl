@@ -363,6 +363,7 @@ def load_model(model_path=None, metadata_path=None, base_model='SmilingWolf/wd-e
         # モデルの指定がない場合も EVA02WithModuleLoRA を使用
         print("初期化されたLoRAモデルを使用します（元のモデルと同等）")
         model = EVA02WithModuleLoRA(
+            base_model=base_model,
             num_classes=num_classes,  # 元のモデルのクラス数
             lora_rank=4,              # デフォルト値
             lora_alpha=1.0,           # デフォルト値
@@ -398,6 +399,7 @@ def load_model(model_path=None, metadata_path=None, base_model='SmilingWolf/wd-e
         
         # モデルを作成
         model = EVA02WithModuleLoRA(
+            base_model=base_model,
             num_classes=num_classes,
             lora_rank=lora_rank,
             lora_alpha=lora_alpha,
@@ -1391,6 +1393,7 @@ def compute_metrics(outputs, targets):
 # トレーニング関数
 def train_model(
     model, 
+    base_model,
     train_loader, 
     val_loader, 
     tag_to_idx,
@@ -1415,7 +1418,7 @@ def train_model(
     # 出力ディレクトリの作成
     os.makedirs(output_dir, exist_ok=True)
 
-    def save_model(output_dir, filename, save_format, model, optimizer, scheduler, epoch, threshold, val_loss, val_f1, tag_to_idx, idx_to_tag, tag_to_category, existing_tags_count):
+    def save_model(output_dir, filename, base_model, save_format, model, optimizer, scheduler, epoch, threshold, val_loss, val_f1, tag_to_idx, idx_to_tag, tag_to_category, existing_tags_count):
         os.makedirs(output_dir, exist_ok=True)
         
         # モデルの状態辞書
@@ -1423,6 +1426,7 @@ def train_model(
         
         # メタデータ情報
         metadata = {
+            'base_model': base_model,
             'epoch': epoch,
             'threshold': threshold,
             'val_loss': val_loss,
@@ -1442,6 +1446,7 @@ def train_model(
             'model_state_dict': model_state_dict,
             # 'optimizer_state_dict': optimizer.state_dict() if optimizer else None,
             # 'scheduler_state_dict': scheduler.state_dict() if scheduler else None,
+            'base_model': base_model,
             'epoch': epoch,
             'threshold': threshold,
             'val_loss': val_loss,
@@ -1455,7 +1460,6 @@ def train_model(
             'tag_to_category': tag_to_category,
             'existing_tags_count': existing_tags_count
         }
-        save_path = os.path.join(output_dir, filename)
 
         if save_format == 'safetensors':
             # safetensors形式ではテンソルのみ保存可能
@@ -1768,15 +1772,15 @@ def train_model(
 
         if save_model_flag:
             # モデルの保存
-            save_model(output_dir, f'best_model', save_format, model, optimizer, scheduler, epoch, threshold, val_loss, val_metrics['f1'], tag_to_idx, idx_to_tag, tag_to_category, existing_tags_count)
+            save_model(output_dir, f'best_model', base_model, save_format, model, optimizer, scheduler, epoch, threshold, val_loss, val_metrics['f1'], tag_to_idx, idx_to_tag, tag_to_category, existing_tags_count)
             print(f"Best model saved! (Val F1: {val_metrics['f1']:.4f}, Val Loss: {val_loss:.4f})")
     
         elif (epoch + 1) % checkpoint_interval == 0:
-            save_model(output_dir, f'checkpoint_epoch_{epoch+1}', save_format, model, optimizer, scheduler, epoch, threshold, val_loss, val_metrics['f1'], tag_to_idx, idx_to_tag, tag_to_category, existing_tags_count)
+            save_model(output_dir, f'checkpoint_epoch_{epoch+1}', base_model, save_format, model, optimizer, scheduler, epoch, threshold, val_loss, val_metrics['f1'], tag_to_idx, idx_to_tag, tag_to_category, existing_tags_count)
             print(f"Checkpoint saved at epoch {epoch+1}")
     
     # 最終モデルの保存
-    save_model(output_dir, f'final_model', save_format, model, optimizer, scheduler, epoch, threshold, val_loss, val_metrics['f1'], tag_to_idx, idx_to_tag, tag_to_category, existing_tags_count)
+    save_model(output_dir, f'final_model', base_model, save_format, model, optimizer, scheduler, epoch, threshold, val_loss, val_metrics['f1'], tag_to_idx, idx_to_tag, tag_to_category, existing_tags_count)
     print(f"Final model saved! (Val F1: {val_metrics['f1']:.4f}, Val Loss: {val_loss:.4f})")
 
     save_tag_mapping(output_dir, idx_to_tag, tag_to_category)
@@ -2078,6 +2082,7 @@ def main():
     train_parser.add_argument('--use_8bit_optimizer', action='store_true', help='8-bitオプティマイザを使用する')
     train_parser.add_argument('--tensorboard', action='store_true', help='TensorBoardを使用する')
     train_parser.add_argument('--tensorboard_port', type=int, default=6006, help='TensorBoardのポート番号')
+    train_parser.add_argument('--bind_all', action='store_true', help='TensorBoardをすべてのネットワークインターフェースにバインドする')
     train_parser.add_argument('--seed', type=int, default=42, help='乱数シード')
     
     debug_parser = subparsers.add_parser('debug', help='モデルのデバッグを行います')
@@ -2089,8 +2094,12 @@ def main():
         analyze_model_structure(base_model=args.base_model)
     
     elif args.command == 'predict':
+
+        device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        print(f"使用デバイス: {device}")
+
         # 単一画像の予測
-        model, labels = load_model(args.model_path, args.metadata_path, base_model=args.base_model)
+        model, labels = load_model(args.model_path, args.metadata_path, base_model=args.base_model, device=device)
         
         # 画像に紐づくタグを読み込む
         actual_tags = read_tags_from_file(args.image)
@@ -2142,8 +2151,12 @@ def main():
         )
     
     elif args.command == 'batch':
+
+        device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        print(f"使用デバイス: {device}")
+
         # モデルの読み込み
-        model, labels = load_model(args.model_path, args.metadata_path, base_model=args.base_model)
+        model, labels = load_model(args.model_path, args.metadata_path, base_model=args.base_model, device=device)
         
         # 画像ファイルのリストを取得
         import glob
@@ -2351,7 +2364,7 @@ def main():
             try:
                 import subprocess
                 tensorboard_process = subprocess.Popen(
-                    ['tensorboard', '--logdir', os.path.join(args.output_dir, 'tensorboard_logs'), '--port', str(args.tensorboard_port)]
+                    ['tensorboard', '--logdir', os.path.join(args.output_dir, 'tensorboard_logs'), '--port', str(args.tensorboard_port), '--bind_all'] if args.bind_all else ['tensorboard', '--logdir', os.path.join(args.output_dir, 'tensorboard_logs'), '--port', str(args.tensorboard_port)]
                 )
                 print(f"TensorBoardを起動しました: http://localhost:{args.tensorboard_port}")
             except Exception as e:
@@ -2365,6 +2378,7 @@ def main():
         print("トレーニングを開始します...")
         train_model(
             model=model,
+            base_model=args.base_model,
             train_loader=train_loader,
             val_loader=val_loader,
             tag_to_idx=tag_to_idx,
