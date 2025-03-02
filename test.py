@@ -256,16 +256,16 @@ class EVA02WithModuleLoRA(nn.Module):
         
         # 新しいヘッドを作成
         new_head = nn.Linear(self.feature_dim, num_classes)
-        
-        # 既存タグの重みとバイアスを新しいヘッドにコピー
-        new_head.weight.data[:self.original_num_classes] = original_weight
-        if original_bias is not None:
-            new_head.bias.data[:self.original_num_classes] = original_bias
-        
+                
         # 新規タグの重みを初期化（Xavierの初期化）
         nn.init.xavier_uniform_(new_head.weight.data[self.original_num_classes:])
         if new_head.bias is not None:
             nn.init.zeros_(new_head.bias.data[self.original_num_classes:])
+
+        # 既存タグの重みとバイアスを新しいヘッドに上書きする
+        new_head.weight.data[:self.original_num_classes] = original_weight
+        if original_bias is not None:
+            new_head.bias.data[:self.original_num_classes] = original_bias
         
         # バックボーンのヘッドを新しいヘッドに置き換え
         self.backbone.head = new_head
@@ -774,116 +774,85 @@ class TagImageDataset(torch.utils.data.Dataset):
 # データセットの準備関数
 def prepare_dataset(
     image_dirs, 
-    existing_tags=None, 
+    existing_tags, 
     val_split=0.1, 
     min_tag_freq=5, 
     remove_special_prefix=True,
     seed=42
 ):
-    """
-    画像とタグのデータセットを準備する
-    
-    Args:
-        image_dirs: 画像ディレクトリのリスト
-        existing_tags: 既存のタグリスト（Noneの場合は全てのタグを使用）
-        val_split: 検証データの割合
-        min_tag_freq: タグの最小出現頻度
-        remove_special_prefix: 特殊プレフィックスを除去するかどうか
-        seed: 乱数シード
-    
-    Returns:
-        train_dataset, val_dataset, tag_to_idx, idx_to_tag
-    """
-    # 乱数シードを設定
-    np.random.seed(seed)
-    torch.manual_seed(seed)
-    
-    # 画像ファイルとタグの収集
-    all_image_paths = []
-    all_tags_list = []
-    
-    # 画像拡張子
-    image_extensions = ['.jpg', '.jpeg', '.png', '.webp']
-    
+    """データセットを準備する関数"""
     print("画像とタグを収集しています...")
+    
+    # 画像とタグを収集
+    image_paths = []
+    tags_list = []
+    
     for image_dir in image_dirs:
-        image_dir = Path(image_dir)
-        
-        # 画像ファイルを再帰的に探索
-        for ext in image_extensions:
-            for img_path in image_dir.glob(f"**/*{ext}"):
-                # 対応するタグファイルを探す
-                tag_path = img_path.with_suffix('.txt')
-                
-                if tag_path.exists():
-                    # タグファイルを読み込む
-                    with open(tag_path, 'r', encoding='utf-8') as f:
-                        content = f.read().strip()
+        for root, _, files in os.walk(image_dir):
+            for file in files:
+                if file.lower().endswith(('.jpg', '.jpeg', '.png', '.webp')):
+                    image_path = os.path.join(root, file)
                     
-                    # カンマ区切りのタグを処理
-                    if ',' in content:
-                        tags = [tag.strip() for tag in content.split(',') if tag.strip()]
-                    else:
-                        tags = [line.strip() for line in content.splitlines() if line.strip()]
+                    # タグファイルのパスを取得
+                    tag_file = os.path.splitext(image_path)[0] + '.txt'
                     
-                    # 特殊プレフィックスの除去
-                    if remove_special_prefix:
-                        tags = [tag for tag in tags if not re.match(r'^[a-zA-Z]@', tag)]
-                    
-                    # スペースをアンダースコアに変換
-                    tags = [tag.replace(' ', '_') for tag in tags]
-                    
-                    all_image_paths.append(str(img_path))
-                    all_tags_list.append(tags)
+                    # タグファイルが存在する場合のみ処理
+                    if os.path.exists(tag_file):
+                        tags = read_tags_from_file(tag_file)
+                        if tags:
+                            image_paths.append(image_path)
+                            tags_list.append(tags)
     
-    print(f"収集された画像数: {len(all_image_paths)}")
+    print(f"収集された画像数: {len(image_paths)}")
     
-    # タグの出現頻度を計算
+    # 既存タグの数を表示
+    print(f"既存タグ数: {len(existing_tags)}")
+    
+    # タグの頻度を計算
     tag_freq = {}
-    for tags in all_tags_list:
+    for tags in tags_list:
         for tag in tags:
             tag_freq[tag] = tag_freq.get(tag, 0) + 1
     
-    # 最小出現頻度でフィルタリング
+    # 最小頻度以上のタグを抽出
     filtered_tags = {tag for tag, freq in tag_freq.items() if freq >= min_tag_freq}
     
-    # 既存タグと新規タグの分類
-    if existing_tags is not None:
-        existing_tags_set = set(existing_tags)
-        new_tags = filtered_tags - existing_tags_set
-        used_tags = filtered_tags & existing_tags_set
-        
-        print(f"既存タグ数: {len(existing_tags_set)}")
-        print(f"使用される既存タグ数: {len(used_tags)}")
-        print(f"新規タグ数: {len(new_tags)}")
-        
-        # タグから索引へのマッピング（既存タグを先に配置）
-        tag_to_idx = {tag: i for i, tag in enumerate(sorted(used_tags))}
-        # 新規タグを追加
-        for i, tag in enumerate(sorted(new_tags), start=len(tag_to_idx)):
-            tag_to_idx[tag] = i
-    else:
-        # 全てのタグを使用
-        tag_to_idx = {tag: i for i, tag in enumerate(sorted(filtered_tags))}
+    # 既存タグと新規タグを分離
+    existing_filtered_tags = set(existing_tags) & filtered_tags
+    new_filtered_tags = filtered_tags - set(existing_tags)
     
-    # 索引からタグへのマッピング
+    print(f"使用される既存タグ数: {len(existing_filtered_tags)}")
+    print(f"新規タグ数: {len(new_filtered_tags)}")
+    
+    # タグをインデックスにマッピング
+    # 既存タグは元のインデックスを維持し、新規タグは既存タグの後に追加
+    tag_to_idx = {tag: i for i, tag in enumerate(existing_tags)}
+    
+    # 新規タグのインデックスを追加
+    next_idx = len(existing_tags)
+    for tag in sorted(new_filtered_tags):  # ソートして順序を一定に
+        tag_to_idx[tag] = next_idx
+        next_idx += 1
+    
+    # インデックスからタグへのマッピングを作成
     idx_to_tag = {i: tag for tag, i in tag_to_idx.items()}
     
     print(f"使用されるタグの総数: {len(tag_to_idx)}")
     
-    # データを訓練セットと検証セットに分割
-    indices = np.arange(len(all_image_paths))
+    # データセットを分割
+    indices = list(range(len(image_paths)))
+    np.random.seed(seed)
     np.random.shuffle(indices)
     
-    split_idx = int(len(indices) * (1 - val_split))
-    train_indices = indices[:split_idx]
-    val_indices = indices[split_idx:]
+    val_size = int(len(indices) * val_split)
+    train_indices = indices[val_size:]
+    val_indices = indices[:val_size]
     
-    train_image_paths = [all_image_paths[i] for i in train_indices]
-    train_tags_list = [all_tags_list[i] for i in train_indices]
+    train_image_paths = [image_paths[i] for i in train_indices]
+    train_tags_list = [tags_list[i] for i in train_indices]
     
-    val_image_paths = [all_image_paths[i] for i in val_indices]
-    val_tags_list = [all_tags_list[i] for i in val_indices]
+    val_image_paths = [image_paths[i] for i in val_indices]
+    val_tags_list = [tags_list[i] for i in val_indices]
     
     print(f"訓練データ数: {len(train_image_paths)}")
     print(f"検証データ数: {len(val_image_paths)}")
@@ -956,8 +925,8 @@ class AsymmetricLoss(nn.Module):
             loss_pos = focal_weight_pos * torch.log(pt_pos)
             loss_neg = focal_weight_neg * torch.log(pt_neg)
         
-        # 最終的な損失
-        loss = -loss_pos.sum() - loss_neg.sum()
+        # 最終的な損失（平均を返す）
+        loss = (-loss_pos.sum() - loss_neg.sum()) / x.size(0)
         return loss
 
 
@@ -1031,8 +1000,8 @@ class AsymmetricLossOptimized(nn.Module):
             loss_pos = focal_weight_pos * torch.log(pt_pos)
             loss_neg = focal_weight_neg * torch.log(pt_neg)
         
-        # 最終的な損失
-        loss = -loss_pos.sum() - loss_neg.sum()
+        # 最終的な損失（平均を返す）
+        loss = (-loss_pos.sum() - loss_neg.sum()) / self.xs_pos.size(0)
         return loss
 
 
@@ -1609,13 +1578,14 @@ def main():
         )
         
         # 既存タグの数を記録
-        existing_tags_count = len(set(existing_tags) & set(idx_to_tag.values()))
-        print(f"使用される既存タグ数: {existing_tags_count}")
-        print(f"新規タグ数: {len(idx_to_tag) - existing_tags_count}")
+        existing_tags_count = len(existing_tags)
+        print(f"使用される既存タグ数: {len(set(existing_tags) & set(idx_to_tag.values()))}")
+        print(f"新規タグ数: {len(idx_to_tag) - len(set(existing_tags) & set(idx_to_tag.values()))}")
         
         # 3. モデルのヘッドを拡張（新規タグに対応）
         print("モデルのヘッドを拡張しています...")
-        model.extend_head(num_classes=len(tag_to_idx))
+        total_classes = len(tag_to_idx)
+        model.extend_head(num_classes=total_classes)
         model = model.to(device)
         
         # データ変換の設定
