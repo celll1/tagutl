@@ -14,10 +14,13 @@ from PIL import Image
 from timm.data import create_transform, resolve_data_config
 from torch import Tensor, nn
 from torch.nn import functional as F
+from torchvision import transforms
 import re
 import json
 from tqdm import tqdm
 import matplotlib.pyplot as plt
+import copy
+from io import BytesIO
 
 # デバイスの設定
 torch_device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -593,7 +596,219 @@ def visualize_predictions(image, tags, predictions, threshold=0.35, output_path=
     else:
         plt.show()
         return None
+    
+def visualize_predictions_for_tensorboard(img_tensor, probs, idx_to_tag, threshold=0.35, original_tags=None, max_tags=50, existing_tags_count=None):
+    """
+    TensorBoard 用に可視化した結果の画像を生成し、HWC形式のNumPy配列を返す関数。
+    トレーニング中の確率値とidx_to_tagマッピングから、get_tags関数の出力形式に変換して可視化します。
+    
+    Args:
+        img_tensor: 入力画像 (torch.Tensor, shape: C x H x W)
+        probs: 各タグの予測確率（torch.Tensor または numpy配列, shape: (num_classes,)）
+        idx_to_tag: インデックスからタグ名へのマッピング辞書
+        threshold: タグの表示に用いる閾値
+        original_tags: グラウンドトゥルースラベル (binary numpy配列または torch.Tensor, shape: (num_classes,))
+        max_tags: 表示する最大タグ数
+        existing_tags_count: 既存タグの数（キャラクターとジェネラルタグを分けるために使用）
+    """
+    import matplotlib.pyplot as plt
+    import numpy as np
+    from PIL import Image
+    import torch
 
+    # 確率値をnumpy配列に変換
+    if isinstance(probs, torch.Tensor):
+        probs_np = probs.detach().cpu().numpy()
+    else:
+        probs_np = probs
+    
+    # EVA02モデルでは入力時にRGB→BGRの変換が行われているため、
+    # 表示時にはBGR→RGBに戻す必要がある
+    
+    # チャンネルの順序を元に戻す (BGR → RGB)
+    # [2,1,0] → [0,1,2] の変換を行う
+    if isinstance(img_tensor, torch.Tensor):
+        img_rgb = img_tensor[[2, 1, 0]].detach().cpu()
+    else:
+        img_rgb = img_tensor
+    
+    # 正規化の逆変換（モデルの前処理に依存）
+    # 一般的なImageNetの正規化パラメータを仮定
+    mean = torch.tensor([0.485, 0.456, 0.406]).view(3, 1, 1)
+    std = torch.tensor([0.229, 0.224, 0.225]).view(3, 1, 1)
+    
+    # 正規化の逆変換
+    img_denorm = img_rgb * std + mean
+    
+    # [0,1]の範囲に収める
+    img_denorm = torch.clamp(img_denorm, 0, 1)
+    
+    # PIL画像に変換
+    to_pil = transforms.ToPILImage()
+    image = to_pil(img_denorm)
+
+    # グラウンドトゥルースタグリストを生成
+    if original_tags is not None:
+        if isinstance(original_tags, torch.Tensor):
+            original_tags_np = original_tags.detach().cpu().numpy()
+        else:
+            original_tags_np = original_tags
+        
+        truth_indices = np.where(original_tags_np > 0.5)[0]
+        truth_tags = [idx_to_tag[idx] for idx in truth_indices if idx in idx_to_tag]
+    else:
+        truth_tags = []
+    
+    # 正規化：スペース -> アンダースコア、エスケープされた括弧を通常に変換
+    normalized_truth = []
+    for tag in truth_tags:
+        norm_tag = tag.replace(' ', '_').replace('\\(', '(').replace('\\)', ')')
+        normalized_truth.append(norm_tag)
+    
+    # get_tags関数の出力形式に変換
+    # 1. 全タグと確率値のペアを作成
+    all_tags_probs = [(idx_to_tag[idx], prob) for idx, prob in enumerate(probs_np) if idx in idx_to_tag]
+    
+    # 2. キャラクタータグとジェネラルタグを分離（existing_tags_countが指定されている場合）
+    if existing_tags_count is not None:
+        # 既存タグの中でのキャラクタータグとジェネラルタグの分離は簡易的に
+        # インデックスで判断（実際にはLabelDataのcharacterとgeneralに基づくべき）
+        char_tags = {}
+        gen_tags = {}
+        
+        for idx, prob in enumerate(probs_np):
+            if idx in idx_to_tag:
+                tag = idx_to_tag[idx]
+                # 簡易的な分類（実際のモデルに合わせて調整が必要）
+                if idx < existing_tags_count:
+                    # 既存タグ（簡易的に最初の4つはratingとして扱う）
+                    if idx >= 4:  # rating以外
+                        if "character" in tag.lower() or any(c in tag.lower() for c in ["holo", "genshin", "arknights"]):
+                            char_tags[tag] = prob
+                        else:
+                            gen_tags[tag] = prob
+                else:
+                    # 新規タグ（簡易的にすべてジェネラルタグとして扱う）
+                    gen_tags[tag] = prob
+    else:
+        # 分離情報がない場合は、すべてジェネラルタグとして扱う
+        char_tags = {}
+        gen_tags = {tag: prob for tag, prob in all_tags_probs}
+    
+    # 3. get_tags関数の出力形式に合わせる
+    all_char_labels = char_tags
+    all_gen_labels = gen_tags
+    
+    # タグを3つのカテゴリに分類
+    above_threshold_in_tags = []      # 閾値以上かつグラウンドトゥルースに含まれる（True Positive）
+    above_threshold_not_in_tags = []  # 閾値以上だがグラウンドトゥルースに含まれない（False Positive）
+    below_threshold_in_tags = []      # 閾値未満だがグラウンドトゥルースに含まれる（False Negative）
+    
+    # すべてのタグを結合
+    all_tags_dict = {}
+    all_tags_dict.update(all_char_labels)
+    all_tags_dict.update(all_gen_labels)
+    
+    for tag, prob in all_tags_dict.items():
+        # 正規化
+        norm_tag = tag.replace(' ', '_').replace('\\(', '(').replace('\\)', ')')
+        if prob >= threshold:
+            if norm_tag in normalized_truth:
+                above_threshold_in_tags.append((tag, prob))
+            else:
+                above_threshold_not_in_tags.append((tag, prob))
+        else:
+            if norm_tag in normalized_truth:
+                below_threshold_in_tags.append((tag, prob))
+    
+    # 降順ソート
+    above_threshold_in_tags.sort(key=lambda x: x[1], reverse=True)
+    above_threshold_not_in_tags.sort(key=lambda x: x[1], reverse=True)
+    below_threshold_in_tags.sort(key=lambda x: x[1], reverse=True)
+    
+    # 表示するタグ数を制限
+    total_tags = len(above_threshold_in_tags) + len(above_threshold_not_in_tags) + len(below_threshold_in_tags)
+    if total_tags > max_tags:
+        tags_per_category = max(1, max_tags // 3)
+        above_threshold_in_tags = above_threshold_in_tags[:tags_per_category]
+        above_threshold_not_in_tags = above_threshold_not_in_tags[:tags_per_category]
+        below_threshold_in_tags = below_threshold_in_tags[:tags_per_category]
+    
+    # プロットの作成
+    fig, axs = plt.subplots(1, 2, figsize=(15, 10))
+    
+    # 左側: 入力画像
+    axs[0].imshow(image)
+    axs[0].set_title("Input Image")
+    axs[0].axis('off')
+    
+    # 右側: タグ予測のバーグラフ
+    all_display = above_threshold_in_tags + above_threshold_not_in_tags + below_threshold_in_tags
+    tag_names = [t[0] for t in all_display]
+    probs_list = [t[1] for t in all_display]
+    
+    # カラー指定
+    colors = []
+    for tag, prob in all_display:
+        norm_tag = tag.replace(' ', '_').replace('\\(', '(').replace('\\)', ')')
+        if prob >= threshold and norm_tag in normalized_truth:
+            colors.append('green')  # True Positive
+        elif prob >= threshold:
+            colors.append('red')    # False Positive
+        else:
+            colors.append('blue')   # False Negative
+    
+    # バーチャートの作成
+    y_pos = range(len(tag_names))
+    axs[1].barh(y_pos, probs_list, color=colors)
+    axs[1].set_yticks(y_pos)
+    axs[1].set_yticklabels(tag_names)
+    axs[1].set_xlabel('Probability')
+    axs[1].set_title('Tag Predictions')
+    
+    # 閾値ラインの表示
+    axs[1].axvline(x=threshold, color='black', linestyle='--', alpha=0.7)
+    if len(tag_names) > 0:
+        axs[1].text(threshold, len(tag_names) - 1, f'Threshold: {threshold}', 
+                    horizontalalignment='right', verticalalignment='bottom')
+    
+    # 凡例の追加
+    from matplotlib.patches import Patch
+    legend_elements = [
+        Patch(facecolor='green', label='True Positive (threshold+ & in tags)'),
+        Patch(facecolor='red', label='False Positive (threshold+ & not in tags)'),
+        Patch(facecolor='blue', label='False Negative (threshold- & in tags)')
+    ]
+    axs[1].legend(handles=legend_elements, loc='upper right')
+    
+    plt.tight_layout()
+    
+    # メモリバッファに図を保存し、画像をNumPy配列として取得
+    buf = BytesIO()
+    plt.savefig(buf, format='png', dpi=100)  # dpiを指定して解像度を調整
+    buf.seek(0)
+    vis_img = np.array(Image.open(buf))
+    plt.close(fig)
+    
+    # 画像形式を確認（デバッグ用）
+    print(f"Generated visualization image shape: {vis_img.shape}, dtype: {vis_img.dtype}")
+    
+    # 画像が3チャンネル（RGB）であることを確認
+    if len(vis_img.shape) != 3 or vis_img.shape[2] != 3:
+        print("警告: 生成された画像が3チャンネルRGBではありません。変換を試みます。")
+        # グレースケールの場合はRGBに変換
+        if len(vis_img.shape) == 2:
+            vis_img = np.stack([vis_img, vis_img, vis_img], axis=2)
+        # アルファチャンネルがある場合は削除
+        elif vis_img.shape[2] == 4:
+            vis_img = vis_img[:, :, :3]
+    
+    # データ型がuint8であることを確認
+    if vis_img.dtype != np.uint8:
+        print(f"警告: 画像のデータ型が{vis_img.dtype}です。uint8に変換します。")
+        vis_img = vis_img.astype(np.uint8)
+    
+    return vis_img
 
 def analyze_model_structure():
     """モデル構造を分析し、LoRAを適用すべき層を特定する関数"""
@@ -804,10 +1019,7 @@ def prepare_dataset(
                             tags_list.append(tags)
     
     print(f"収集された画像数: {len(image_paths)}")
-    
-    # 既存タグの数を表示
-    print(f"既存タグ数: {len(existing_tags)}")
-    
+
     # タグの頻度を計算
     tag_freq = {}
     for tags in tags_list:
@@ -817,11 +1029,9 @@ def prepare_dataset(
     # 最小頻度以上のタグを抽出
     filtered_tags = {tag for tag, freq in tag_freq.items() if freq >= min_tag_freq}
     
-    # 既存タグと新規タグを分離
-    existing_filtered_tags = set(existing_tags) & filtered_tags
     new_filtered_tags = filtered_tags - set(existing_tags)
     
-    print(f"使用される既存タグ数: {len(existing_filtered_tags)}")
+    print(f"既存タグ数: {len(existing_tags)}")
     print(f"新規タグ数: {len(new_filtered_tags)}")
     
     # タグをインデックスにマッピング
@@ -838,7 +1048,12 @@ def prepare_dataset(
     idx_to_tag = {i: tag for tag, i in tag_to_idx.items()}
     
     print(f"使用されるタグの総数: {len(tag_to_idx)}")
-    
+
+    # idx-to-tag の最初の10件を表示
+    print(f"idx-to-tag の最初の10件: {list(idx_to_tag.items())[:10]}")
+    # new tagsのidx-to-tagを表示
+    print(f"new tagsのidx-to-tag: {list(idx_to_tag.items())[len(existing_tags):len(existing_tags)+10]}")
+
     # データセットを分割
     indices = list(range(len(image_paths)))
     np.random.seed(seed)
@@ -1022,8 +1237,15 @@ def compute_metrics(outputs, targets, thresholds=None):
         thresholds = np.arange(0.1, 0.95, 0.05)
     
     # CPU上のnumpy配列に変換
-    outputs_np = outputs.cpu().numpy()
-    targets_np = targets.cpu().numpy()
+    if isinstance(outputs, torch.Tensor):
+        outputs_np = outputs.cpu().numpy()
+    else:
+        outputs_np = outputs
+
+    if isinstance(targets, torch.Tensor):
+        targets_np = targets.cpu().numpy()
+    else:
+        targets_np = targets
     
     # 各クラスのPR-AUCを計算
     from sklearn.metrics import precision_recall_curve, auc
@@ -1123,6 +1345,75 @@ def train_model(
     new_tag_indices = list(range(existing_tags_count, total_tags))
     
     print(f"既存タグ数: {len(existing_tag_indices)}, 新規タグ数: {len(new_tag_indices)}")
+
+    # 初期検証（もともとの重みにより推論はある程度できるはず）
+    model.eval()
+    val_loss = 0.0
+    val_preds = []
+    val_targets = []
+    
+    with torch.no_grad():
+        progress_bar = tqdm(val_loader, desc=f"Initial Validation")
+        for i, (images, targets) in enumerate(progress_bar):
+            images = images.to(device)
+            targets = targets.to(device)
+            
+            if mixed_precision:
+                with torch.amp.autocast('cuda'):
+                    outputs = model(images)
+                    loss = criterion(outputs, targets)
+            else:
+                outputs = model(images)
+                loss = criterion(outputs, targets)
+            
+            val_loss += loss.item()
+            
+            # シグモイド関数で確率に変換
+            probs = torch.sigmoid(outputs).cpu().numpy()
+            val_preds.append(probs)
+            val_targets.append(targets.cpu().numpy())
+            
+            progress_bar.set_postfix({"loss": f"{loss.item():.4f}"})
+
+            if i % 5 == 0 and i / 5 < 10:
+                img_grid = visualize_predictions_for_tensorboard(images[0], probs[0], idx_to_tag, threshold=0.35, original_tags=targets[0], max_tags=50, existing_tags_count=existing_tags_count)
+
+                # テスト：ここで一回画像を開く
+                Image.fromarray(img_grid).show()
+
+                if tensorboard:
+                    writer.add_image(f'predictions/initial_val_{i}', img_grid, 0)
+    
+    # 検証メトリクスの計算
+    val_loss /= len(val_loader)
+    val_preds = np.concatenate(val_preds)
+    val_targets = np.concatenate(val_targets)
+    
+    val_metrics = compute_metrics(val_preds, val_targets)
+    
+    # 既存タグと新規タグに分けてメトリクスを計算
+    if existing_tags_count > 0 and len(new_tag_indices) > 0:
+        existing_val_metrics = compute_metrics(
+            val_preds[:, existing_tag_indices], 
+            val_targets[:, existing_tag_indices]
+        )
+        new_val_metrics = compute_metrics(
+            val_preds[:, new_tag_indices], 
+            val_targets[:, new_tag_indices]
+        )
+        
+        print(f"初期検証結果 - 全体 F1: {val_metrics['f1']:.4f}")
+        print(f"初期検証結果 - 既存タグ F1: {existing_val_metrics['f1']:.4f}")
+        print(f"初期検証結果 - 新規タグ F1: {new_val_metrics['f1']:.4f}")
+
+        if tensorboard:
+            writer.add_scalar('Initial/F1_all', val_metrics['f1'], 0)
+            writer.add_scalar('Initial/F1_existing', existing_val_metrics['f1'], 0)
+            writer.add_scalar('Initial/F1_new', new_val_metrics['f1'], 0)
+    else:
+        print(f"初期検証結果 - F1: {val_metrics['f1']:.4f}")
+        if tensorboard:
+            writer.add_scalar('Initial/F1', val_metrics['f1'], 0)
     
     # トレーニングループ
     for epoch in range(num_epochs):
@@ -1135,13 +1426,13 @@ def train_model(
         train_targets = []
         
         progress_bar = tqdm(train_loader, desc=f"Training")
-        for images, targets in progress_bar:
+        for i, (images, targets) in enumerate(progress_bar):
             images = images.to(device)
             targets = targets.to(device)
             
             # 混合精度トレーニング
             if mixed_precision:
-                with torch.cuda.amp.autocast():
+                with torch.amp.autocast('cuda'):
                     outputs = model(images)
                     loss = criterion(outputs, targets)
                 
@@ -1165,9 +1456,20 @@ def train_model(
             train_targets.append(targets.detach().cpu().numpy())
             
             progress_bar.set_postfix({"loss": f"{loss.item():.4f}"})
+
+            # 定期的にTensorBoardに予測結果を記録
+            if tensorboard:
+                # stepごとのlossを記録
+                writer.add_scalar('Train/Step_Loss', loss.item(), epoch * len(train_loader) + i)
+                
+                if i % 100 == 0:
+                    img_grid = visualize_predictions_for_tensorboard(images[0], probs[0], idx_to_tag, threshold=0.35, original_tags=targets[0], max_tags=50, existing_tags_count=existing_tags_count)
+                    writer.add_image(f'predictions/train_epoch_{epoch}', img_grid, i)
         
         # 学習率のスケジューリング
         scheduler.step()
+        if tensorboard:
+            writer.add_scalar('Learning_Rate', optimizer.param_groups[0]['lr'], epoch)
         
         # トレーニングメトリクスの計算
         train_loss /= len(train_loader)
@@ -1186,7 +1488,12 @@ def train_model(
                 train_preds[:, new_tag_indices], 
                 train_targets[:, new_tag_indices]
             )
-        
+
+            if tensorboard:
+                writer.add_scalar('Train/Loss', train_loss, epoch)
+                writer.add_scalar('Train/F1_all', train_metrics['f1'], epoch)
+                writer.add_scalar('Train/F1_existing', existing_train_metrics['f1'], epoch)
+                writer.add_scalar('Train/F1_new', new_train_metrics['f1'], epoch)
         # 検証フェーズ
         model.eval()
         val_loss = 0.0
@@ -1200,7 +1507,7 @@ def train_model(
                 targets = targets.to(device)
                 
                 if mixed_precision:
-                    with torch.cuda.amp.autocast():
+                    with torch.amp.autocast('cuda'):
                         outputs = model(images)
                         loss = criterion(outputs, targets)
                 else:
@@ -1343,10 +1650,173 @@ def train_model(
     return val_metrics
 
 
+def debug_model():
+    """
+    extend_head 前後の重みコピーおよび出力差分を比較するデバッグ関数
+    """
+    import copy
+    
+    # デバイスの設定
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    
+    print("【検証1】extend_head 前のモデル（baseline）の読み込み")
+    model_baseline = EVA02WithModuleLoRA(
+        num_classes=None,  # 既存ヘッドのみ（pre-trained 状態）
+        lora_rank=4,
+        lora_alpha=1.0,
+        lora_dropout=0.0,
+        target_modules=None,
+        pretrained=True
+    )
+    model_baseline = model_baseline.to(device)
+    model_baseline.eval()
+    
+    # baselineヘッドの重みを保持
+    baseline_head_weights = model_baseline.backbone.head.weight.data.clone()
+    baseline_head_bias = None
+    if model_baseline.backbone.head.bias is not None:
+        baseline_head_bias = model_baseline.backbone.head.bias.data.clone()
+    
+    print("Baseline existing head weight stats: mean = {:.6f}, std = {:.6f}".format(
+         baseline_head_weights.mean().item(), baseline_head_weights.std().item()))
+    
+    # 既存タグ数はモデル内部に保持されている (pre-trained ヘッドの out_features)
+    original_num = model_baseline.original_num_classes
+    # ここではシミュレーションとして新規タグ461件を追加する
+    total_classes = original_num + 461
+    print(f"【検証2】ヘッド拡張: {original_num} -> {total_classes} (新規タグ数: 461)")
+    
+    # baselineモデルをコピーして、ヘッド拡張を実施
+    model_extended = copy.deepcopy(model_baseline)
+    model_extended.extend_head(num_classes=total_classes)
+    model_extended = model_extended.to(device)
+    model_extended.eval()
+    
+    ext_head_weights = model_extended.backbone.head.weight.data.clone()
+    ext_head_bias = None
+    if model_extended.backbone.head.bias is not None:
+        ext_head_bias = model_extended.backbone.head.bias.data.clone()
+    
+    # baselineの既存ヘッド部分と、extend後の既存ヘッド部分の差分を確認
+    diff_weights = ext_head_weights[:original_num] - baseline_head_weights
+    print("After extending head, difference stats for existing head portion:")
+    print("  - Difference weight: mean = {:.6f}, std = {:.6f}".format(
+         diff_weights.mean().item(), diff_weights.std().item()))
+    
+    # ダミー入力を用意 (事前にモデルの期待する画像サイズを取得)
+    img_size = model_extended.img_size  # (height, width) 例：(448, 448)
+    dummy_input = torch.randn(1, 3, img_size[0], img_size[1]).to(device)
+    
+    with torch.no_grad():
+        baseline_output = model_baseline(dummy_input)
+        extended_output = model_extended(dummy_input)
+    
+    # 既存タグに該当する部分の出力を比較
+    baseline_existing = baseline_output[:, :original_num]
+    extended_existing = extended_output[:, :original_num]
+    
+    diff_output = extended_existing - baseline_existing
+    print("Existing head output difference (after extend):")
+    print("  - Mean = {:.6f}, Std = {:.6f}".format(diff_output.mean().item(), diff_output.std().item()))
+    
+    # 全体出力の統計も表示
+    print("Extended model overall output stats: mean = {:.6f}, std = {:.6f}".format(
+         extended_output.mean().item(), extended_output.std().item()))
+    
+    debug_id_mapping()
+    
+    print("\n【デバッグ検証終了】")
+
+def debug_id_mapping():
+    """
+    トレーニング時に用いられる tag_to_idx / idx_to_tag のマッピングが正しく構築されているかを確認するためのデバッグ関数
+    ＊ 特に、既存タグ（load_labels_hfで得られる）と、新規タグが正しく追加されているかを確認する
+    """
+    # 事前にload_labels_hfで得た既存のラベルリスト（pre-trainedで使われている順序）の取得
+    labels = load_labels_hf(repo_id=MODEL_REPO)
+    existing_tags = labels.names
+    num_existing = len(existing_tags)
+    print(f"pre-trainedから取得した既存タグ数: {num_existing}")
+    
+    # ダミーの画像ディレクトリ（またはテスト用のタグリスト）を用意する
+    # ここでは既存タグに含まれていないタグを新規タグと仮定
+    # 例として、既存タグの一部だけ＆新規タグを含む簡易テストケースを作成します
+    image_paths = ["images/002_ev201_a.jpg", "images/007_ev201_f.jpg", "images/013_ev202_a.jpg"]
+    tags_list = [
+        # この画像は既存タグのみを含む
+        existing_tags[:10],
+        # この画像は既存タグと、新規タグ "new_tag_A", "new_tag_B" を含む
+        existing_tags[5:15] + ["new_tag_A", "new_tag_B"],
+        # この画像は新規タグのみ
+        ["new_tag_A", "new_tag_B", "new_tag_C"]
+    ]
+    
+    # prepare_dataset 内部ではファイル入出力がありますので、ここではその一部処理のみ、つまり
+    # タグの頻度計算、フィルタリング、既存／新規タグの分離、そしてマッピングの構築部のみをシミュレーションします
+    tag_freq = {}
+    for tags in tags_list:
+        for tag in tags:
+            tag_freq[tag] = tag_freq.get(tag, 0) + 1
+    # min_tag_freq を1として全てのタグを採用（テスト目的）
+    filtered_tags = {tag for tag, freq in tag_freq.items() if freq >= 1}
+    
+    # 既存タグと新規タグの分離
+    existing_filtered_tags = set(existing_tags) & filtered_tags
+    new_filtered_tags = filtered_tags - set(existing_tags)
+    
+    print(f"フィルタリング後の既存タグ数: {len(existing_filtered_tags)}")
+    print(f"フィルタリング後の新規タグ数: {len(new_filtered_tags)}")
+    
+    # マッピング作成
+    # 既存タグはそのままの順序で
+    tag_to_idx = {tag: i for i, tag in enumerate(existing_tags)}
+    
+    next_idx = num_existing
+    for tag in sorted(new_filtered_tags):
+        tag_to_idx[tag] = next_idx
+        next_idx += 1
+    idx_to_tag = {i: tag for tag, i in tag_to_idx.items()}
+    
+    total_tags = len(tag_to_idx)
+    print(f"最終的に使用されるタグの総数: {total_tags}")
+    
+    # マッピングの先頭部分（既存タグ側）と後半部分（新規タグ側）を確認
+    print("\n【既存タグマッピング（一部表示）】")
+    for i in range(min(10, num_existing)):
+        print(f"Index: {i} → {idx_to_tag[i]}")
+        
+    print("\n【新規タグマッピング】")
+    for i in range(num_existing, total_tags):
+        print(f"Index: {i} → {idx_to_tag[i]}")
+    
+    # 次に、シンプルな TagImageDataset を用いて、実際のターゲット生成結果を確認する
+    # 前処理に remove_special_prefix が有効の場合と無効の場合で確認可能
+    from torchvision import transforms
+    transform = transforms.Compose([
+        transforms.ToTensor()
+    ])
+    
+    dataset = TagImageDataset(
+        image_paths=image_paths,
+        tags_list=tags_list,
+        tag_to_idx=tag_to_idx,
+        transform=transform,
+        min_tag_freq=1,  # 全タグ使用
+        remove_special_prefix=True  # 本来は学習からは除外すべきプレフィックス
+    )
+    
+    print("\n【各サンプルのターゲットベクトル（nonzero indices）】")
+    for idx in range(len(dataset)):
+        image_tensor, target = dataset[idx]
+        nz = target.nonzero(as_tuple=False).squeeze().tolist()
+        print(f"Sample {idx}: ターゲットindices = {nz}")
+    
+
 def main():
     parser = argparse.ArgumentParser(description="SmilingWolf/wd-eva02-large-tagger-v3モデルを使用して画像のタグを推論し、LoRAトレーニングのための準備を行います。")
     subparsers = parser.add_subparsers(dest='command', help='コマンド')
-    
+
+    # ここに必要な引数を追加します（省略）
     # 分析コマンド
     analyze_parser = subparsers.add_parser('analyze', help='モデル構造を分析します')
     
@@ -1373,7 +1843,7 @@ def main():
     train_parser.add_argument('--image_dirs', type=str, nargs='+', required=True, help='トレーニング画像のディレクトリ（複数指定可）')
     train_parser.add_argument('--val_split', type=float, default=0.1, help='検証データの割合')
     train_parser.add_argument('--min_tag_freq', type=int, default=5, help='タグの最小出現頻度')
-    train_parser.add_argument('--remove_special_prefix', action='store_true', help='特殊プレフィックス（例：a@、g@など）を除去する')
+    train_parser.add_argument('--remove_special_prefix', default=True, action='store_true', help='特殊プレフィックス（例：a@、g@など）を除去する')
     # train_parser.add_argument('--image_size', type=int, default=224, help='画像サイズ')
     train_parser.add_argument('--batch_size', type=int, default=4, help='バッチサイズ')
     train_parser.add_argument('--num_workers', type=int, default=4, help='データローダーのワーカー数')
@@ -1405,6 +1875,8 @@ def main():
     train_parser.add_argument('--tensorboard_port', type=int, default=6006, help='TensorBoardのポート番号')
     train_parser.add_argument('--seed', type=int, default=42, help='乱数シード')
     
+    debug_parser = subparsers.add_parser('debug', help='モデルのデバッグを行います')
+
     args = parser.parse_args()
     
     if args.command == 'analyze':
@@ -1750,6 +2222,9 @@ def main():
         # TensorBoardプロセスの終了
         if args.tensorboard and 'tensorboard_process' in locals():
             tensorboard_process.terminate()
+
+    elif args.command == 'debug':
+        debug_model()
     
     else:
         parser.print_help()
