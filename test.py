@@ -21,6 +21,7 @@ from tqdm import tqdm
 import matplotlib.pyplot as plt
 import copy
 from io import BytesIO
+from collections import defaultdict
 
 # デバイスの設定
 torch_device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -618,10 +619,9 @@ def visualize_predictions(image, tags, predictions, threshold=0.35, output_path=
         plt.show()
         return None
     
-def visualize_predictions_for_tensorboard(img_tensor, probs, idx_to_tag, threshold=0.35, original_tags=None, max_tags=50, existing_tags_count=None):
+def visualize_predictions_for_tensorboard(img_tensor, probs, idx_to_tag, threshold=0.35, original_tags=None,  existing_tags_count=None, tag_to_category=None):
     """
     TensorBoard 用に可視化した結果の画像を生成し、HWC形式のNumPy配列を返す関数。
-    トレーニング中の確率値とidx_to_tagマッピングから、get_tags関数の出力形式に変換して可視化します。
     
     Args:
         img_tensor: 入力画像 (torch.Tensor, shape: C x H x W)
@@ -629,13 +629,14 @@ def visualize_predictions_for_tensorboard(img_tensor, probs, idx_to_tag, thresho
         idx_to_tag: インデックスからタグ名へのマッピング辞書
         threshold: タグの表示に用いる閾値
         original_tags: グラウンドトゥルースラベル (binary numpy配列または torch.Tensor, shape: (num_classes,))
-        max_tags: 表示する最大タグ数
-        existing_tags_count: 既存タグの数（キャラクターとジェネラルタグを分けるために使用）
+        existing_tags_count: 既存タグの数
+        tag_to_category: タグからカテゴリへのマッピング辞書
     """
     import matplotlib.pyplot as plt
     import numpy as np
     from PIL import Image
     import torch
+    from collections import defaultdict
 
     # 確率値をnumpy配列に変換
     if isinstance(probs, torch.Tensor):
@@ -683,77 +684,43 @@ def visualize_predictions_for_tensorboard(img_tensor, probs, idx_to_tag, thresho
     # 正規化：スペース -> アンダースコア、エスケープされた括弧を通常に変換
     normalized_truth = []
     for tag in truth_tags:
-        norm_tag = tag.replace(' ', '_').replace('\\(', '(').replace('\\)', ')')
+        norm_tag = normalize_tag(tag)
         normalized_truth.append(norm_tag)
     
-    # get_tags関数の出力形式に変換
-    # 1. 全タグと確率値のペアを作成
-    all_tags_probs = [(idx_to_tag[idx], prob) for idx, prob in enumerate(probs_np) if idx in idx_to_tag]
-    
-    # 2. キャラクタータグとジェネラルタグを分離（existing_tags_countが指定されている場合）
-    if existing_tags_count is not None:
-        # 既存タグの中でのキャラクタータグとジェネラルタグの分離は簡易的に
-        # インデックスで判断（実際にはLabelDataのcharacterとgeneralに基づくべき）
-        char_tags = {}
-        gen_tags = {}
-        
-        for idx, prob in enumerate(probs_np):
-            if idx in idx_to_tag:
-                tag = idx_to_tag[idx]
-                # 簡易的な分類（実際のモデルに合わせて調整が必要）
-                if idx < existing_tags_count:
-                    # 既存タグ（簡易的に最初の4つはratingとして扱う）
-                    if idx >= 4:  # rating以外
-                        if "character" in tag.lower() or any(c in tag.lower() for c in ["holo", "genshin", "arknights"]):
-                            char_tags[tag] = prob
-                        else:
-                            gen_tags[tag] = prob
-                else:
-                    # 新規タグ（簡易的にすべてジェネラルタグとして扱う）
-                    gen_tags[tag] = prob
-    else:
-        # 分離情報がない場合は、すべてジェネラルタグとして扱う
-        char_tags = {}
-        gen_tags = {tag: prob for tag, prob in all_tags_probs}
-    
-    # 3. get_tags関数の出力形式に合わせる
-    all_char_labels = char_tags
-    all_gen_labels = gen_tags
+    # タグをカテゴリごとに分類（可視化のためだけに使用）
+    category_tags = defaultdict(list)
     
     # タグを3つのカテゴリに分類
     above_threshold_in_tags = []      # 閾値以上かつグラウンドトゥルースに含まれる（True Positive）
     above_threshold_not_in_tags = []  # 閾値以上だがグラウンドトゥルースに含まれない（False Positive）
     below_threshold_in_tags = []      # 閾値未満だがグラウンドトゥルースに含まれる（False Negative）
     
-    # すべてのタグを結合
-    all_tags_dict = {}
-    all_tags_dict.update(all_char_labels)
-    all_tags_dict.update(all_gen_labels)
-    
-    for tag, prob in all_tags_dict.items():
-        # 正規化
-        norm_tag = tag.replace(' ', '_').replace('\\(', '(').replace('\\)', ')')
-        if prob >= threshold:
-            if norm_tag in normalized_truth:
-                above_threshold_in_tags.append((tag, prob))
+    for idx, prob in enumerate(probs_np):
+        if idx in idx_to_tag:
+            tag = idx_to_tag[idx]
+            normalized_tag = normalize_tag(tag)
+            
+            # タグのカテゴリを決定（可視化のためだけに使用）
+            if tag_to_category and normalized_tag in tag_to_category:
+                category = tag_to_category[normalized_tag]
             else:
-                above_threshold_not_in_tags.append((tag, prob))
-        else:
-            if norm_tag in normalized_truth:
-                below_threshold_in_tags.append((tag, prob))
+                # カテゴリ情報がない場合はデフォルトでGeneral
+                category = 'General'
+            
+            # 閾値に基づいて分類
+            if prob >= threshold:
+                if normalized_tag in normalized_truth:
+                    above_threshold_in_tags.append((tag, prob, category))
+                else:
+                    above_threshold_not_in_tags.append((tag, prob, category))
+            else:
+                if normalized_tag in normalized_truth:
+                    below_threshold_in_tags.append((tag, prob, category))
     
     # 降順ソート
     above_threshold_in_tags.sort(key=lambda x: x[1], reverse=True)
     above_threshold_not_in_tags.sort(key=lambda x: x[1], reverse=True)
     below_threshold_in_tags.sort(key=lambda x: x[1], reverse=True)
-    
-    # 表示するタグ数を制限
-    total_tags = len(above_threshold_in_tags) + len(above_threshold_not_in_tags) + len(below_threshold_in_tags)
-    if total_tags > max_tags:
-        tags_per_category = max(1, max_tags // 3)
-        above_threshold_in_tags = above_threshold_in_tags[:tags_per_category]
-        above_threshold_not_in_tags = above_threshold_not_in_tags[:tags_per_category]
-        below_threshold_in_tags = below_threshold_in_tags[:tags_per_category]
     
     # プロットの作成
     fig, axs = plt.subplots(1, 2, figsize=(15, 10))
@@ -770,8 +737,8 @@ def visualize_predictions_for_tensorboard(img_tensor, probs, idx_to_tag, thresho
     
     # カラー指定
     colors = []
-    for tag, prob in all_display:
-        norm_tag = tag.replace(' ', '_').replace('\\(', '(').replace('\\)', ')')
+    for tag, prob, _ in all_display:
+        norm_tag = normalize_tag(tag)
         if prob >= threshold and norm_tag in normalized_truth:
             colors.append('green')  # True Positive
         elif prob >= threshold:
@@ -1341,7 +1308,7 @@ def train_model(
             progress_bar.set_postfix({"loss": f"{loss.item():.4f}"})
 
             if i % 5 == 0 and i / 5 < 10:
-                img_grid = visualize_predictions_for_tensorboard(images[0], probs[0], idx_to_tag, threshold=0.35, original_tags=targets[0], max_tags=50, existing_tags_count=existing_tags_count)
+                img_grid = visualize_predictions_for_tensorboard(images[0], probs[0], idx_to_tag, threshold=0.35, original_tags=targets[0], existing_tags_count=existing_tags_count)
 
                 if tensorboard:
                     writer.add_image(f'predictions/val_{i}', img_grid, 0)
@@ -1428,7 +1395,7 @@ def train_model(
                 writer.add_scalar('Train/Step_Loss', loss.item(), epoch * len(train_loader) + i)
                 
                 if i % 100 == 0:
-                    img_grid = visualize_predictions_for_tensorboard(images[0], probs[0], idx_to_tag, threshold=0.35, original_tags=targets[0], max_tags=50, existing_tags_count=existing_tags_count)
+                    img_grid = visualize_predictions_for_tensorboard(images[0], probs[0], idx_to_tag, threshold=0.35, original_tags=targets[0], existing_tags_count=existing_tags_count)
                     writer.add_image(f'predictions/train_epoch_{epoch}', img_grid, i)
         
         # 学習率のスケジューリング
@@ -1489,7 +1456,7 @@ def train_model(
                 progress_bar.set_postfix({"loss": f"{loss.item():.4f}"})
 
                 if i % 5 == 0 and i / 5 < 10:
-                    img_grid = visualize_predictions_for_tensorboard(images[0], probs[0], idx_to_tag, threshold=0.35, original_tags=targets[0], max_tags=50, existing_tags_count=existing_tags_count)
+                    img_grid = visualize_predictions_for_tensorboard(images[0], probs[0], idx_to_tag, threshold=0.35, original_tags=targets[0], existing_tags_count=existing_tags_count)
 
                     if tensorboard:
                         writer.add_image(f'predictions/val_{i}', img_grid, epoch+1)
@@ -1712,7 +1679,7 @@ def debug_id_mapping():
     # ダミーの画像ディレクトリ（またはテスト用のタグリスト）を用意する
     # ここでは既存タグに含まれていないタグを新規タグと仮定
     # 例として、既存タグの一部だけ＆新規タグを含む簡易テストケースを作成します
-    image_paths = ["images/002_ev201_a.jpg", "images/007_ev201_f.jpg", "images/013_ev202_a.jpg"]
+    image_paths = ["b.jpg", "f.jpg", "a.jpg"]
     tags_list = [
         # この画像は既存タグのみを含む
         existing_tags[:10],
@@ -1780,6 +1747,60 @@ def debug_id_mapping():
         nz = target.nonzero(as_tuple=False).squeeze().tolist()
         print(f"Sample {idx}: ターゲットindices = {nz}")
     
+
+def load_tag_categories():
+    """
+    taggroupディレクトリからタグカテゴリ情報を読み込む関数
+    
+    Returns:
+        dict: タグからカテゴリへのマッピング辞書
+    """
+    tag_to_category = {}
+    categories = ['Artist', 'Character', 'Copyright', 'General', 'Meta']
+    
+    for category in categories:
+        json_path = os.path.join('taggroup', f'{category}.json')
+        if os.path.exists(json_path):
+            try:
+                with open(json_path, 'r', encoding='utf-8') as f:
+                    category_tags = json.load(f)
+                    for tag in category_tags.keys():
+                        # タグ名を正規化（スペースをアンダースコアに、エスケープされた括弧を通常に）
+                        normalized_tag = tag.replace(' ', '_').replace('\\(', '(').replace('\\)', ')')
+                        tag_to_category[normalized_tag] = category
+                print(f"Loaded {len(category_tags)} tags for category {category}")
+            except Exception as e:
+                print(f"Error loading {category} tags: {e}")
+    
+    return tag_to_category
+
+def save_tag_mapping(output_dir, idx_to_tag, tag_to_category):
+    """
+    idx_to_tag マッピングとカテゴリ情報を保存する関数
+    
+    Args:
+        output_dir: 出力ディレクトリ
+        idx_to_tag: インデックスからタグへのマッピング
+        tag_to_category: タグからカテゴリへのマッピング
+    """
+    # idx - tag - category のマッピングを作成
+    tag_mapping = {}
+    for idx, tag in idx_to_tag.items():
+        normalized_tag = tag.replace(' ', '_').replace('\\(', '(').replace('\\)', ')')
+        category = tag_to_category.get(normalized_tag, 'General')  # デフォルトはGeneral
+        tag_mapping[idx] = {
+            'tag': tag,
+            'category': category
+        }
+    
+    # JSONとして保存
+    os.makedirs(output_dir, exist_ok=True)
+    mapping_path = os.path.join(output_dir, 'tag_mapping.json')
+    with open(mapping_path, 'w', encoding='utf-8') as f:
+        json.dump(tag_mapping, f, indent=2, ensure_ascii=False)
+    
+    print(f"Tag mapping saved to {mapping_path}")
+    return mapping_path
 
 def main():
     parser = argparse.ArgumentParser(description="SmilingWolf/wd-eva02-large-tagger-v3モデルを使用して画像のタグを推論し、LoRAトレーニングのための準備を行います。")
@@ -2167,12 +2188,8 @@ def main():
         print(f"最終モデルを保存しました: {os.path.join(args.output_dir, 'final_model.pth')}")
         
         # タグマッピングの保存
-        with open(os.path.join(args.output_dir, 'tag_mapping.json'), 'w', encoding='utf-8') as f:
-            json.dump({
-                'tag_to_idx': tag_to_idx,
-                'idx_to_tag': idx_to_tag,
-                'existing_tags_count': existing_tags_count
-            }, f, indent=2, ensure_ascii=False)
+        tag_to_category = load_tag_categories()
+        save_tag_mapping(args.output_dir, idx_to_tag, tag_to_category)
         
         print("トレーニングが完了しました！")
         
