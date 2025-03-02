@@ -184,8 +184,8 @@ class EVA02WithModuleLoRA(nn.Module):
         self, 
         base_model: str = 'SmilingWolf/wd-eva02-large-tagger-v3',
         num_classes=None,  # 初期化時にはNoneでも可能に
-        lora_rank=4, 
-        lora_alpha=1.0, 
+        lora_rank=32, 
+        lora_alpha=16, 
         lora_dropout=0.0,
         target_modules=None,
         pretrained=True
@@ -341,6 +341,90 @@ class EVA02WithModuleLoRA(nn.Module):
         # ヘッドのパラメータも訓練可能に設定
         for param in self.backbone.head.parameters():
             param.requires_grad = True
+
+    def merge_lora_to_base_model(self, scale=1.0):
+        """
+        LoRAの重みをベースモデルにマージする
+        
+        Args:
+            scale: マージ時のスケーリング係数（デフォルト: 1.0）
+        
+        Returns:
+            マージされたモジュールの数
+        """
+        # lora_modulesが存在しない場合は、モデル内のLoRALinearモジュールを検索
+        if not hasattr(self, 'lora_modules') or not self.lora_modules:
+            print("lora_modulesが見つかりません。モデル内のLoRALinearモジュールを検索します...")
+            self.lora_modules = {}
+            
+            # モデル内のすべてのLoRALinearモジュールを検索
+            for name, module in self.named_modules():
+                if isinstance(module, LoRALinear):
+                    self.lora_modules[name] = module
+                    print(f"LoRAモジュールを検出: {name}")
+        
+        if not self.lora_modules:
+            print("マージするLoRAモジュールがありません。")
+            return 0
+        
+        merged_count = 0
+        for name, module in self.lora_modules.items():
+            if isinstance(module, LoRALinear):
+                # LoRAの計算: x @ (A @ B) * scale
+                # ベースの重みに A @ B * scale を加算
+                print(f"マージ中のモジュール: {name}")
+                with torch.no_grad():
+                    # 行列のサイズを確認
+                    base_weight_shape = module.base_layer.weight.shape
+                    lora_a_shape = module.lora.lora_A.shape
+                    lora_b_shape = module.lora.lora_B.shape
+                    
+                    print(f"  base_weight: {base_weight_shape}, lora_A: {lora_a_shape}, lora_B: {lora_b_shape}")
+                    
+                    # 行列の掛け算と転置を適切に行う
+                    if base_weight_shape[0] == lora_b_shape[1] and base_weight_shape[1] == lora_a_shape[0]:
+                        # ケース1: base_weight が out_features x in_features で
+                        # lora_A が in_features x rank, lora_B が rank x out_features の場合
+                        # (B.T @ A.T).T = A @ B を計算
+                        lora_weight = (module.lora.lora_B.t() @ module.lora.lora_A.t()).t()
+                    elif base_weight_shape[0] == lora_a_shape[0] and base_weight_shape[1] == lora_b_shape[1]:
+                        # ケース2: base_weight が out_features x in_features で
+                        # lora_A が out_features x rank, lora_B が rank x in_features の場合
+                        # A @ B を計算
+                        lora_weight = module.lora.lora_A @ module.lora.lora_B
+                    else:
+                        print(f"  警告: 行列のサイズが一致しません。このモジュールはスキップします。")
+                        continue
+                    
+                    # スケーリングを適用
+                    lora_weight = lora_weight * (module.lora.scale * scale)
+                    
+                    # 行列のサイズを確認
+                    print(f"  計算されたlora_weight: {lora_weight.shape}")
+                    
+                    # ベースの重みに加算する前に次元が一致するか確認
+                    if lora_weight.shape == base_weight_shape:
+                        module.base_layer.weight.data += lora_weight.to(module.base_layer.weight.data.device)
+                        merged_count += 1
+                    else:
+                        print(f"  警告: 計算されたLoRA重みのサイズ({lora_weight.shape})がベース重みのサイズ({base_weight_shape})と一致しません。")
+                        # 転置して試してみる
+                        if lora_weight.t().shape == base_weight_shape:
+                            print(f"  転置後のサイズが一致するため、転置して加算します。")
+                            module.base_layer.weight.data += lora_weight.t().to(module.base_layer.weight.data.device)
+                            merged_count += 1
+                        else:
+                            print(f"  このモジュールはスキップします。")
+        
+        print(f"{merged_count}個のLoRAモジュールをベースモデルにマージしました（スケール: {scale}）")
+        
+        # マージ後はLoRAモジュールをリセット
+        self.lora_modules = {}
+        
+        # LoRAを再適用（空のLoRAを適用）
+        self._apply_lora_to_modules()
+        
+        return merged_count
     
     def forward(self, x):
         # モデル全体を通して推論
@@ -457,10 +541,10 @@ def load_model(model_path=None, metadata_path=None, base_model='SmilingWolf/wd-e
                 if idx_to_tag is not None:
                     # 新しいLabelDataオブジェクトを作成
                     labels = LabelData(
-                        names=[],
-                        rating=[],
-                        general=[],
-                        character=[]
+                        names=[idx_to_tag[i] for i in range(len(idx_to_tag))],
+                        rating=np.array([0, 1, 2, 3]),  # デフォルト値
+                        general=np.array([]),  # 簡易的な設定
+                        character=np.array([])  # 簡易的な設定
                     )
                     
                     try:
@@ -476,6 +560,7 @@ def load_model(model_path=None, metadata_path=None, base_model='SmilingWolf/wd-e
                         rating_indices = []
                         general_indices = []
                         character_indices = []
+                        rating_indices = []
                         
                         # すべてのインデックスに対応するタグを取得
                         for i in range(num_classes):
@@ -539,9 +624,16 @@ def load_model(model_path=None, metadata_path=None, base_model='SmilingWolf/wd-e
                 target_modules=target_modules,
                 pretrained=True
             )
-            
-            # 状態辞書をモデルに読み込む
+
             model.load_state_dict(state_dict)
+            
+            # LoRAモジュールを明示的に検出
+            model.lora_modules = {}
+            for name, module in model.named_modules():
+                if isinstance(module, LoRALinear):
+                    model.lora_modules[name] = module
+            
+            print(f"検出されたLoRAモジュール数: {len(model.lora_modules)}")
         else:
             raise ValueError(f"メタデータファイルが見つかりません: {metadata_path}")
     else:
@@ -2041,6 +2133,8 @@ def main():
     train_parser.add_argument('--base_model', type=str, default='SmilingWolf/wd-eva02-large-tagger-v3', help='使用するベースモデルのリポジトリ')
     train_parser.add_argument('--model_path', type=str, default=None, help='使用するLoRAモデルのパス（指定しない場合は元のモデルを使用）')
     train_parser.add_argument('--metadata_path', type=str, default=None, help='モデルのメタデータファイルのパス（指定しない場合は_metadata.jsonを使用）')
+    train_parser.add_argument('--merge_before_train', nargs='?', const=1, type=float, default=None, 
+                         help='トレーニング前にLoRAの重みをベースモデルにマージする。数値を指定するとスケーリング係数として使用（デフォルト: 1.0）')
 
     # データセット関連の引数
     train_parser.add_argument('--image_dirs', type=str, nargs='+', required=True, help='トレーニング画像のディレクトリ（複数指定可）')
@@ -2274,6 +2368,16 @@ def main():
             print(f"タグ数が一致しています。ヘッドの拡張は不要です。({total_classes}クラス)")
 
         model = model.to(device)
+
+        # トレーニング前にLoRAをマージ（指定された場合）
+        if args.merge_before_train is not None:
+            # モデルがLoRAを持っているか確認（ベースモデルから始める場合は何もしない）
+            if hasattr(model, 'lora_modules') and model.lora_modules:
+                print(f"トレーニング前にLoRAをベースモデルにマージします（スケール: {args.merge_before_train}）...")
+                model.merge_lora_to_base_model(scale=args.merge_before_train)
+                model.to(device)
+            else:
+                print("マージするLoRAモジュールがありません。ベースモデルからトレーニングを開始します。")
         
         # データ変換の設定
         from timm.data import create_transform
