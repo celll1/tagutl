@@ -452,7 +452,7 @@ def read_tags_from_file(image_path, remove_special_prefix=True):
     # タグを正規化
     tags = [normalize_tag(tag, remove_special_prefixes=remove_special_prefix) for tag in tags]
     
-    print(f"Read {len(tags)} tags from {tag_path}")
+    # print(f"Read {len(tags)} tags from {tag_path}")
     return tags
 
 def predict_image(image_path, model, labels, device=torch_device, gen_threshold=0.35, char_threshold=0.75):
@@ -654,9 +654,9 @@ def visualize_predictions_for_tensorboard(img_tensor, probs, idx_to_tag, thresho
         img_rgb = img_tensor
     
     # 正規化の逆変換（モデルの前処理に依存）
-    # 一般的なImageNetの正規化パラメータを仮定
-    mean = torch.tensor([0.485, 0.456, 0.406]).view(3, 1, 1)
-    std = torch.tensor([0.229, 0.224, 0.225]).view(3, 1, 1)
+    # mean=0.5, std=0.5 で正規化されている
+    mean = torch.tensor([0.5, 0.5, 0.5]).view(3, 1, 1)
+    std = torch.tensor([0.5, 0.5, 0.5]).view(3, 1, 1)
     
     # 正規化の逆変換
     img_denorm = img_rgb * std + mean
@@ -803,33 +803,17 @@ def visualize_predictions_for_tensorboard(img_tensor, probs, idx_to_tag, thresho
     axs[1].legend(handles=legend_elements, loc='upper right')
     
     plt.tight_layout()
-    
-    # メモリバッファに図を保存し、画像をNumPy配列として取得
+    # プロットをPIL画像に変換
     buf = BytesIO()
-    plt.savefig(buf, format='png', dpi=100)  # dpiを指定して解像度を調整
-    buf.seek(0)
-    vis_img = np.array(Image.open(buf))
+    plt.savefig(buf, format='png')
     plt.close(fig)
+    buf.seek(0)
     
-    # 画像形式を確認（デバッグ用）
-    print(f"Generated visualization image shape: {vis_img.shape}, dtype: {vis_img.dtype}")
+    # PIL画像をテンソルに変換
+    pil_img = Image.open(buf)
+    img_tensor = transforms.ToTensor()(pil_img)
     
-    # 画像が3チャンネル（RGB）であることを確認
-    if len(vis_img.shape) != 3 or vis_img.shape[2] != 3:
-        print("警告: 生成された画像が3チャンネルRGBではありません。変換を試みます。")
-        # グレースケールの場合はRGBに変換
-        if len(vis_img.shape) == 2:
-            vis_img = np.stack([vis_img, vis_img, vis_img], axis=2)
-        # アルファチャンネルがある場合は削除
-        elif vis_img.shape[2] == 4:
-            vis_img = vis_img[:, :, :3]
-    
-    # データ型がuint8であることを確認
-    if vis_img.dtype != np.uint8:
-        print(f"警告: 画像のデータ型が{vis_img.dtype}です。uint8に変換します。")
-        vis_img = vis_img.astype(np.uint8)
-    
-    return vis_img
+    return img_tensor
 
 def analyze_model_structure():
     """モデル構造を分析し、LoRAを適用すべき層を特定する関数"""
@@ -1002,7 +986,7 @@ def prepare_dataset(
     image_paths = []
     tags_list = []
     
-    for image_dir in image_dirs:
+    for image_dir in tqdm(image_dirs, desc="画像ディレクトリを処理中"):
         for root, _, files in os.walk(image_dir):
             for file in files:
                 if file.lower().endswith(('.jpg', '.jpeg', '.png', '.webp')):
@@ -1081,147 +1065,112 @@ def prepare_dataset(
 
 # 非対称損失関数（ASL）の実装
 class AsymmetricLoss(nn.Module):
-    def __init__(
-        self, 
-        gamma_neg=4, 
-        gamma_pos=1, 
-        clip=0.05, 
-        eps=1e-8, 
-        disable_torch_grad_focal_loss=False
-    ):
+    def __init__(self, gamma_neg=4, gamma_pos=1, clip=0.05, eps=1e-6, disable_torch_grad_focal_loss=False):
         super(AsymmetricLoss, self).__init__()
+
         self.gamma_neg = gamma_neg
         self.gamma_pos = gamma_pos
         self.clip = clip
-        self.eps = eps
         self.disable_torch_grad_focal_loss = disable_torch_grad_focal_loss
+        self.eps = eps
 
     def forward(self, x, y):
         """"
-        非対称損失関数
-        Args:
-            x: 予測値 (logits)
-            y: 正解ラベル (0 or 1)
-        """
-        # Sigmoid関数を適用
-        xs_pos = torch.sigmoid(x)
-        xs_neg = 1.0 - xs_pos
+        Parameters
+        ----------
+        x: input logits
+        y: targets (multi-label binarized vector)
+        """        
+        # Calculating Probabilities
+        x_sigmoid = torch.sigmoid(x)
+        xs_pos = x_sigmoid
+        xs_neg = 1 - x_sigmoid
 
-        # 正例と負例の分離
-        targets = y
-        anti_targets = 1.0 - targets
+        # Asymmetric Clipping
+        if self.clip is not None and self.clip > 0:
+            xs_neg = (xs_neg + self.clip).clamp(max=1)
 
-        # クリッピング
-        if self.clip > 0:
-            xs_neg = (xs_neg + self.clip).clamp(max=1.0)
+        # Basic CE calculation
+        los_pos = y * torch.log(xs_pos.clamp(min=self.eps))
+        los_neg = (1 - y) * torch.log(xs_neg.clamp(min=self.eps))
+        loss = los_pos + los_neg
 
-        # 損失計算の準備
-        if self.disable_torch_grad_focal_loss:
-            with torch.no_grad():
-                pt_pos = xs_pos * targets
-                pt_neg = xs_neg * anti_targets
-                pt_pos = pt_pos.clamp(min=self.eps)
-                pt_neg = pt_neg.clamp(min=self.eps)
-                
-                # 重みの計算
-                focal_weight_pos = pt_pos.pow(self.gamma_pos)
-                focal_weight_neg = pt_neg.pow(self.gamma_neg)
-            
-            # 損失計算
-            loss_pos = focal_weight_pos * torch.log(pt_pos)
-            loss_neg = focal_weight_neg * torch.log(pt_neg)
-        else:
-            pt_pos = xs_pos * targets
-            pt_neg = xs_neg * anti_targets
-            pt_pos = pt_pos.clamp(min=self.eps)
-            pt_neg = pt_neg.clamp(min=self.eps)
-            
-            # 重みの計算
-            focal_weight_pos = pt_pos.pow(self.gamma_pos)
-            focal_weight_neg = pt_neg.pow(self.gamma_neg)
-            
-            # 損失計算
-            loss_pos = focal_weight_pos * torch.log(pt_pos)
-            loss_neg = focal_weight_neg * torch.log(pt_neg)
-        
-        # 最終的な損失（平均を返す）
-        loss = (-loss_pos.sum() - loss_neg.sum()) / x.size(0)
-        return loss
+        # Asymmetric Focusing
+        if self.gamma_neg > 0 or self.gamma_pos > 0:
+            if self.disable_torch_grad_focal_loss:
+                torch.set_grad_enabled(False)
+            pt0 = xs_pos * y
+            pt1 = xs_neg * (1 - y)  # pt = p if t > 0 else 1-p
+            pt = pt0 + pt1
+            one_sided_gamma = self.gamma_pos * y + self.gamma_neg * (1 - y)
+            one_sided_w = torch.pow(1 - pt, one_sided_gamma)
+            if self.disable_torch_grad_focal_loss:
+                torch.set_grad_enabled(True)
+            loss *= one_sided_w
+
+        # バッチ単位で平均を取る（サンプル数で割る）
+        final_loss = -loss.mean()
+        return final_loss
 
 
 # 最適化された非対称損失関数
 class AsymmetricLossOptimized(nn.Module):
-    def __init__(
-        self, 
-        gamma_neg=4, 
-        gamma_pos=1, 
-        clip=0.05, 
-        eps=1e-8, 
-        disable_torch_grad_focal_loss=False
-    ):
+    ''' Notice - optimized version, minimizes memory allocation and gpu uploading,
+    favors inplace operations'''
+
+    def __init__(self, gamma_neg=4, gamma_pos=1, clip=0.05, eps=1e-6, disable_torch_grad_focal_loss=False):
         super(AsymmetricLossOptimized, self).__init__()
+
         self.gamma_neg = gamma_neg
         self.gamma_pos = gamma_pos
         self.clip = clip
-        self.eps = eps
         self.disable_torch_grad_focal_loss = disable_torch_grad_focal_loss
-        self.targets = self.anti_targets = None
-        self.xs_pos = self.xs_neg = None
+        self.eps = eps
+
+        # prevent memory allocation and gpu uploading every iteration, and encourages inplace operations
+        self.targets = self.anti_targets = self.xs_pos = self.xs_neg = self.asymmetric_w = self.loss = None
 
     def forward(self, x, y):
         """"
-        最適化された非対称損失関数
-        Args:
-            x: 予測値 (logits)
-            y: 正解ラベル (0 or 1)
+        Parameters
+        ----------
+        x: input logits
+        y: targets (multi-label binarized vector)
         """
-        self.targets = y
-        self.anti_targets = 1.0 - y
 
-        # Sigmoid関数を適用
+        self.targets = y
+        self.anti_targets = 1 - y
+
+        # Calculating Probabilities
         self.xs_pos = torch.sigmoid(x)
         self.xs_neg = 1.0 - self.xs_pos
 
-        # クリッピング
-        if self.clip > 0:
-            self.xs_neg.add_(self.clip).clamp_(max=1.0)
+        # Asymmetric Clipping
+        if self.clip is not None and self.clip > 0:
+            self.xs_neg.add_(self.clip).clamp_(max=1)
 
-        # 損失計算
-        loss = self._asymmetric_loss()
-        return loss
+        # Basic CE calculation
+        self.loss = self.targets * torch.log(self.xs_pos.clamp(min=self.eps))
+        self.loss.add_(self.anti_targets * torch.log(self.xs_neg.clamp(min=self.eps)))
 
-    def _asymmetric_loss(self):
-        if self.disable_torch_grad_focal_loss:
-            with torch.no_grad():
-                pt_pos = self.xs_pos * self.targets
-                pt_neg = self.xs_neg * self.anti_targets
-                pt_pos = pt_pos.clamp(min=self.eps)
-                pt_neg = pt_neg.clamp(min=self.eps)
-                
-                # 重みの計算
-                focal_weight_pos = pt_pos.pow(self.gamma_pos)
-                focal_weight_neg = pt_neg.pow(self.gamma_neg)
+        # Asymmetric Focusing
+        if self.gamma_neg > 0 or self.gamma_pos > 0:
+            if self.disable_torch_grad_focal_loss:
+                with torch.no_grad():
+                    self.xs_pos_focus = self.xs_pos * self.targets
+                    self.xs_neg_focus = self.xs_neg * self.anti_targets
+                    self.asymmetric_w = torch.pow(1 - self.xs_pos_focus - self.xs_neg_focus,
+                                              self.gamma_pos * self.targets + self.gamma_neg * self.anti_targets)
+            else:
+                self.xs_pos_focus = self.xs_pos * self.targets
+                self.xs_neg_focus = self.xs_neg * self.anti_targets
+                self.asymmetric_w = torch.pow(1 - self.xs_pos_focus - self.xs_neg_focus,
+                                          self.gamma_pos * self.targets + self.gamma_neg * self.anti_targets)
             
-            # 損失計算
-            loss_pos = focal_weight_pos * torch.log(pt_pos)
-            loss_neg = focal_weight_neg * torch.log(pt_neg)
-        else:
-            pt_pos = self.xs_pos * self.targets
-            pt_neg = self.xs_neg * self.anti_targets
-            pt_pos = pt_pos.clamp(min=self.eps)
-            pt_neg = pt_neg.clamp(min=self.eps)
-            
-            # 重みの計算
-            focal_weight_pos = pt_pos.pow(self.gamma_pos)
-            focal_weight_neg = pt_neg.pow(self.gamma_neg)
-            
-            # 損失計算
-            loss_pos = focal_weight_pos * torch.log(pt_pos)
-            loss_neg = focal_weight_neg * torch.log(pt_neg)
-        
-        # 最終的な損失（平均を返す）
-        loss = (-loss_pos.sum() - loss_neg.sum()) / self.xs_pos.size(0)
-        return loss
+            self.loss *= self.asymmetric_w
+
+        # バッチ単位で平均を取る（サンプル数で割る）
+        return -self.loss.mean()
 
 
 # 評価指標の計算関数
@@ -1327,12 +1276,24 @@ def train_model(
     # 出力ディレクトリの作成
     os.makedirs(output_dir, exist_ok=True)
     
-    # TensorBoardの設定
+    # TensorBoardの設定を修正
     if tensorboard:
         from torch.utils.tensorboard import SummaryWriter
-        tensorboard_dir = os.path.join(output_dir, 'tensorboard')
-        os.makedirs(tensorboard_dir, exist_ok=True)
-        writer = SummaryWriter(tensorboard_dir)
+        from datetime import datetime
+        
+        # タイムスタンプを作成
+        timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+        
+        # 実行設定の概要を含むrun名を作成
+        run_name = f"run_{timestamp}_lr{optimizer.param_groups[0]['lr']}_bs{train_loader.batch_size}"
+        
+        # ディレクトリを作成
+        tb_log_dir = os.path.join(output_dir, 'tensorboard_logs')
+        os.makedirs(tb_log_dir, exist_ok=True)
+        
+        # run_nameをログディレクトリに含める
+        writer = SummaryWriter(log_dir=os.path.join(tb_log_dir, run_name))
+        print(f"TensorBoard logs will be saved to: {os.path.join(tb_log_dir, run_name)}")
     
     # 混合精度トレーニングのスケーラー
     scaler = torch.cuda.amp.GradScaler() if mixed_precision else None
@@ -1382,11 +1343,8 @@ def train_model(
             if i % 5 == 0 and i / 5 < 10:
                 img_grid = visualize_predictions_for_tensorboard(images[0], probs[0], idx_to_tag, threshold=0.35, original_tags=targets[0], max_tags=50, existing_tags_count=existing_tags_count)
 
-                # テスト：ここで一回画像を開く
-                Image.fromarray(img_grid).show()
-
                 if tensorboard:
-                    writer.add_image(f'predictions/initial_val_{i}', img_grid, 0)
+                    writer.add_image(f'predictions/val_{i}', img_grid, 0)
     
     # 検証メトリクスの計算
     val_loss /= len(val_loader)
@@ -1411,13 +1369,16 @@ def train_model(
         print(f"初期検証結果 - 新規タグ F1: {new_val_metrics['f1']:.4f}")
 
         if tensorboard:
-            writer.add_scalar('Initial/F1_all', val_metrics['f1'], 0)
-            writer.add_scalar('Initial/F1_existing', existing_val_metrics['f1'], 0)
-            writer.add_scalar('Initial/F1_new', new_val_metrics['f1'], 0)
+            writer.add_scalar('Metrics/F1/val', val_metrics['f1'], 0)
+            writer.add_scalar('Metrics/PR-AUC/val', val_metrics['pr_auc'], 0)
+            if existing_tags_count > 0 and len(new_tag_indices) > 0:
+                writer.add_scalar('Metrics/F1/val_existing', existing_val_metrics['f1'], 0)
+                writer.add_scalar('Metrics/F1/val_new', new_val_metrics['f1'], 0)
     else:
         print(f"初期検証結果 - F1: {val_metrics['f1']:.4f}")
         if tensorboard:
-            writer.add_scalar('Initial/F1', val_metrics['f1'], 0)
+            writer.add_scalar('Metrics/F1/val', val_metrics['f1'], 0)
+            writer.add_scalar('Metrics/PR-AUC/val', val_metrics['pr_auc'], 0)
     
     # トレーニングループ
     for epoch in range(num_epochs):
@@ -1494,10 +1455,10 @@ def train_model(
             )
 
             if tensorboard:
-                writer.add_scalar('Train/Loss', train_loss, epoch)
-                writer.add_scalar('Train/F1_all', train_metrics['f1'], epoch)
-                writer.add_scalar('Train/F1_existing', existing_train_metrics['f1'], epoch)
-                writer.add_scalar('Train/F1_new', new_train_metrics['f1'], epoch)
+                writer.add_scalar('Metrics/Loss', train_loss, epoch+1)
+                writer.add_scalar('Metrics/F1_all', train_metrics['f1'], epoch+1)
+                writer.add_scalar('Metrics/F1_existing', existing_train_metrics['f1'], epoch+1)
+                writer.add_scalar('Metrics/F1_new', new_train_metrics['f1'], epoch+1)
         # 検証フェーズ
         model.eval()
         val_loss = 0.0
@@ -1506,7 +1467,7 @@ def train_model(
         
         with torch.no_grad():
             progress_bar = tqdm(val_loader, desc=f"Validation")
-            for images, targets in progress_bar:
+            for i, (images, targets) in enumerate(progress_bar):
                 images = images.to(device)
                 targets = targets.to(device)
                 
@@ -1526,7 +1487,13 @@ def train_model(
                 val_targets.append(targets.cpu().numpy())
                 
                 progress_bar.set_postfix({"loss": f"{loss.item():.4f}"})
-        
+
+                if i % 5 == 0 and i / 5 < 10:
+                    img_grid = visualize_predictions_for_tensorboard(images[0], probs[0], idx_to_tag, threshold=0.35, original_tags=targets[0], max_tags=50, existing_tags_count=existing_tags_count)
+
+                    if tensorboard:
+                        writer.add_image(f'predictions/val_{i}', img_grid, epoch+1)
+            
         # 検証メトリクスの計算
         val_loss /= len(val_loader)
         val_preds = np.concatenate(val_preds)
@@ -1555,18 +1522,18 @@ def train_model(
         
         # TensorBoardにメトリクスを記録
         if tensorboard:
-            writer.add_scalar('Loss/train', train_loss, epoch)
-            writer.add_scalar('Loss/val', val_loss, epoch)
-            writer.add_scalar('F1/train', train_metrics['f1'], epoch)
-            writer.add_scalar('F1/val', val_metrics['f1'], epoch)
-            writer.add_scalar('PR-AUC/train', train_metrics['pr_auc'], epoch)
-            writer.add_scalar('PR-AUC/val', val_metrics['pr_auc'], epoch)
+            writer.add_scalar('Metrics/Loss/train', train_loss, epoch+1)
+            writer.add_scalar('Metrics/Loss/val', val_loss, epoch+1)
+            writer.add_scalar('Metrics/F1/train', train_metrics['f1'], epoch+1)
+            writer.add_scalar('Metrics/F1/val', val_metrics['f1'], epoch+1)
+            writer.add_scalar('Metrics/PR-AUC/train', train_metrics['pr_auc'], epoch+1)
+            writer.add_scalar('Metrics/PR-AUC/val', val_metrics['pr_auc'], epoch+1)
             
             if existing_tags_count > 0 and len(new_tag_indices) > 0:
-                writer.add_scalar('F1/train_existing', existing_train_metrics['f1'], epoch)
-                writer.add_scalar('F1/val_existing', existing_val_metrics['f1'], epoch)
-                writer.add_scalar('F1/train_new', new_train_metrics['f1'], epoch)
-                writer.add_scalar('F1/val_new', new_val_metrics['f1'], epoch)
+                writer.add_scalar('Metrics/F1/train_existing', existing_train_metrics['f1'], epoch+1)
+                writer.add_scalar('Metrics/F1/val_existing', existing_val_metrics['f1'], epoch+1)
+                writer.add_scalar('Metrics/F1/train_new', new_train_metrics['f1'], epoch+1)
+                writer.add_scalar('Metrics/F1/val_new', new_val_metrics['f1'], epoch)
         
         # 最良のモデルを保存
         save_model = False
@@ -1647,7 +1614,7 @@ def train_model(
     torch.save(checkpoint, os.path.join(output_dir, 'final_model.pth'))
     print(f"Final model saved! (Val F1: {val_metrics['f1']:.4f}, Val Loss: {val_loss:.4f})")
     
-    # TensorBoardのクローズ
+    # Close the tensorboard writer
     if tensorboard:
         writer.close()
     
@@ -2112,6 +2079,9 @@ def main():
                 gamma_pos=args.gamma_pos,
                 clip=args.clip
             )
+        else:
+            print("損失関数が指定されていません。BCEWithLogitsLossを使用します。")
+            criterion = nn.BCEWithLogitsLoss()
         
         # オプティマイザの設定
         if args.use_8bit_optimizer:
@@ -2148,7 +2118,7 @@ def main():
             try:
                 import subprocess
                 tensorboard_process = subprocess.Popen(
-                    ['tensorboard', '--logdir', os.path.join(args.output_dir, 'tensorboard'), '--port', str(args.tensorboard_port)]
+                    ['tensorboard', '--logdir', os.path.join(args.output_dir, 'tensorboard_logs'), '--port', str(args.tensorboard_port)]
                 )
                 print(f"TensorBoardを起動しました: http://localhost:{args.tensorboard_port}")
             except Exception as e:
