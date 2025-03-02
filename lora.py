@@ -217,6 +217,7 @@ class EVA02WithModuleLoRA(nn.Module):
         # 新しいクラス数が指定されている場合は、ヘッドを拡張
         if num_classes is not None and num_classes > self.original_num_classes:
             self._extend_head(num_classes)
+            self.original_num_classes = num_classes
         
         # ターゲットモジュールが指定されていない場合は、デフォルトのリストを使用
         if target_modules is None:
@@ -251,7 +252,7 @@ class EVA02WithModuleLoRA(nn.Module):
         self.num_new_classes = num_classes - self.original_num_classes
         
         if self.num_new_classes <= 0:
-            print("新規タグがないか、既存タグ数より少ないため、ヘッドの拡張は行いません。")
+            print(f"新規タグがないか、既存タグ数より少ないため、ヘッドの拡張は行いません。(現在: {self.original_num_classes}, 要求: {num_classes})")
             return
         
         # 元のヘッドの重みとバイアスを取得
@@ -528,7 +529,8 @@ def load_model(model_path=None, metadata_path=None, base_model='SmilingWolf/wd-e
             
             # モデルを作成
             model = EVA02WithModuleLoRA(
-                num_classes=num_classes,
+                base_model=base_model,
+                num_classes=num_classes,  # safetensorsから取得したクラス数を使用
                 lora_rank=lora_rank,
                 lora_alpha=lora_alpha,
                 lora_dropout=lora_dropout,
@@ -2026,8 +2028,8 @@ def main():
     batch_parser.add_argument('--model_path', type=str, default=None, help='使用するLoRAモデルのパス（指定しない場合は元のモデルを使用）')
     batch_parser.add_argument('--metadata_path', type=str, default=None, help='モデルのメタデータファイルのパス（指定しない場合は元のモデルを使用）')
     batch_parser.add_argument('--output_dir', type=str, default='predictions', help='予測結果を保存するディレクトリ')
-    batch_parser.add_argument('--gen_threshold', type=float, default=0.35, help='一般タグの閾値')
-    batch_parser.add_argument('--char_threshold', type=float, default=0.75, help='キャラクタータグの閾値')
+    batch_parser.add_argument('--gen_threshold', type=float, default=None, help='一般タグの閾値')
+    batch_parser.add_argument('--char_threshold', type=float, default=None, help='キャラクタータグの閾値')
     
     # トレーニングコマンド
     train_parser = subparsers.add_parser('train', help='LoRAモデルをトレーニングします')
@@ -2099,8 +2101,8 @@ def main():
             args.image, 
             model, 
             labels, 
-            gen_threshold=args.gen_threshold, 
-            char_threshold=args.char_threshold
+            gen_threshold=args.gen_threshold if args.gen_threshold is not None else model.threshold,
+            char_threshold=args.char_threshold if args.char_threshold is not None else model.threshold
         )
         
         # 結果の表示
@@ -2115,12 +2117,12 @@ def main():
             print(f"  {k}: {v:.3f}")
         
         print("--------")
-        print(f"Character tags (threshold={args.char_threshold}):")
+        print(f"Character tags (threshold={args.char_threshold if args.char_threshold is not None else model.threshold}):")
         for k, v in character.items():
             print(f"  {k}: {v:.3f}")
         
         print("--------")
-        print(f"General tags (threshold={args.gen_threshold}):")
+        print(f"General tags (threshold={args.gen_threshold if args.gen_threshold is not None else model.threshold}):")
         for k, v in general.items():
             print(f"  {k}: {v:.3f}")
         
@@ -2212,10 +2214,9 @@ def main():
         # デバイスの設定
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         print(f"使用デバイス: {device}")
-        
-        # 既存のタグリストを読み込む
-        print("既存のタグリストを読み込んでいます...")
-        labels = load_labels_hf(repo_id=args.base_model)
+
+        print(f"モデルを読み込んでいます...")
+        model, labels = load_model(args.model_path, args.metadata_path, base_model=args.base_model, device=device)
         existing_tags = labels.names
         print(f"既存タグ数: {len(existing_tags)}")
         
@@ -2225,17 +2226,6 @@ def main():
             with open(args.target_modules_file, 'r') as f:
                 target_modules = [line.strip() for line in f.readlines() if line.strip()]
             print(f"LoRAを適用するモジュール数: {len(target_modules)}")
-        
-        # 1. まずモデルを読み込む（この時点では既存タグのみ）
-        print("モデルを読み込んでいます...")
-        model = EVA02WithModuleLoRA(
-            num_classes=None,  # 初期状態では既存タグのみ
-            lora_rank=args.lora_rank,
-            lora_alpha=args.lora_alpha,
-            lora_dropout=args.lora_dropout,
-            target_modules=target_modules,
-            pretrained=True
-        )
         
         # モデルの期待する画像サイズを取得
         img_size = model.img_size
@@ -2260,7 +2250,16 @@ def main():
         # 3. モデルのヘッドを拡張（新規タグに対応）
         print("モデルのヘッドを拡張しています...")
         total_classes = len(tag_to_idx)
-        model.extend_head(num_classes=total_classes)
+
+        # 既存のモデルのクラス数と新しいタグ数を比較
+        if total_classes > model.original_num_classes:
+            model.extend_head(num_classes=total_classes)
+        elif total_classes < model.original_num_classes:
+            print(f"警告: 新しいタグ数({total_classes})が既存モデルのクラス数({model.original_num_classes})より少ないです。")
+            print("既存モデルのヘッドをそのまま使用します。")
+        else:
+            print(f"タグ数が一致しています。ヘッドの拡張は不要です。({total_classes}クラス)")
+
         model = model.to(device)
         
         # データ変換の設定
