@@ -348,35 +348,54 @@ class EVA02WithModuleLoRA(nn.Module):
         return self.backbone(x)
 
 
-def load_model(model_path=None, device=torch_device):
+def load_model(model_path=None, metadata_path=None, device=torch_device):
     """モデルを読み込む関数"""
     print(f"モデルを読み込んでいます...")
-    
-    # ラベルデータを読み込む
-    labels = load_labels_hf(repo_id=MODEL_REPO)
-    num_classes = len(labels.names)
-    
-    if model_path:
-        # LoRAモデルのチェックポイントを読み込む
+
+    # huggingface のsmilingwolf のモデルの場合
+    if model_path is None:
+        # ラベルデータを読み込む
+        labels = load_labels_hf(repo_id=MODEL_REPO)
+        num_classes = len(labels.names)
+        
+        idx_to_tag = {i: name for i, name in enumerate(labels.names)}
+        tag_to_idx = {name: i for i, name in enumerate(labels.names)}
+
+        # モデルの指定がない場合も EVA02WithModuleLoRA を使用
+        print("初期化されたLoRAモデルを使用します（元のモデルと同等）")
+        model = EVA02WithModuleLoRA(
+            num_classes=num_classes,  # 元のモデルのクラス数
+            lora_rank=4,              # デフォルト値
+            lora_alpha=1.0,           # デフォルト値
+            lora_dropout=0.0,         # デフォルト値
+            pretrained=True
+        ) 
+    elif model_path.endswith('.pth') or model_path.endswith('.pt'):
+        # ほかのローカルモデルの場合
+        # トレーニング済みのLoRAが付与されたモデルの可能性がある
         print(f"LoRAチェックポイントを読み込んでいます: {model_path}")
+        
+        # PyTorch形式のチェックポイントを読み込む
         checkpoint = torch.load(model_path, map_location=device)
         
-        # タグマッピングを取得
+        # チェックポイントからLoRA設定を取得
+        lora_rank = checkpoint.get('lora_rank', 4)
+        lora_alpha = checkpoint.get('lora_alpha', 1.0) 
+        lora_dropout = checkpoint.get('lora_dropout', 0.0)
+        target_modules = checkpoint.get('target_modules', None)
         tag_to_idx = checkpoint.get('tag_to_idx', None)
         idx_to_tag = checkpoint.get('idx_to_tag', None)
         existing_tags_count = checkpoint.get('existing_tags_count', 0)
         
-        # 新しいクラス数を決定
+        # タグ数を決定
         if tag_to_idx is not None:
             num_classes = len(tag_to_idx)
             print(f"チェックポイントから読み込んだタグ数: {num_classes}")
             print(f"既存タグ数: {existing_tags_count}, 新規タグ数: {num_classes - existing_tags_count}")
-        
-        # LoRA設定を取得
-        lora_rank = checkpoint.get('lora_rank', 4)
-        lora_alpha = checkpoint.get('lora_alpha', 1.0)
-        lora_dropout = checkpoint.get('lora_dropout', 0.0)
-        target_modules = checkpoint.get('target_modules', None)
+            
+            # タグマッピングがある場合は、ラベルを更新
+            if idx_to_tag is not None:
+                labels.names = [idx_to_tag[i] for i in range(len(idx_to_tag))]
         
         # モデルを作成
         model = EVA02WithModuleLoRA(
@@ -390,24 +409,145 @@ def load_model(model_path=None, device=torch_device):
         
         # 状態辞書をモデルに読み込む
         model.load_state_dict(checkpoint['model_state_dict'])
+    elif model_path is not None and model_path.endswith('.safetensors'):
+        # safetensors形式のチェックポイントを読み込む
+        from safetensors.torch import load_file
         
-        # タグマッピングがある場合は、ラベルを更新
-        if idx_to_tag is not None:
-            labels.names = [idx_to_tag[i] for i in range(len(idx_to_tag))]
+        # メタデータを読み込む
+        if metadata_path is None:
+            metadata_path = os.path.splitext(model_path)[0] + '_metadata.json'
+    
+        if os.path.exists(metadata_path):
+            with open(metadata_path, 'r', encoding='utf-8') as f:
+                metadata = json.load(f)
+                
+            # メタデータからLoRA設定を取得
+            lora_rank = int(metadata.get('lora_rank', 4))
+            lora_alpha = float(metadata.get('lora_alpha', 1.0))
+            lora_dropout = float(metadata.get('lora_dropout', 0.0))
+            
+            # evalを使用する場合の注意点: 辞書のキーが整数になる
+            try:
+                target_modules = eval(metadata.get('target_modules', 'None'))
+                tag_to_idx = eval(metadata.get('tag_to_idx', 'None'))
+                idx_to_tag = eval(metadata.get('idx_to_tag', 'None'))
+                tag_to_category = eval(metadata.get('tag_to_category', 'None'))
+            except Exception as e:
+                print(f"Warning: Error evaluating metadata: {e}")
+                target_modules = None
+                tag_to_idx = None
+                idx_to_tag = None
+                
+            existing_tags_count = int(metadata.get('existing_tags_count', 0))
+            
+            # タグ数を決定
+            if tag_to_idx is not None:
+                num_classes = len(tag_to_idx)
+                print(f"チェックポイントから読み込んだタグ数: {num_classes}")
+                print(f"既存タグ数: {existing_tags_count}, 新規タグ数: {num_classes - existing_tags_count}")
+                
+                # デバッグ情報
+                print(f"idx_to_tag type: {type(idx_to_tag)}")
+                if idx_to_tag:
+                    sample_key = next(iter(idx_to_tag.keys()))
+                    print(f"Sample key type: {type(sample_key)}")
+                
+                # タグマッピングがある場合は、ラベルを更新
+                if idx_to_tag is not None:
+                    # 新しいLabelDataオブジェクトを作成
+                    labels = LabelData(
+                        names=[],
+                        rating=[],
+                        general=[],
+                        character=[]
+                    )
+                    
+                    try:
+                        # キーの型を確認
+                        is_int_key = False
+                        if idx_to_tag:
+                            sample_key = next(iter(idx_to_tag.keys()))
+                            is_int_key = isinstance(sample_key, int)
+                            print(f"Using {'integer' if is_int_key else 'string'} keys for idx_to_tag")
+                        
+                        # タグ名のリストを作成
+                        tag_names = []
+                        rating_indices = []
+                        general_indices = []
+                        character_indices = []
+                        
+                        # すべてのインデックスに対応するタグを取得
+                        for i in range(num_classes):
+                            key = i if is_int_key else str(i)
+                            tag = idx_to_tag.get(key, f"unknown_{i}")
+                            tag_names.append(tag)
+                            
+                            # カテゴリに基づいてインデックスを分類
+                            if i < 4:  # 最初の4つはrating
+                                rating_indices.append(np.int64(i))
+                            elif tag_to_category and tag in tag_to_category:
+                                category = tag_to_category[tag]
+                                if category == 'Character':
+                                    character_indices.append(np.int64(i))
+                                else:  # General, Meta, Artist などはすべてGeneralとして扱う
+                                    general_indices.append(np.int64(i))
+                            else:
+                                # カテゴリ情報がない場合はGeneralとして扱う
+                                general_indices.append(np.int64(i))
+                        
+                        # LabelDataオブジェクトを更新
+                        labels.names = tag_names
+                        labels.rating = rating_indices
+                        labels.general = general_indices
+                        labels.character = character_indices
+                        
+                        print(f"Created labels with {len(tag_names)} tags")
+                        print(f"Rating tags: {len(rating_indices)}")
+                        print(f"General tags: {len(general_indices)}")
+                        print(f"Character tags: {len(character_indices)}")
+                        
+                    except Exception as e:
+                        print(f"Error creating labels: {e}")
+                        # 最低限の情報でラベルを作成
+                        labels.names = [f"tag_{i}" for i in range(num_classes)]
+                        labels.rating = [np.int64(i) for i in range(min(4, num_classes))]
+                        labels.general = [np.int64(i) for i in range(4, num_classes)]
+                        labels.character = []
+
+            # モデルの読み込み
+            from safetensors.torch import load_file
+            # deviceをstr型に変換して渡す
+            device_str = str(device).split(':')[0]  # 'cuda:0' -> 'cuda', 'cpu' -> 'cpu'
+            print(f"Loading safetensors with device: {device_str}")
+            state_dict = load_file(model_path, device=device_str)
+
+            # 出力層のサイズを取得
+            num_classes = None
+            for key in state_dict.keys():
+                if 'head.weight' in key:
+                    num_classes = state_dict[key].shape[0]
+                    break
+            
+            # モデルを作成
+            model = EVA02WithModuleLoRA(
+                num_classes=num_classes,
+                lora_rank=lora_rank,
+                lora_alpha=lora_alpha,
+                lora_dropout=lora_dropout,
+                target_modules=target_modules,
+                pretrained=True
+            )
+            
+            # 状態辞書をモデルに読み込む
+            model.load_state_dict(state_dict)
+        else:
+            raise ValueError(f"メタデータファイルが見つかりません: {metadata_path}")
     else:
-        # モデルの指定がない場合も EVA02WithModuleLoRA を使用
-        print("初期化されたLoRAモデルを使用します（元のモデルと同等）")
-        model = EVA02WithModuleLoRA(
-            num_classes=num_classes,  # 元のモデルのクラス数
-            lora_rank=4,              # デフォルト値
-            lora_alpha=1.0,           # デフォルト値
-            lora_dropout=0.0,         # デフォルト値
-            pretrained=True
-        )
+        raise ValueError("モデルパスが指定されていません")  
     
     model = model.to(device)
     model.eval()
-    
+
     return model, labels
 
 # タグの正規化関数を拡張
@@ -1222,9 +1362,9 @@ def compute_metrics(outputs, targets):
     ax.plot(best_threshold_idx, best_macro_f1, 'ro', markersize=10)
     ax.set_xticks(range(len(thresholds)))
     ax.set_xticklabels([f"{t:.2f}" for t in thresholds], rotation=45)
-    ax.set_xlabel('閾値')
-    ax.set_ylabel('マクロF1スコア')
-    ax.set_title(f'マクロF1スコア vs 閾値 (最適値: {best_threshold:.2f})')
+    ax.set_xlabel('Threshold')
+    ax.set_ylabel('Macro F1 Score')
+    ax.set_title(f'Macro F1 Score vs Threshold (Optimal Value: {best_threshold:.2f})')
     ax.grid(True)
     
     # プロットをバイトストリームに変換
@@ -1262,6 +1402,7 @@ def train_model(
     num_epochs, 
     device, 
     output_dir='lora_model',
+    save_format='safetensors',
     save_best='f1',  # 'f1', 'loss', 'both'
     checkpoint_interval=1,
     mixed_precision=False,
@@ -1273,6 +1414,66 @@ def train_model(
     """モデルをトレーニングする関数"""
     # 出力ディレクトリの作成
     os.makedirs(output_dir, exist_ok=True)
+
+    def save_model(output_dir, filename, save_format, model, optimizer, scheduler, epoch, threshold, val_loss, val_f1, tag_to_idx, idx_to_tag, tag_to_category, existing_tags_count):
+        os.makedirs(output_dir, exist_ok=True)
+        
+        # モデルの状態辞書
+        model_state_dict = model.state_dict()
+        
+        # メタデータ情報
+        metadata = {
+            'epoch': epoch,
+            'threshold': threshold,
+            'val_loss': val_loss,
+            'val_f1': val_f1,
+            'lora_rank': model.lora_rank,
+            'lora_alpha': model.lora_alpha,
+            'lora_dropout': model.lora_dropout,
+            'target_modules': model.target_modules,
+            'tag_to_idx': tag_to_idx,
+            'idx_to_tag': idx_to_tag,
+            'tag_to_category': tag_to_category,
+            'existing_tags_count': existing_tags_count
+        }
+        
+        # 完全なチェックポイント
+        checkpoint = {
+            'model_state_dict': model_state_dict,
+            # 'optimizer_state_dict': optimizer.state_dict() if optimizer else None,
+            # 'scheduler_state_dict': scheduler.state_dict() if scheduler else None,
+            'epoch': epoch,
+            'threshold': threshold,
+            'val_loss': val_loss,
+            'val_f1': val_f1,
+            'lora_rank': model.lora_rank,
+            'lora_alpha': model.lora_alpha,
+            'lora_dropout': model.lora_dropout,
+            'target_modules': model.target_modules,
+            'tag_to_idx': tag_to_idx,
+            'idx_to_tag': idx_to_tag,
+            'tag_to_category': tag_to_category,
+            'existing_tags_count': existing_tags_count
+        }
+        save_path = os.path.join(output_dir, filename)
+
+        if save_format == 'safetensors':
+            # safetensors形式ではテンソルのみ保存可能
+            from safetensors.torch import save_file
+            
+            # モデルの状態辞書のみsafetensorsで保存
+            save_file(model_state_dict, os.path.join(output_dir, f'{filename}.safetensors'), metadata={str(k): str(v) for k, v in metadata.items()})
+            
+            # その他の情報はJSON形式で保存
+            other_info = {k: str(v) if isinstance(v, (dict, list, tuple)) else v for k, v in checkpoint.items() if k != 'model_state_dict'}
+            with open(os.path.join(output_dir, f'{filename}_metadata.json'), 'w', encoding='utf-8') as f:
+                json.dump(other_info, f, indent=2, ensure_ascii=False)
+            
+            print(f"Model saved as {os.path.join(output_dir, f'{filename}.safetensors')} and metadata as {os.path.join(output_dir, f'{filename}_metadata.json')}")
+        else:
+            # PyTorch形式で保存
+            torch.save(checkpoint, os.path.join(output_dir, f'{filename}.pt'))
+            print(f"Model saved as {os.path.join(output_dir, f'{filename}.pt')}")
     
     # TensorBoardの設定を修正
     if tensorboard:
@@ -1294,7 +1495,7 @@ def train_model(
         print(f"TensorBoard logs will be saved to: {os.path.join(tb_log_dir, run_name)}")
     
     # 混合精度トレーニングのスケーラー
-    scaler = torch.cuda.amp.GradScaler() if mixed_precision else None
+    scaler = torch.amp.GradScaler(device=device) if mixed_precision else None
     
     # 最良のモデルを保存するための変数
     best_val_loss = float('inf')
@@ -1365,9 +1566,7 @@ def train_model(
             val_targets[:, new_tag_indices]
         )
         
-        print(f"初期検証結果 - 全体 F1: {val_metrics['f1']:.4f}")
-        print(f"初期検証結果 - 既存タグ F1: {existing_val_metrics['f1']:.4f}")
-        print(f"初期検証結果 - 新規タグ F1: {new_val_metrics['f1']:.4f}")
+        print(f"初期検証結果 - 既存タグ F1: {existing_val_metrics['f1']:.4f}, 新規タグ F1: {new_val_metrics['f1']:.4f}")
 
         if tensorboard:
             writer.add_scalar('Metrics/val/F1', val_metrics['f1'], 0)
@@ -1543,102 +1742,53 @@ def train_model(
             writer.add_scalar('Metrics/val/Loss', val_loss, epoch+1)
             writer.add_scalar('Metrics/val/F1', val_metrics['f1'], epoch+1)
             writer.add_scalar('Metrics/val/PR-AUC', val_metrics['pr_auc'], epoch+1)
+            writer.add_scalar('Metrics/val/Threshold', threshold, epoch+1)
+            writer.add_image('Metrics/val/F1_vs_Threshold', val_metrics['f1_vs_threshold_plot'], epoch+1)
             
             if existing_tags_count > 0 and len(new_tag_indices) > 0:
                 writer.add_scalar('Metrics/val/F1_existing', existing_val_metrics['f1'], epoch+1)
                 writer.add_scalar('Metrics/val/F1_new', new_val_metrics['f1'], epoch+1)
         
         # 最良のモデルを保存
-        save_model = False
+        save_model_flag = False
         
         if save_best == 'f1' and val_metrics['f1'] > best_val_f1:
             best_val_f1 = val_metrics['f1']
-            save_model = True
+            save_model_flag = True
         elif save_best == 'loss' and val_loss < best_val_loss:
             best_val_loss = val_loss
-            save_model = True
+            save_model_flag = True
         elif save_best == 'both':
             if val_metrics['f1'] > best_val_f1:
                 best_val_f1 = val_metrics['f1']
-                save_model = True
+                save_model_flag = True
             if val_loss < best_val_loss:
                 best_val_loss = val_loss
-                save_model = True
-        
-        if save_model:
+                save_model_flag = True
+
+        if save_model_flag:
             # モデルの保存
-            checkpoint = {
-                'epoch': epoch + 1,
-                'model_state_dict': model.state_dict(),
-                'optimizer_state_dict': optimizer.state_dict(),
-                'scheduler_state_dict': scheduler.state_dict() if scheduler else None,
-                'threshold': threshold,
-                'val_loss': val_loss,
-                'val_f1': val_metrics['f1'],
-                'lora_rank': model.lora_rank,
-                'lora_alpha': model.lora_alpha,
-                'lora_dropout': model.lora_dropout,
-                'target_modules': model.target_modules,
-                'tag_to_idx': tag_to_idx,
-                'idx_to_tag': idx_to_tag,
-                'tag_to_category': tag_to_category,
-                'existing_tags_count': existing_tags_count
-            }
-            
-            torch.save(checkpoint, os.path.join(output_dir, 'best_model.pth'))
+            save_model(output_dir, f'best_model', save_format, model, optimizer, scheduler, epoch, threshold, val_loss, val_metrics['f1'], tag_to_idx, idx_to_tag, tag_to_category, existing_tags_count)
             print(f"Best model saved! (Val F1: {val_metrics['f1']:.4f}, Val Loss: {val_loss:.4f})")
-        
-        # 定期的なチェックポイントの保存
-        if (epoch + 1) % checkpoint_interval == 0:
-            checkpoint = {
-                'epoch': epoch + 1,
-                'model_state_dict': model.state_dict(),
-                'optimizer_state_dict': optimizer.state_dict(),
-                'scheduler_state_dict': scheduler.state_dict() if scheduler else None,
-                'threshold': threshold,
-                'val_loss': val_loss,
-                'val_f1': val_metrics['f1'],
-                'lora_rank': model.lora_rank,
-                'lora_alpha': model.lora_alpha,
-                'lora_dropout': model.lora_dropout,
-                'target_modules': model.target_modules,
-                'tag_to_idx': tag_to_idx,
-                'idx_to_tag': idx_to_tag,
-                'tag_to_category': tag_to_category,
-                'existing_tags_count': existing_tags_count
-            }
-            
-            torch.save(checkpoint, os.path.join(output_dir, f'checkpoint_epoch_{epoch+1}.pth'))
+    
+        elif (epoch + 1) % checkpoint_interval == 0:
+            save_model(output_dir, f'checkpoint_epoch_{epoch+1}', save_format, model, optimizer, scheduler, epoch, threshold, val_loss, val_metrics['f1'], tag_to_idx, idx_to_tag, tag_to_category, existing_tags_count)
             print(f"Checkpoint saved at epoch {epoch+1}")
     
     # 最終モデルの保存
-    checkpoint = {
-        'epoch': num_epochs,
-        'model_state_dict': model.state_dict(),
-        'optimizer_state_dict': optimizer.state_dict(),
-        'scheduler_state_dict': scheduler.state_dict() if scheduler else None,
-        'threshold': threshold,
-        'val_loss': val_loss,
-        'val_f1': val_metrics['f1'],
-        'lora_rank': model.lora_rank,
-        'lora_alpha': model.lora_alpha,
-        'lora_dropout': model.lora_dropout,
-        'target_modules': model.target_modules,
-        'tag_to_idx': tag_to_idx,
-        'idx_to_tag': idx_to_tag,
-        'tag_to_category': tag_to_category,
-        'existing_tags_count': existing_tags_count
-    }
-    
-    torch.save(checkpoint, os.path.join(output_dir, 'final_model.pth'))
+    save_model(output_dir, f'final_model', save_format, model, optimizer, scheduler, epoch, threshold, val_loss, val_metrics['f1'], tag_to_idx, idx_to_tag, tag_to_category, existing_tags_count)
     print(f"Final model saved! (Val F1: {val_metrics['f1']:.4f}, Val Loss: {val_loss:.4f})")
+
+    save_tag_mapping(output_dir, idx_to_tag, tag_to_category)
+
+    # 'optimizer_state_dict': optimizer.state_dict(),
+    # 'scheduler_state_dict': scheduler.state_dict() if scheduler else None, どうするか後で検討
     
     # Close the tensorboard writer
     if tensorboard:
         writer.close()
     
     return val_metrics
-
 
 def debug_model():
     """
@@ -1865,7 +2015,8 @@ def main():
     # 推論コマンド
     predict_parser = subparsers.add_parser('predict', help='画像からタグを予測します')
     predict_parser.add_argument('--image', type=str, required=True, help='予測する画像ファイルのパス')
-    predict_parser.add_argument('--lora_model', type=str, default=None, help='使用するLoRAモデルのパス（指定しない場合は元のモデルを使用）')
+    predict_parser.add_argument('--model_path', type=str, default=None, help='使用するLoRAモデルのパス（指定しない場合は元のモデルを使用）')
+    predict_parser.add_argument('--metadata_path', type=str, default=None, help='モデルのメタデータファイルのパス（指定しない場合は元のモデルを使用）')
     predict_parser.add_argument('--output_dir', type=str, default='predictions', help='予測結果を保存するディレクトリ')
     predict_parser.add_argument('--gen_threshold', type=float, default=0.35, help='一般タグの閾値')
     predict_parser.add_argument('--char_threshold', type=float, default=0.75, help='キャラクタータグの閾値')
@@ -1873,7 +2024,8 @@ def main():
     # バッチ推論コマンド
     batch_parser = subparsers.add_parser('batch', help='複数の画像からタグを予測します')
     batch_parser.add_argument('--image_dir', type=str, required=True, help='予測する画像ファイルのディレクトリ')
-    batch_parser.add_argument('--lora_model', type=str, default=None, help='使用するLoRAモデルのパス（指定しない場合は元のモデルを使用）')
+    batch_parser.add_argument('--model_path', type=str, default=None, help='使用するLoRAモデルのパス（指定しない場合は元のモデルを使用）')
+    batch_parser.add_argument('--metadata_path', type=str, default=None, help='モデルのメタデータファイルのパス（指定しない場合は元のモデルを使用）')
     batch_parser.add_argument('--output_dir', type=str, default='predictions', help='予測結果を保存するディレクトリ')
     batch_parser.add_argument('--gen_threshold', type=float, default=0.35, help='一般タグの閾値')
     batch_parser.add_argument('--char_threshold', type=float, default=0.75, help='キャラクタータグの閾値')
@@ -1904,6 +2056,8 @@ def main():
     train_parser.add_argument('--initial_threshold', type=float, default=0.35, help='初期閾値')
     train_parser.add_argument('--dynamic_threshold', type=float, default=True, help='動的閾値')
 
+    # モデルの保存関連の引数
+    train_parser.add_argument('--save_format', type=str, default='safetensors', choices=['safetensors', 'pytorch'], help='モデルの保存形式')
     train_parser.add_argument('--checkpoint_interval', type=int, default=5, help='チェックポイント保存間隔（エポック）')
     train_parser.add_argument('--save_best', type=str, default='f1', choices=['f1', 'loss', 'both'], help='最良モデルの保存基準')
     train_parser.add_argument('--output_dir', type=str, default='lora_model', help='出力ディレクトリ')
@@ -1931,7 +2085,7 @@ def main():
     
     elif args.command == 'predict':
         # 単一画像の予測
-        model, labels = load_model(args.lora_model)
+        model, labels = load_model(args.model_path, args.metadata_path)
         
         # 画像に紐づくタグを読み込む
         actual_tags = read_tags_from_file(args.image)
@@ -2220,6 +2374,7 @@ def main():
             num_epochs=args.num_epochs,
             device=device,
             output_dir=args.output_dir,
+            save_format=args.save_format,
             save_best=args.save_best,
             checkpoint_interval=args.checkpoint_interval,
             mixed_precision=args.mixed_precision,
