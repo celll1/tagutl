@@ -2,6 +2,7 @@
 images/
 lora_checkpoints/
 lora_model*/
+merged_*/
 old_files/
 prediction/
 predictions/

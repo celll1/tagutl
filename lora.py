@@ -1,29 +1,34 @@
 import os
+import re
+import json
+import ast
+import copy
 import argparse
+import requests
+
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional, List, Dict, Tuple, Union
+from collections import defaultdict
 
 import numpy as np
 import pandas as pd
-import timm
+import matplotlib.pyplot as plt
+import math
 import torch
 from huggingface_hub import hf_hub_download
 from huggingface_hub.utils import HfHubHTTPError
 from PIL import Image
+import timm
 from timm.data import create_transform, resolve_data_config
-from torch import Tensor, nn
 import gc
+from torch import Tensor, nn
 from torch.nn import functional as F
 from torchvision import transforms
-import re
-import json
-import ast
-from tqdm.auto import tqdm
-import matplotlib.pyplot as plt
-import copy
+import bitsandbytes as bnb
+
 from io import BytesIO
-from collections import defaultdict
+from tqdm.auto import tqdm
 
 # デバイスの設定
 torch_device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -94,7 +99,10 @@ class LabelData:
     names: list[str]
     rating: list[np.int64]
     general: list[np.int64]
+    artist: list[np.int64]
     character: list[np.int64]
+    copyright: list[np.int64]
+    meta: list[np.int64]
 
 
 def pil_ensure_rgb(image: Image.Image) -> Image.Image:
@@ -137,7 +145,10 @@ def load_labels_hf(
         names=df["name"].tolist(),
         rating=list(np.where(df["category"] == 9)[0]),
         general=list(np.where(df["category"] == 0)[0]),
+        artist=list(np.where(df["category"] == 1)[0]),
         character=list(np.where(df["category"] == 4)[0]),
+        copyright=list(np.where(df["category"] == 3)[0]),
+        meta=list(np.where(df["category"] == 5)[0]),
     )
 
     return tag_data
@@ -157,17 +168,38 @@ def get_tags(
 
     # General labels with all probabilities
     all_gen_labels = dict([probs_list[i] for i in labels.general])
-    
+
+    # Artist labels with all probabilities
+    all_artist_labels = dict([probs_list[i] for i in labels.artist])
+
     # Character labels with all probabilities
     all_char_labels = dict([probs_list[i] for i in labels.character])
+
+    # Copyright labels with all probabilities
+    all_copyright_labels = dict([probs_list[i] for i in labels.copyright])
+
+    # Meta labels with all probabilities
+    all_meta_labels = dict([probs_list[i] for i in labels.meta])
     
     # Filtered general labels (above threshold)
     gen_labels = {k: v for k, v in all_gen_labels.items() if v > gen_threshold}
     gen_labels = dict(sorted(gen_labels.items(), key=lambda item: item[1], reverse=True))
 
+    # Filtered artist labels (above threshold)
+    artist_labels = {k: v for k, v in all_artist_labels.items() if v > gen_threshold}
+    artist_labels = dict(sorted(artist_labels.items(), key=lambda item: item[1], reverse=True))
+
     # Filtered character labels (above threshold)
     char_labels = {k: v for k, v in all_char_labels.items() if v > char_threshold}
     char_labels = dict(sorted(char_labels.items(), key=lambda item: item[1], reverse=True))
+
+    # Filtered copyright labels (above threshold)
+    copyright_labels = {k: v for k, v in all_copyright_labels.items() if v > gen_threshold}
+    copyright_labels = dict(sorted(copyright_labels.items(), key=lambda item: item[1], reverse=True))
+
+    # Filtered meta labels (above threshold)
+    meta_labels = {k: v for k, v in all_meta_labels.items() if v > gen_threshold}
+    meta_labels = dict(sorted(meta_labels.items(), key=lambda item: item[1], reverse=True))
 
     # Combine general and character labels for caption
     combined_names = list(gen_labels.keys())
@@ -177,7 +209,7 @@ def get_tags(
     caption = ", ".join(combined_names)
     taglist = caption.replace("_", " ").replace("(", "\(").replace(")", "\)")
 
-    return caption, taglist, rating_labels, char_labels, gen_labels, all_char_labels, all_gen_labels
+    return caption, taglist, rating_labels, gen_labels, artist_labels, char_labels, copyright_labels, meta_labels, all_gen_labels, all_artist_labels, all_char_labels, all_copyright_labels, all_meta_labels
 
 
 # EVA02モデルにモジュールごとのLoRAを適用するクラス
@@ -187,6 +219,7 @@ class EVA02WithModuleLoRA(nn.Module):
         base_model: str = 'SmilingWolf/wd-eva02-large-tagger-v3',
         model_path: str = None,
         num_classes=None,  # 初期化時にはNoneでも可能に
+        threshold=0.35,
         idx_to_tag=None,
         tag_to_idx=None,
         tag_to_category=None,
@@ -204,6 +237,7 @@ class EVA02WithModuleLoRA(nn.Module):
         self.lora_rank = lora_rank
         self.lora_alpha = lora_alpha
         self.lora_dropout = lora_dropout
+        self.threshold = threshold
         self.idx_to_tag = idx_to_tag
         self.tag_to_idx = tag_to_idx
         self.tag_to_category = tag_to_category
@@ -309,10 +343,10 @@ class EVA02WithModuleLoRA(nn.Module):
         self.lora_layers = {}
         
         # 各モジュールを調査
-        for name, module in self.backbone.named_modules():
+        for name, module in tqdm(self.backbone.named_modules(), desc="LoRA適用中", leave=True):
             # パターンに一致するか確認
             if isinstance(module, nn.Linear) and any(pattern.search(name) for pattern in patterns):
-                print(f"Applying LoRA to module: {name}")
+                tqdm.write(f"Applying LoRA to module: {name}")
                 
                 # モジュールの親を取得
                 parent_name, child_name = name.rsplit('.', 1)
@@ -336,6 +370,41 @@ class EVA02WithModuleLoRA(nn.Module):
                 self.lora_layers[name] = lora_module
         
         print(f"Applied LoRA to {len(self.lora_layers)} modules")
+
+    def _remove_lora_from_modules(self):
+        """モデルからすべてのLoRA層を削除するメソッド"""
+        # 削除したLoRA層の数をカウント
+        removed_count = 0
+        
+        # 記録されているLoRA層を元に戻す
+        for name, lora_module in list(self.lora_layers.items()):
+            print(f"Removing LoRA from module: {name}")
+            
+            # nameが"backbone."で始まる場合、それを取り除く
+            if name.startswith("backbone."):
+                name = name[9:]  # "backbone."の長さ(9文字)を取り除く
+            
+            # モジュールの親を取得
+            if "." in name:
+                parent_name, child_name = name.rsplit('.', 1)
+                parent = self.backbone
+                for part in parent_name.split('.'):
+                    parent = getattr(parent, part)
+            else:
+                # 直接backboneの属性の場合
+                parent = self.backbone
+                child_name = name
+            
+            # 元の線形層を取得して置き換え
+            original_module = lora_module.base_layer
+            setattr(parent, child_name, original_module)
+            removed_count += 1
+        
+        # LoRA関連の属性をリセット
+        self.lora_layers = {}
+        
+        print(f"Removed LoRA from {removed_count} modules")
+        return self
     
     def _freeze_non_lora_parameters(self):
         """LoRAパラメータ以外を凍結する"""
@@ -379,18 +448,18 @@ class EVA02WithModuleLoRA(nn.Module):
             return 0
         
         merged_count = 0
-        for name, module in self.lora_layers.items():
+        for name, module in tqdm(self.lora_layers.items(), desc="LoRAレイヤーのマージ", leave=True):
             if isinstance(module, LoRALinear):
                 # LoRAの計算: x @ (A @ B) * scale
                 # ベースの重みに A @ B * scale を加算
-                print(f"マージ中のモジュール: {name}")
+                tqdm.write(f"マージ中のモジュール: {name}")
                 with torch.no_grad():
                     # 行列のサイズを確認
                     base_weight_shape = module.base_layer.weight.shape
                     lora_a_shape = module.lora.lora_A.shape
                     lora_b_shape = module.lora.lora_B.shape
                     
-                    print(f"base_weight: {base_weight_shape}, lora_A: {lora_a_shape}, lora_B: {lora_b_shape}")
+                    tqdm.write(f"base_weight: {base_weight_shape}, lora_A: {lora_a_shape}, lora_B: {lora_b_shape}")
                     
                     # 行列の掛け算と転置を適切に行う
                     if base_weight_shape[0] == lora_b_shape[1] and base_weight_shape[1] == lora_a_shape[0]:
@@ -404,34 +473,35 @@ class EVA02WithModuleLoRA(nn.Module):
                         # A @ B を計算
                         lora_weight = module.lora.lora_A @ module.lora.lora_B
                     else:
-                        print(f"  警告: 行列のサイズが一致しません。このモジュールはスキップします。")
+                        tqdm.write(f"  警告: 行列のサイズが一致しません。このモジュールはスキップします。")
                         continue
                     
                     # スケーリングを適用
                     lora_weight = lora_weight * (module.lora.scale * scale)
                     
                     # 行列のサイズを確認
-                    print(f"  計算されたlora_weight: {lora_weight.shape}")
+                    tqdm.write(f"  計算されたlora_weight: {lora_weight.shape}")
                     
                     # ベースの重みに加算する前に次元が一致するか確認
                     if lora_weight.shape == base_weight_shape:
                         module.base_layer.weight.data += lora_weight.to(module.base_layer.weight.data.device)
                         merged_count += 1
                     else:
-                        print(f"  警告: 計算されたLoRA重みのサイズ({lora_weight.shape})がベース重みのサイズ({base_weight_shape})と一致しません。")
+                        tqdm.write(f"  警告: 計算されたLoRA重みのサイズ({lora_weight.shape})がベース重みのサイズ({base_weight_shape})と一致しません。")
                         # 転置して試してみる
                         if lora_weight.t().shape == base_weight_shape:
-                            print(f"  転置後のサイズが一致するため、転置して加算します。")
+                            tqdm.write(f"  転置後のサイズが一致するため、転置して加算します。")
                             module.base_layer.weight.data += lora_weight.t().to(module.base_layer.weight.data.device)
                             merged_count += 1
                         else:
-                            print(f"このモジュールはスキップします。")
+                            tqdm.write(f"このモジュールはスキップします。")
                 del module
         
         print(f"{merged_count}個のLoraレイヤーをベースモデルにマージしました（スケール: {scale}）")
         
         # マージ後はLoraレイヤーをリセット
-        self.lora_layers = {}
+        self._remove_lora_from_modules()
+        
         gc.collect()
         torch.cuda.empty_cache()
 
@@ -449,8 +519,8 @@ def load_model(model_path=None,
                metadata_path=None, 
                base_model='SmilingWolf/wd-eva02-large-tagger-v3', 
                device=torch_device,
-               lora_rank=4,
-               lora_alpha=1.0,
+               lora_rank=32,
+               lora_alpha=16,
                lora_dropout=0.0,
                pretrained=True
     ) -> tuple[EVA02WithModuleLoRA, LabelData]:
@@ -475,7 +545,8 @@ def load_model(model_path=None,
         model = EVA02WithModuleLoRA(
             base_model=base_model,
             model_path = None,
-            num_classes=num_classes,  # 元のモデルのクラス
+            num_classes=num_classes,  # 元のモデルのクラス数
+            threshold=0.35,
             idx_to_tag=idx_to_tag,
             tag_to_idx=tag_to_idx,
             tag_to_category=tag_to_category,
@@ -498,11 +569,12 @@ def load_model(model_path=None,
 
         # チェックポイントからLoRA設定を取得
         print(f"チェックポイントからLoRA設定を取得しています...")
-        lora_rank = checkpoint.get('lora_rank', 4)
-        lora_alpha = checkpoint.get('lora_alpha', 1.0) 
-        lora_dropout = checkpoint.get('lora_dropout', 0.0)
+        lora_rank = checkpoint.get('lora_rank', lora_rank)
+        lora_alpha = checkpoint.get('lora_alpha', lora_alpha) 
+        lora_dropout = checkpoint.get('lora_dropout', lora_dropout)
         print(f"LoRA設定: lora_rank: {lora_rank}, lora_alpha: {lora_alpha}, lora_dropout: {lora_dropout}")
         target_modules = checkpoint.get('target_modules', None)
+        threshold = checkpoint.get('threshold', 0.35)
         tag_to_idx = checkpoint.get('tag_to_idx', None)
         idx_to_tag = checkpoint.get('idx_to_tag', None)
         tag_to_category = checkpoint.get('tag_to_category', None)
@@ -513,8 +585,11 @@ def load_model(model_path=None,
             num_classes = len(idx_to_tag)
             labels.names = [idx_to_tag[i] for i in range(len(idx_to_tag))]
             labels.rating = [i for i, name in enumerate(labels.names) if tag_to_category[name] == 'Rating']
-            labels.character = [i for i, name in enumerate(labels.names) if tag_to_category[name] == 'Character']
             labels.general = [i for i, name in enumerate(labels.names) if tag_to_category[name] == 'General']
+            labels.artist = [i for i, name in enumerate(labels.names) if tag_to_category[name] == 'Artist']
+            labels.character = [i for i, name in enumerate(labels.names) if tag_to_category[name] == 'Character']
+            labels.meta = [i for i, name in enumerate(labels.names) if tag_to_category[name] == 'Meta']
+            
         else:
             # データが欠落しているときは、ベースモデルから読み込む
             print(f"チェックポイントからラベルデータが見つかりません。ベースモデルから読み込んでいます...")
@@ -524,8 +599,8 @@ def load_model(model_path=None,
             tag_to_idx = {name: i for i, name in enumerate(labels.names)}
             tag_to_category = {name: 'Rating' if i in labels.rating else 'Character' if i in labels.character else 'General' for i, name in enumerate(labels.names)}
             # 'general': 0, 'sensitive': 1, 'questionable': 2, 'explicit': 3はratingに入るように
-            labels.rating.extend([i for i, name in enumerate(labels.names) if name not in tag_to_category and name in ['general', 'sensitive', 'questionable', 'explicit']])
-            labels.general.extend([i for i, name in enumerate(labels.names) if name not in tag_to_category and name not in ['general', 'sensitive', 'questionable', 'explicit']])  
+            # labels.rating.extend([i for i, name in enumerate(labels.names) if name not in tag_to_category and name in ['general', 'sensitive', 'questionable', 'explicit']])
+            # labels.general.extend([i for i, name in enumerate(labels.names) if name not in tag_to_category and name not in ['general', 'sensitive', 'questionable', 'explicit']])  
 
         print(f"カテゴリごとのタグ数: Rating: {len(labels.rating)}, Character: {len(labels.character)}, General: {len(labels.general)}")
         
@@ -534,6 +609,7 @@ def load_model(model_path=None,
             base_model=base_model,
             model_path = model_path,
             num_classes=num_classes,
+            threshold=threshold,
             idx_to_tag=idx_to_tag,
             tag_to_idx=tag_to_idx,
             tag_to_category=tag_to_category,
@@ -570,9 +646,9 @@ def load_model(model_path=None,
             # メタデータからLoRA設定を取得
             try:
                 base_model = metadata.get('base_model', 'SmilingWolf/wd-eva02-large-tagger-v3')
-                lora_rank = int(metadata.get('lora_rank', 4))
-                lora_alpha = float(metadata.get('lora_alpha', 1.0))
-                lora_dropout = float(metadata.get('lora_dropout', 0.0))
+                lora_rank = int(metadata.get('lora_rank', lora_rank))
+                lora_alpha = float(metadata.get('lora_alpha', lora_alpha))
+                lora_dropout = float(metadata.get('lora_dropout', lora_dropout))
                 print(f"LoRA設定: lora_rank: {lora_rank}, lora_alpha: {lora_alpha}, lora_dropout: {lora_dropout}")
             except Exception as e:
                 print(f"チェックポイントからLoRA設定が見つかりません...")
@@ -590,12 +666,16 @@ def load_model(model_path=None,
                 idx_to_tag = ast.literal_eval(metadata['idx_to_tag'])
                 tag_to_idx = ast.literal_eval(metadata['tag_to_idx'])
                 tag_to_category = ast.literal_eval(metadata['tag_to_category'])
+                threshold = float(metadata.get('threshold', 0.35))
                 if idx_to_tag is not None:
                     num_classes = len(idx_to_tag)
                     labels.names = [idx_to_tag[i] for i in range(len(idx_to_tag))]
                     labels.rating = [i for i, name in enumerate(labels.names) if tag_to_category.get(name) == 'Rating']
-                    labels.character = [i for i, name in enumerate(labels.names) if tag_to_category.get(name) == 'Character'] 
                     labels.general = [i for i, name in enumerate(labels.names) if tag_to_category.get(name) == 'General']
+                    labels.artist = [i for i, name in enumerate(labels.names) if tag_to_category.get(name) == 'Artist']
+                    labels.character = [i for i, name in enumerate(labels.names) if tag_to_category.get(name) == 'Character'] 
+                    labels.meta = [i for i, name in enumerate(labels.names) if tag_to_category.get(name) == 'Meta']
+
                     # tag_to_category のキーに存在しないtagは、暫定的にGeneralに分類
                     # 'general': 0, 'sensitive': 1, 'questionable': 2, 'explicit': 3はratingに入るように
                     labels.rating.extend([i for i, name in enumerate(labels.names) if name not in tag_to_category and name in ['general', 'sensitive', 'questionable', 'explicit']])
@@ -606,6 +686,7 @@ def load_model(model_path=None,
                 target_modules = None
                 labels = load_labels_hf(repo_id=base_model)
                 num_classes = len(labels.names)
+                threshold = 0.35
                 idx_to_tag = {i: name for i, name in enumerate(labels.names)}
                 tag_to_idx = {name: i for i, name in enumerate(labels.names)}
                 tag_to_category = {name: 'Rating' if i in labels.rating else 'Character' if i in labels.character else 'General' for i, name in enumerate(labels.names)}
@@ -635,6 +716,7 @@ def load_model(model_path=None,
                 base_model=base_model,
                 model_path = model_path,
                 num_classes=num_classes,  # safetensorsから取得したクラス数を使用
+                threshold=threshold,
                 idx_to_tag=idx_to_tag,
                 tag_to_idx=tag_to_idx,
                 tag_to_category=tag_to_category,
@@ -703,7 +785,7 @@ def read_tags_from_file(image_path, remove_special_prefix="remove"):
         tags = [line.strip() for line in content.splitlines() if line.strip()]
 
     # タグを正規化
-    tags = [normalize_tag(tag, remove_special_prefixes=remove_special_prefix) for tag in tags]
+    tags = [normalize_tag(tag) for tag in tags]
 
     # タグを処理
     processed_tags = []
@@ -712,20 +794,25 @@ def read_tags_from_file(image_path, remove_special_prefix="remove"):
         if re.match(r'^[a-zA-Z]@', tag):
             if remove_special_prefix == "remove":
                 # プレフィックスを削除して追加
-                processed_tags.append(normalize_tag(tag, remove_special_prefixes="remove"))
+                processed_tags.append(tag[2:])
             elif remove_special_prefix == "omit":
                 # 特殊プレフィックスを持つタグは完全にスキップ
                 continue
         else:
             # 特殊プレフィックスを持たないタグはそのまま正規化して追加
-            processed_tags.append(normalize_tag(tag, remove_special_prefixes="remove"))
+            processed_tags.append(tag)
     
     return processed_tags
 
-def predict_image(image_path, model, labels, device=torch_device, gen_threshold=0.35, char_threshold=0.75):
+def predict_image(image_path, model, labels, gen_threshold = None, char_threshold = None, device=torch_device):
     """画像からタグを予測する関数"""
     # 画像の読み込みと前処理
-    img_input = Image.open(image_path)
+    if image_path.startswith(('http://', 'https://')):
+        response = requests.get(image_path)
+        img_input = Image.open(BytesIO(response.content))
+    else:
+        img_input = Image.open(image_path)
+
     img_input = pil_ensure_rgb(img_input)
     img_input = pil_pad_square(img_input)
     
@@ -752,14 +839,14 @@ def predict_image(image_path, model, labels, device=torch_device, gen_threshold=
             outputs = outputs.to("cpu")
     
     # タグの取得
-    caption, taglist, ratings, character, general, all_character, all_general = get_tags(
+    caption, taglist, ratings, general, artist, character, copyright, meta, all_general, all_artist, all_character, all_copyright, all_meta = get_tags(
         probs=outputs.squeeze(0),
         labels=labels,
-        gen_threshold=gen_threshold,
-        char_threshold=char_threshold,
+        gen_threshold=gen_threshold if gen_threshold is not None else model.threshold,
+        char_threshold=char_threshold if char_threshold is not None else model.threshold,
     )
     
-    return img_input, caption, taglist, ratings, character, general, all_character, all_general
+    return img_input, caption, taglist, ratings, general, artist, character, copyright, meta, all_general, all_artist, all_character, all_copyright, all_meta
 
 
 def visualize_predictions(image, tags, predictions, threshold=0.35, output_path=None, max_tags=50):
@@ -811,13 +898,13 @@ def visualize_predictions(image, tags, predictions, threshold=0.35, output_path=
     below_threshold_in_tags.sort(key=lambda x: x[1], reverse=True)
     
     # 表示するタグ数を制限
-    total_tags = len(above_threshold_in_tags) + len(above_threshold_not_in_tags) + len(below_threshold_in_tags)
-    if total_tags > max_tags:
-        # 各カテゴリから均等に選択
-        tags_per_category = max(1, max_tags // 3)
-        above_threshold_in_tags = above_threshold_in_tags[:tags_per_category]
-        above_threshold_not_in_tags = above_threshold_not_in_tags[:tags_per_category]
-        below_threshold_in_tags = below_threshold_in_tags[:tags_per_category]
+    # total_tags = len(above_threshold_in_tags) + len(above_threshold_not_in_tags) + len(below_threshold_in_tags)
+    # if total_tags > max_tags:
+    #     # 各カテゴリから均等に選択
+    #     tags_per_category = max(1, max_tags // 3)
+    #     above_threshold_in_tags = above_threshold_in_tags[:tags_per_category]
+    #     above_threshold_not_in_tags = above_threshold_not_in_tags[:tags_per_category]
+    #     below_threshold_in_tags = below_threshold_in_tags[:tags_per_category]
     
     # プロットの設定
     plt.figure(figsize=(15, 10))
@@ -941,9 +1028,6 @@ def visualize_predictions_for_tensorboard(img_tensor, probs, idx_to_tag, thresho
     for tag in truth_tags:
         norm_tag = normalize_tag(tag)
         normalized_truth.append(norm_tag)
-    
-    # タグをカテゴリごとに分類（可視化のためだけに使用）
-    category_tags = defaultdict(list)
     
     # タグを3つのカテゴリに分類
     above_threshold_in_tags = []      # 閾値以上かつグラウンドトゥルースに含まれる（True Positive）
@@ -1527,6 +1611,7 @@ def train_model(
     save_format='safetensors',
     save_best='f1',  # 'f1', 'loss', 'both'
     checkpoint_interval=1,
+    merge_every_n_epochs=None,
     mixed_precision=False,
     tensorboard=False,
     initial_threshold=0.35,
@@ -1654,7 +1739,7 @@ def train_model(
             progress_bar.set_postfix({"loss": f"{loss.item():.4f}"})
 
             if i % 5 == 0 and i / 5 < 10:
-                img_grid = visualize_predictions_for_tensorboard(images[0], probs[0], idx_to_tag, threshold=0.35, original_tags=targets[0], tag_to_category=tag_to_category)
+                img_grid = visualize_predictions_for_tensorboard(images[0], probs[0], idx_to_tag, threshold=threshold, original_tags=targets[0])
 
                 if tensorboard:
                     writer.add_image(f'predictions/val_{i}', img_grid, 0)
@@ -1756,7 +1841,7 @@ def train_model(
                 writer.add_scalar('Train/Step_Loss', loss.item(), epoch * len(train_loader) + i)
                 
                 if i % 100 == 0:
-                    img_grid = visualize_predictions_for_tensorboard(images[0], probs[0], idx_to_tag, threshold=0.35, original_tags=targets[0])
+                    img_grid = visualize_predictions_for_tensorboard(images[0], probs[0], idx_to_tag, threshold=threshold, original_tags=targets[0])
                     writer.add_image(f'predictions/train_epoch_{epoch}', img_grid, i)
         
         # 学習率のスケジューリング
@@ -1784,7 +1869,7 @@ def train_model(
         train_metrics = compute_metrics(train_preds,train_targets)
 
         if dynamic_threshold:
-            threshold = train_metrics['threshold']
+            threshold = round(train_metrics['threshold'], 2)
         
         # 既存タグと新規タグに分けてメトリクスを計算
         if old_tags_count > 0 and len(model.tag_to_idx) > old_tags_count:
@@ -1804,6 +1889,14 @@ def train_model(
                 writer.add_scalar('Metrics/Train/F1_all', train_metrics['f1'], epoch+1)
                 writer.add_scalar('Metrics/Train/Threshold', threshold, epoch+1)
                 writer.add_image('Metrics/Train/F1_vs_Threshold', train_metrics['f1_vs_threshold_plot'], epoch+1)
+
+        if merge_every_n_epochs is not None and (epoch + 1) % merge_every_n_epochs == 0:
+            model.merge_lora_to_base_model()
+            # optimizer, schedulerをリセット
+            if isinstance(optimizer, bnb.optim.AdamW8bit):
+                optimizer = bnb.optim.AdamW8bit(model.parameters(), lr=optimizer.param_groups[0]['lr'], weight_decay=optimizer.param_groups[0]['weight_decay'])
+            else:
+                optimizer = torch.optim.AdamW(model.parameters(), lr=optimizer.param_groups[0]['lr'], weight_decay=optimizer.param_groups[0]['weight_decay'])
 
         # 検証フェーズ
         model.eval()
@@ -1835,7 +1928,7 @@ def train_model(
                 progress_bar.set_postfix({"loss": f"{loss.item():.4f}"})
 
                 if i % 5 == 0 and i / 5 < 10:
-                    img_grid = visualize_predictions_for_tensorboard(images[0], probs[0], idx_to_tag, threshold=0.35, original_tags=targets[0])
+                    img_grid = visualize_predictions_for_tensorboard(images[0], probs[0], idx_to_tag, threshold=threshold, original_tags=targets[0])
 
                     if tensorboard:
                         writer.add_image(f'predictions/val_{i}', img_grid, epoch+1)
@@ -2147,8 +2240,8 @@ def main():
     predict_parser.add_argument('--model_path', type=str, default=None, help='使用するLoRAモデルのパス（指定しない場合は元のモデルを使用）')
     predict_parser.add_argument('--metadata_path', type=str, default=None, help='モデルのメタデータファイルのパス（指定しない場合は元のモデルを使用）')
     predict_parser.add_argument('--output_dir', type=str, default='predictions', help='予測結果を保存するディレクトリ')
-    predict_parser.add_argument('--gen_threshold', type=float, default=0.35, help='一般タグの閾値')
-    predict_parser.add_argument('--char_threshold', type=float, default=0.75, help='キャラクタータグの閾値')
+    predict_parser.add_argument('--gen_threshold', type=float, default=None, help='一般タグの閾値')
+    predict_parser.add_argument('--char_threshold', type=float, default=None, help='キャラクタータグの閾値')
     
     # バッチ推論コマンド
     batch_parser = subparsers.add_parser('batch', help='複数の画像からタグを予測します')
@@ -2213,6 +2306,22 @@ def main():
     train_parser.add_argument('--tensorboard_port', type=int, default=6006, help='TensorBoardのポート番号')
     train_parser.add_argument('--bind_all', action='store_true', help='TensorBoardをすべてのネットワークインターフェースにバインドする')
     train_parser.add_argument('--seed', type=int, default=42, help='乱数シード')
+
+    # モデルマージコマンド
+    merge_parser = subparsers.add_parser('merge', help='LoRAモデルをマージします')
+
+    merge_parser.add_argument('--model_path', type=str, default=None, help='使用するLoRAモデルのパス（指定しない場合は元のモデルを使用）')
+    merge_parser.add_argument('--metadata_path', type=str, default=None, help='モデルのメタデータファイルのパス（指定しない場合は_metadata.jsonを使用）')
+    merge_parser.add_argument('--base_model', type=str, default='SmilingWolf/wd-eva02-large-tagger-v3', help='使用するベースモデルのリポジトリ')
+    merge_parser.add_argument('--output_dir', type=str, default='merged_model', help='出力ディレクトリ')
+
+    merge_parser.add_argument('--scale', type=float, default=1.0, help='マージ時のスケーリング係数（デフォルト: 1.0）')
+    merge_parser.add_argument('--save_format', type=str, default='safetensors', choices=['safetensors', 'pytorch'], help='モデルの保存形式')
+
+    merge_parser.add_argument('--merge_type', type=str, default='lora', choices=['lora'], help='マージするモデルの種類')
+    """
+    lora: LoRAモデルを元のモデルにマージし、LoRA層を削除する
+    """
     
     debug_parser = subparsers.add_parser('debug', help='モデルのデバッグを行います')
 
@@ -2235,7 +2344,7 @@ def main():
         print(f"読み込まれたタグ: {len(actual_tags)}個")
         
         # 予測を実行
-        img, caption, taglist, ratings, character, general, all_character, all_general = predict_image(
+        img, caption, taglist, ratings, general, artist, character, copyright, meta, all_general, all_artist, all_character, all_copyright, all_meta = predict_image(
             args.image, 
             model, 
             labels, 
@@ -2258,10 +2367,25 @@ def main():
         print(f"Character tags (threshold={args.char_threshold if args.char_threshold is not None else model.threshold}):")
         for k, v in character.items():
             print(f"  {k}: {v:.3f}")
-        
+
+        print("--------")
+        print(f"Copyright tags (threshold={args.gen_threshold if args.gen_threshold is not None else model.threshold}):")
+        for k, v in copyright.items():
+            print(f"  {k}: {v:.3f}")
+
+        print("--------")
+        print(f"Artist tags (threshold={args.gen_threshold if args.gen_threshold is not None else model.threshold}):")
+        for k, v in artist.items():
+            print(f"  {k}: {v:.3f}")
+
         print("--------")
         print(f"General tags (threshold={args.gen_threshold if args.gen_threshold is not None else model.threshold}):")
         for k, v in general.items():
+            print(f"  {k}: {v:.3f}")
+
+        print("--------")
+        print(f"Meta tags (threshold={args.gen_threshold if args.gen_threshold is not None else model.threshold}):")
+        for k, v in meta.items():
             print(f"  {k}: {v:.3f}")
         
         # 結果の可視化と保存
@@ -2275,7 +2399,7 @@ def main():
             image=img, 
             tags=actual_tags, 
             predictions=(caption, taglist, ratings, character, general, all_character, all_general),
-            threshold=args.gen_threshold,
+            threshold=args.gen_threshold if args.gen_threshold is not None else model.threshold,
             output_path=output_path
         )
     
@@ -2358,7 +2482,7 @@ def main():
         print(f"使用デバイス: {device}")
 
         print(f"モデルを読み込んでいます...")
-        model, labels = load_model(args.model_path, args.metadata_path, base_model=args.base_model, device=device)
+        model, labels = load_model(args.model_path, args.metadata_path, base_model=args.base_model, lora_rank=args.lora_rank, lora_alpha=args.lora_alpha, lora_dropout=args.lora_dropout, device=device)
         
         # ターゲットモジュールの読み込み
         target_modules = None
@@ -2450,7 +2574,6 @@ def main():
         # オプティマイザの設定
         if args.use_8bit_optimizer:
             try:
-                import bitsandbytes as bnb
                 optimizer = bnb.optim.AdamW8bit(
                     model.parameters(),
                     lr=args.learning_rate,
@@ -2517,6 +2640,7 @@ def main():
             save_format=args.save_format,
             save_best=args.save_best,
             checkpoint_interval=args.checkpoint_interval,
+            merge_every_n_epochs=args.merge_every_n_epochs,
             mixed_precision=args.mixed_precision,
             tensorboard=True,
             initial_threshold=args.initial_threshold,
@@ -2529,14 +2653,91 @@ def main():
         if args.tensorboard and 'tensorboard_process' in locals():
             tensorboard_process.terminate()
 
-    elif args.command == 'debug':
-        debug_model()
+    elif args.command == 'merge':
+
+        def save_model(output_dir, filename, base_model, save_format, model, optimizer, scheduler, epoch, threshold, val_loss, val_f1, tag_to_idx, idx_to_tag, tag_to_category):
+            os.makedirs(output_dir, exist_ok=True)
+            
+            # モデルの状態辞書
+            model_state_dict = model.state_dict()
+            
+            # メタデータ情報
+            metadata = {
+                'base_model': base_model,
+                'epoch': epoch,
+                'threshold': threshold,
+                'val_loss': val_loss,
+                'val_f1': val_f1,
+                'lora_rank': model.lora_rank,
+                'lora_alpha': model.lora_alpha,
+                'lora_dropout': model.lora_dropout,
+                'target_modules': model.target_modules,
+                'tag_to_idx': tag_to_idx,
+                'idx_to_tag': idx_to_tag,
+                'tag_to_category': tag_to_category,
+            }
+            
+            # 完全なチェックポイント
+            checkpoint = {
+                'model_state_dict': model_state_dict,
+                # 'optimizer_state_dict': optimizer.state_dict() if optimizer else None,
+                # 'scheduler_state_dict': scheduler.state_dict() if scheduler else None,
+                'base_model': base_model,
+                'epoch': epoch,
+                'threshold': threshold,
+                'val_loss': val_loss,
+                'val_f1': val_f1,
+                'lora_rank': model.lora_rank,
+                'lora_alpha': model.lora_alpha,
+                'lora_dropout': model.lora_dropout,
+                'target_modules': model.target_modules,
+                'tag_to_idx': tag_to_idx,
+                'idx_to_tag': idx_to_tag,
+                'tag_to_category': tag_to_category,
+            }
+
+            if save_format == 'safetensors':
+                # safetensors形式ではテンソルのみ保存可能
+                from safetensors.torch import save_file
+                
+                # モデルの状態辞書のみsafetensorsで保存
+                save_file(model_state_dict, os.path.join(output_dir, f'{filename}.safetensors'), metadata={str(k): str(v) for k, v in metadata.items()})
+                
+                # その他の情報はJSON形式で保存
+                other_info = {k: str(v) if isinstance(v, (dict, list, tuple)) else v for k, v in checkpoint.items() if k != 'model_state_dict'}
+                with open(os.path.join(output_dir, f'{filename}_metadata.json'), 'w', encoding='utf-8') as f:
+                    json.dump(other_info, f, indent=2, ensure_ascii=False)
+                
+                print(f"Model saved as {os.path.join(output_dir, f'{filename}.safetensors')} and metadata as {os.path.join(output_dir, f'{filename}_metadata.json')}")
+            else:
+                # PyTorch形式で保存
+                torch.save(checkpoint, os.path.join(output_dir, f'{filename}.pt'))
+                print(f"Model saved as {os.path.join(output_dir, f'{filename}.pt')}")
+
+        # モデルの読み込み
+        model, labels = load_model(args.model_path, args.metadata_path, base_model=args.base_model, device=torch_device)
+
+        # マージタイプに応じた処理
+        if args.merge_type == 'lora':
+            # LoRAをベースモデルにマージ
+            model.merge_lora_to_base_model(scale=args.scale)
+            
+            # LoRA層を削除
+            model._remove_lora_from_modules()
+
+            filename = os.path.basename(args.model_path) + '_merged'
+            
+            save_model(args.output_dir, filename, args.base_model, args.save_format, model, None, None, None, model.threshold, None, None, model.tag_to_idx, model.idx_to_tag, model.tag_to_category)
+            # タグマッピングの保存
+            save_tag_mapping(args.output_dir, model.idx_to_tag, model.tag_to_category)
+        else:
+            print(f"未対応のマージタイプです: {args.merge_type}")
     
     else:
         parser.print_help()
 
 
 if __name__ == "__main__":
-    import math  # LoRALayer初期化に必要
     main()
+
 
