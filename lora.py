@@ -13,11 +13,13 @@ from huggingface_hub.utils import HfHubHTTPError
 from PIL import Image
 from timm.data import create_transform, resolve_data_config
 from torch import Tensor, nn
+import gc
 from torch.nn import functional as F
 from torchvision import transforms
 import re
 import json
-from tqdm import tqdm
+import ast
+from tqdm.auto import tqdm
 import matplotlib.pyplot as plt
 import copy
 from io import BytesIO
@@ -26,7 +28,7 @@ from collections import defaultdict
 # デバイスの設定
 torch_device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-# LoRAモジュールの定義
+# Loraレイヤーの定義
 class LoRALayer(nn.Module):
     def __init__(self, in_features, out_features, rank=4, alpha=1.0):
         super().__init__()
@@ -183,7 +185,11 @@ class EVA02WithModuleLoRA(nn.Module):
     def __init__(
         self, 
         base_model: str = 'SmilingWolf/wd-eva02-large-tagger-v3',
+        model_path: str = None,
         num_classes=None,  # 初期化時にはNoneでも可能に
+        idx_to_tag=None,
+        tag_to_idx=None,
+        tag_to_category=None,
         lora_rank=32, 
         lora_alpha=16, 
         lora_dropout=0.0,
@@ -191,15 +197,20 @@ class EVA02WithModuleLoRA(nn.Module):
         pretrained=True
     ):
         super().__init__()
+
+        self.base_model = base_model
         
         # LoRAのハイパーパラメータを保存
         self.lora_rank = lora_rank
         self.lora_alpha = lora_alpha
         self.lora_dropout = lora_dropout
+        self.idx_to_tag = idx_to_tag
+        self.tag_to_idx = tag_to_idx
+        self.tag_to_category = tag_to_category
         
         # バックボーンを作成
         self.backbone = timm.create_model(
-            'hf-hub:' + base_model, 
+            'hf-hub:' + self.base_model, 
             pretrained=pretrained
         )
         
@@ -294,7 +305,7 @@ class EVA02WithModuleLoRA(nn.Module):
         # 正規表現パターンをコンパイル
         patterns = [re.compile(pattern) for pattern in self.target_modules]
         
-        # 適用されたLoRA層を追跡
+        # 新しいLoRA層を追跡
         self.lora_layers = {}
         
         # 各モジュールを調査
@@ -350,25 +361,25 @@ class EVA02WithModuleLoRA(nn.Module):
             scale: マージ時のスケーリング係数（デフォルト: 1.0）
         
         Returns:
-            マージされたモジュールの数
+            マージされたレイヤーの数
         """
-        # lora_modulesが存在しない場合は、モデル内のLoRALinearモジュールを検索
-        if not hasattr(self, 'lora_modules') or not self.lora_modules:
-            print("lora_modulesが見つかりません。モデル内のLoRALinearモジュールを検索します...")
-            self.lora_modules = {}
+        # lora_layerが存在しない場合は、モデル内のLoRALinearモジュールを検索
+        if not hasattr(self, 'lora_layers') or not self.lora_layers:
+            print("lora_layersが見つかりません。モデル内のLoRALinearモジュールを検索します...")
+            self.lora_layers = {}
             
             # モデル内のすべてのLoRALinearモジュールを検索
             for name, module in self.named_modules():
                 if isinstance(module, LoRALinear):
-                    self.lora_modules[name] = module
-                    print(f"LoRAモジュールを検出: {name}")
+                    self.lora_layers[name] = module
+                    print(f"Loraレイヤーを検出: {name}")
         
-        if not self.lora_modules:
-            print("マージするLoRAモジュールがありません。")
+        if not self.lora_layers:
+            print("マージするLoraレイヤーがありません。")
             return 0
         
         merged_count = 0
-        for name, module in self.lora_modules.items():
+        for name, module in self.lora_layers.items():
             if isinstance(module, LoRALinear):
                 # LoRAの計算: x @ (A @ B) * scale
                 # ベースの重みに A @ B * scale を加算
@@ -379,7 +390,7 @@ class EVA02WithModuleLoRA(nn.Module):
                     lora_a_shape = module.lora.lora_A.shape
                     lora_b_shape = module.lora.lora_B.shape
                     
-                    print(f"  base_weight: {base_weight_shape}, lora_A: {lora_a_shape}, lora_B: {lora_b_shape}")
+                    print(f"base_weight: {base_weight_shape}, lora_A: {lora_a_shape}, lora_B: {lora_b_shape}")
                     
                     # 行列の掛け算と転置を適切に行う
                     if base_weight_shape[0] == lora_b_shape[1] and base_weight_shape[1] == lora_a_shape[0]:
@@ -414,13 +425,16 @@ class EVA02WithModuleLoRA(nn.Module):
                             module.base_layer.weight.data += lora_weight.t().to(module.base_layer.weight.data.device)
                             merged_count += 1
                         else:
-                            print(f"  このモジュールはスキップします。")
+                            print(f"このモジュールはスキップします。")
+                del module
         
-        print(f"{merged_count}個のLoRAモジュールをベースモデルにマージしました（スケール: {scale}）")
+        print(f"{merged_count}個のLoraレイヤーをベースモデルにマージしました（スケール: {scale}）")
         
-        # マージ後はLoRAモジュールをリセット
-        self.lora_modules = {}
-        
+        # マージ後はLoraレイヤーをリセット
+        self.lora_layers = {}
+        gc.collect()
+        torch.cuda.empty_cache()
+
         # LoRAを再適用（空のLoRAを適用）
         self._apply_lora_to_modules()
         
@@ -431,69 +445,115 @@ class EVA02WithModuleLoRA(nn.Module):
         return self.backbone(x)
 
 
-def load_model(model_path=None, metadata_path=None, base_model='SmilingWolf/wd-eva02-large-tagger-v3', device=torch_device):
+def load_model(model_path=None, 
+               metadata_path=None, 
+               base_model='SmilingWolf/wd-eva02-large-tagger-v3', 
+               device=torch_device,
+               lora_rank=4,
+               lora_alpha=1.0,
+               lora_dropout=0.0,
+               pretrained=True
+    ) -> tuple[EVA02WithModuleLoRA, LabelData]:
     """モデルを読み込む関数"""
-    print(f"モデルを読み込んでいます...")
+    print(f" === Load Model === ")
 
-    # huggingface のsmilingwolf のモデルの場合
     if model_path is None:
+        print(f"ベースモデルを読み込んでいます...")
+
         # ラベルデータを読み込む
+        print(f"ラベルデータを読み込んでいます...")
         labels = load_labels_hf(repo_id=base_model)
         num_classes = len(labels.names)
         
         idx_to_tag = {i: name for i, name in enumerate(labels.names)}
         tag_to_idx = {name: i for i, name in enumerate(labels.names)}
+        tag_to_category = {name: 'Rating' if i in labels.rating else 'Character' if i in labels.character else 'General' for i, name in enumerate(labels.names)}
+        print(f"カテゴリごとのタグ数: Rating: {len(labels.rating)}, Character: {len(labels.character)}, General: {len(labels.general)}")
 
-        # モデルの指定がない場合も EVA02WithModuleLoRA を使用
-        print("初期化されたLoRAモデルを使用します（元のモデルと同等）")
+        print(f"初期化されたLoRAモデルを使用します（ベースモデル: {base_model}, lora_rank: {lora_rank}, lora_alpha: {lora_alpha}, lora_dropout: {lora_dropout}")
+
         model = EVA02WithModuleLoRA(
             base_model=base_model,
-            num_classes=num_classes,  # 元のモデルのクラス数
-            lora_rank=4,              # デフォルト値
-            lora_alpha=1.0,           # デフォルト値
-            lora_dropout=0.0,         # デフォルト値
-            pretrained=True
-        ) 
+            model_path = None,
+            num_classes=num_classes,  # 元のモデルのクラス
+            idx_to_tag=idx_to_tag,
+            tag_to_idx=tag_to_idx,
+            tag_to_category=tag_to_category,
+            lora_rank=lora_rank,
+            lora_alpha=lora_alpha,
+            lora_dropout=lora_dropout,
+            pretrained=pretrained
+        )
     elif model_path.endswith('.pth') or model_path.endswith('.pt'):
         # ほかのローカルモデルの場合
         # トレーニング済みのLoRAが付与されたモデルの可能性がある
-        print(f"LoRAチェックポイントを読み込んでいます: {model_path}")
+        print(f"LoRA適用モデル(PyTorch形式)を読み込んでいます: {model_path}")
         
         # PyTorch形式のチェックポイントを読み込む
+        print(f"チェックポイントを読み込んでいます...")
         checkpoint = torch.load(model_path, map_location=device)
-        
+
+        # ベースモデル設定を上書き
+        base_model = checkpoint.get('base_model', None)
+
         # チェックポイントからLoRA設定を取得
+        print(f"チェックポイントからLoRA設定を取得しています...")
         lora_rank = checkpoint.get('lora_rank', 4)
         lora_alpha = checkpoint.get('lora_alpha', 1.0) 
         lora_dropout = checkpoint.get('lora_dropout', 0.0)
+        print(f"LoRA設定: lora_rank: {lora_rank}, lora_alpha: {lora_alpha}, lora_dropout: {lora_dropout}")
         target_modules = checkpoint.get('target_modules', None)
         tag_to_idx = checkpoint.get('tag_to_idx', None)
         idx_to_tag = checkpoint.get('idx_to_tag', None)
-        existing_tags_count = checkpoint.get('existing_tags_count', 0)
-        
-        # タグ数を決定
-        if tag_to_idx is not None:
-            num_classes = len(tag_to_idx)
-            print(f"チェックポイントから読み込んだタグ数: {num_classes}")
-            print(f"既存タグ数: {existing_tags_count}, 新規タグ数: {num_classes - existing_tags_count}")
-            
-            # タグマッピングがある場合は、ラベルを更新
-            if idx_to_tag is not None:
-                labels.names = [idx_to_tag[i] for i in range(len(idx_to_tag))]
+        tag_to_category = checkpoint.get('tag_to_category', None)
+
+        labels = LabelData(names=[], rating=[], general=[], character=[])
+
+        if idx_to_tag is not None:
+            num_classes = len(idx_to_tag)
+            labels.names = [idx_to_tag[i] for i in range(len(idx_to_tag))]
+            labels.rating = [i for i, name in enumerate(labels.names) if tag_to_category[name] == 'Rating']
+            labels.character = [i for i, name in enumerate(labels.names) if tag_to_category[name] == 'Character']
+            labels.general = [i for i, name in enumerate(labels.names) if tag_to_category[name] == 'General']
+        else:
+            # データが欠落しているときは、ベースモデルから読み込む
+            print(f"チェックポイントからラベルデータが見つかりません。ベースモデルから読み込んでいます...")
+            labels = load_labels_hf(repo_id=base_model)
+            num_classes = len(labels.names)
+            idx_to_tag = {i: name for i, name in enumerate(labels.names)}
+            tag_to_idx = {name: i for i, name in enumerate(labels.names)}
+            tag_to_category = {name: 'Rating' if i in labels.rating else 'Character' if i in labels.character else 'General' for i, name in enumerate(labels.names)}
+            # 'general': 0, 'sensitive': 1, 'questionable': 2, 'explicit': 3はratingに入るように
+            labels.rating.extend([i for i, name in enumerate(labels.names) if name not in tag_to_category and name in ['general', 'sensitive', 'questionable', 'explicit']])
+            labels.general.extend([i for i, name in enumerate(labels.names) if name not in tag_to_category and name not in ['general', 'sensitive', 'questionable', 'explicit']])  
+
+        print(f"カテゴリごとのタグ数: Rating: {len(labels.rating)}, Character: {len(labels.character)}, General: {len(labels.general)}")
         
         # モデルを作成
         model = EVA02WithModuleLoRA(
             base_model=base_model,
+            model_path = model_path,
             num_classes=num_classes,
+            idx_to_tag=idx_to_tag,
+            tag_to_idx=tag_to_idx,
+            tag_to_category=tag_to_category,
             lora_rank=lora_rank,
             lora_alpha=lora_alpha,
             lora_dropout=lora_dropout,
             target_modules=target_modules,
-            pretrained=True
+            pretrained=False
         )
-        
         # 状態辞書をモデルに読み込む
         model.load_state_dict(checkpoint['model_state_dict'])
+
+        # Loraレイヤーを明示的に検出
+        model.lora_layers = {}
+        for name, module in model.named_modules():
+            if isinstance(module, LoRALinear):
+                model.lora_layers[name] = module
+
+        print(f"検出されたLoraレイヤー数: {len(model.lora_layers)}")
+
     elif model_path is not None and model_path.endswith('.safetensors'):
         # safetensors形式のチェックポイントを読み込む
         from safetensors.torch import load_file
@@ -501,104 +561,56 @@ def load_model(model_path=None, metadata_path=None, base_model='SmilingWolf/wd-e
         # メタデータを読み込む
         if metadata_path is None:
             metadata_path = os.path.splitext(model_path)[0] + '_metadata.json'
+            print(f"Read metadata from {metadata_path}")
     
         if os.path.exists(metadata_path):
             with open(metadata_path, 'r', encoding='utf-8') as f:
                 metadata = json.load(f)
                 
             # メタデータからLoRA設定を取得
-            lora_rank = int(metadata.get('lora_rank', 4))
-            lora_alpha = float(metadata.get('lora_alpha', 1.0))
-            lora_dropout = float(metadata.get('lora_dropout', 0.0))
+            try:
+                base_model = metadata.get('base_model', 'SmilingWolf/wd-eva02-large-tagger-v3')
+                lora_rank = int(metadata.get('lora_rank', 4))
+                lora_alpha = float(metadata.get('lora_alpha', 1.0))
+                lora_dropout = float(metadata.get('lora_dropout', 0.0))
+                print(f"LoRA設定: lora_rank: {lora_rank}, lora_alpha: {lora_alpha}, lora_dropout: {lora_dropout}")
+            except Exception as e:
+                print(f"チェックポイントからLoRA設定が見つかりません...")
             
             # evalを使用する場合の注意点: 辞書のキーが整数になる
             try:
                 target_modules = eval(metadata.get('target_modules', 'None'))
-                tag_to_idx = eval(metadata.get('tag_to_idx', 'None'))
-                idx_to_tag = eval(metadata.get('idx_to_tag', 'None'))
-                tag_to_category = eval(metadata.get('tag_to_category', 'None'))
             except Exception as e:
-                print(f"Warning: Error evaluating metadata: {e}")
+                print(f"チェックポイントからtarget_modulesが見つかりません...")
                 target_modules = None
-                tag_to_idx = None
-                idx_to_tag = None
-                
-            existing_tags_count = int(metadata.get('existing_tags_count', 0))
-            
-            # タグ数を決定
-            if tag_to_idx is not None:
-                num_classes = len(tag_to_idx)
-                print(f"チェックポイントから読み込んだタグ数: {num_classes}")
-                print(f"既存タグ数: {existing_tags_count}, 新規タグ数: {num_classes - existing_tags_count}")
-                
-                # デバッグ情報
-                print(f"idx_to_tag type: {type(idx_to_tag)}")
-                if idx_to_tag:
-                    sample_key = next(iter(idx_to_tag.keys()))
-                    print(f"Sample key type: {type(sample_key)}")
-                
-                # タグマッピングがある場合は、ラベルを更新
+
+            labels = LabelData(names=[], rating=[], general=[], character=[])
+
+            try:
+                idx_to_tag = ast.literal_eval(metadata['idx_to_tag'])
+                tag_to_idx = ast.literal_eval(metadata['tag_to_idx'])
+                tag_to_category = ast.literal_eval(metadata['tag_to_category'])
                 if idx_to_tag is not None:
-                    # 新しいLabelDataオブジェクトを作成
-                    labels = LabelData(
-                        names=[idx_to_tag[i] for i in range(len(idx_to_tag))],
-                        rating=np.array([0, 1, 2, 3]),  # デフォルト値
-                        general=np.array([]),  # 簡易的な設定
-                        character=np.array([])  # 簡易的な設定
-                    )
+                    num_classes = len(idx_to_tag)
+                    labels.names = [idx_to_tag[i] for i in range(len(idx_to_tag))]
+                    labels.rating = [i for i, name in enumerate(labels.names) if tag_to_category.get(name) == 'Rating']
+                    labels.character = [i for i, name in enumerate(labels.names) if tag_to_category.get(name) == 'Character'] 
+                    labels.general = [i for i, name in enumerate(labels.names) if tag_to_category.get(name) == 'General']
+                    # tag_to_category のキーに存在しないtagは、暫定的にGeneralに分類
+                    # 'general': 0, 'sensitive': 1, 'questionable': 2, 'explicit': 3はratingに入るように
+                    labels.rating.extend([i for i, name in enumerate(labels.names) if name not in tag_to_category and name in ['general', 'sensitive', 'questionable', 'explicit']])
+                    labels.general.extend([i for i, name in enumerate(labels.names) if name not in tag_to_category and name not in ['general', 'sensitive', 'questionable', 'explicit']])
                     
-                    try:
-                        # キーの型を確認
-                        is_int_key = False
-                        if idx_to_tag:
-                            sample_key = next(iter(idx_to_tag.keys()))
-                            is_int_key = isinstance(sample_key, int)
-                            print(f"Using {'integer' if is_int_key else 'string'} keys for idx_to_tag")
-                        
-                        # タグ名のリストを作成
-                        tag_names = []
-                        rating_indices = []
-                        general_indices = []
-                        character_indices = []
-                        rating_indices = []
-                        
-                        # すべてのインデックスに対応するタグを取得
-                        for i in range(num_classes):
-                            key = i if is_int_key else str(i)
-                            tag = idx_to_tag.get(key, f"unknown_{i}")
-                            tag_names.append(tag)
-                            
-                            # カテゴリに基づいてインデックスを分類
-                            if i < 4:  # 最初の4つはrating
-                                rating_indices.append(np.int64(i))
-                            elif tag_to_category and tag in tag_to_category:
-                                category = tag_to_category[tag]
-                                if category == 'Character':
-                                    character_indices.append(np.int64(i))
-                                else:  # General, Meta, Artist などはすべてGeneralとして扱う
-                                    general_indices.append(np.int64(i))
-                            else:
-                                # カテゴリ情報がない場合はGeneralとして扱う
-                                general_indices.append(np.int64(i))
-                        
-                        # LabelDataオブジェクトを更新
-                        labels.names = tag_names
-                        labels.rating = rating_indices
-                        labels.general = general_indices
-                        labels.character = character_indices
-                        
-                        print(f"Created labels with {len(tag_names)} tags")
-                        print(f"Rating tags: {len(rating_indices)}")
-                        print(f"General tags: {len(general_indices)}")
-                        print(f"Character tags: {len(character_indices)}")
-                        
-                    except Exception as e:
-                        print(f"Error creating labels: {e}")
-                        # 最低限の情報でラベルを作成
-                        labels.names = [f"tag_{i}" for i in range(num_classes)]
-                        labels.rating = [np.int64(i) for i in range(min(4, num_classes))]
-                        labels.general = [np.int64(i) for i in range(4, num_classes)]
-                        labels.character = []
+            except Exception as e:
+                print(f"チェックポイントからラベルデータが見つかりません。{e}, ベースモデルから読み込んでいます...")
+                target_modules = None
+                labels = load_labels_hf(repo_id=base_model)
+                num_classes = len(labels.names)
+                idx_to_tag = {i: name for i, name in enumerate(labels.names)}
+                tag_to_idx = {name: i for i, name in enumerate(labels.names)}
+                tag_to_category = {name: 'Rating' if i in labels.rating else 'Character' if i in labels.character else 'General' for i, name in enumerate(labels.names)}
+
+            print(f"カテゴリごとのタグ数: Rating: {len(labels.rating)}, Character: {len(labels.character)}, General: {len(labels.general)}")
 
             # モデルの読み込み
             from safetensors.torch import load_file
@@ -608,32 +620,40 @@ def load_model(model_path=None, metadata_path=None, base_model='SmilingWolf/wd-e
             state_dict = load_file(model_path, device=device_str)
 
             # 出力層のサイズを取得
-            num_classes = None
+            head_size = None
             for key in state_dict.keys():
                 if 'head.weight' in key:
-                    num_classes = state_dict[key].shape[0]
+                    head_size = state_dict[key].shape[0]
                     break
+            if head_size != num_classes:
+                print(f"警告: ベースモデルのラベル数とチェックポイントのラベル数が一致しません。")
+                print(f"ベースモデルのラベル数: {num_classes}, チェックポイントのラベル数: {head_size}")
             
             # モデルを作成
+            print(f"モデルを作成しています...")
             model = EVA02WithModuleLoRA(
                 base_model=base_model,
+                model_path = model_path,
                 num_classes=num_classes,  # safetensorsから取得したクラス数を使用
+                idx_to_tag=idx_to_tag,
+                tag_to_idx=tag_to_idx,
+                tag_to_category=tag_to_category,
                 lora_rank=lora_rank,
                 lora_alpha=lora_alpha,
                 lora_dropout=lora_dropout,
                 target_modules=target_modules,
-                pretrained=True
+                pretrained=False
             )
 
             model.load_state_dict(state_dict)
             
-            # LoRAモジュールを明示的に検出
-            model.lora_modules = {}
+            # Loraレイヤーを明示的に検出
+            model.lora_layers = {}
             for name, module in model.named_modules():
                 if isinstance(module, LoRALinear):
-                    model.lora_modules[name] = module
+                    model.lora_layers[name] = module
             
-            print(f"検出されたLoRAモジュール数: {len(model.lora_modules)}")
+            print(f"検出されたLoraレイヤー数: {len(model.lora_layers)}")
         else:
             raise ValueError(f"メタデータファイルが見つかりません: {metadata_path}")
     else:
@@ -642,10 +662,12 @@ def load_model(model_path=None, metadata_path=None, base_model='SmilingWolf/wd-e
     model = model.to(device)
     model.eval()
 
+    print(f" === Load Model Completed === ")
+
     return model, labels
 
 # タグの正規化関数を拡張
-def normalize_tag(tag, remove_special_prefixes=True):
+def normalize_tag(tag):
     """タグを正規化する関数（スペースをアンダースコアに変換、エスケープ文字を処理など）"""
     # スペースをアンダースコアに変換
     tag = tag.replace(' ', '_')
@@ -653,16 +675,12 @@ def normalize_tag(tag, remove_special_prefixes=True):
     # エスケープされた文字を処理（例: \( → (）
     tag = re.sub(r'\\(.)', r'\1', tag)
     
-    # 特殊プレフィックス（a@, g@など）を削除するオプション
-    if remove_special_prefixes and re.match(r'^[a-zA-Z]@', tag):
-        tag = tag[2:]  # プレフィックスを削除
-    
     # 連続するアンダースコアを1つに
     tag = re.sub(r'_+', '_', tag)
     
     return tag
 
-def read_tags_from_file(image_path, remove_special_prefix=True):
+def read_tags_from_file(image_path, remove_special_prefix="remove"):
     """画像に紐づくタグファイルを読み込む関数"""
     # 画像パスからタグファイルのパスを生成
     tag_path = os.path.splitext(image_path)[0] + '.txt'
@@ -686,9 +704,23 @@ def read_tags_from_file(image_path, remove_special_prefix=True):
 
     # タグを正規化
     tags = [normalize_tag(tag, remove_special_prefixes=remove_special_prefix) for tag in tags]
+
+    # タグを処理
+    processed_tags = []
+    for tag in tags:
+        # 特殊プレフィックスを持つタグの処理
+        if re.match(r'^[a-zA-Z]@', tag):
+            if remove_special_prefix == "remove":
+                # プレフィックスを削除して追加
+                processed_tags.append(normalize_tag(tag, remove_special_prefixes="remove"))
+            elif remove_special_prefix == "omit":
+                # 特殊プレフィックスを持つタグは完全にスキップ
+                continue
+        else:
+            # 特殊プレフィックスを持たないタグはそのまま正規化して追加
+            processed_tags.append(normalize_tag(tag, remove_special_prefixes="remove"))
     
-    # print(f"Read {len(tags)} tags from {tag_path}")
-    return tags
+    return processed_tags
 
 def predict_image(image_path, model, labels, device=torch_device, gen_threshold=0.35, char_threshold=0.75):
     """画像からタグを予測する関数"""
@@ -745,14 +777,7 @@ def visualize_predictions(image, tags, predictions, threshold=0.35, output_path=
     caption, taglist, ratings, character, general, all_character, all_general = predictions
     
     # タグの正規化（スペースを_に変換、エスケープされた括弧を通常の括弧に変換）
-    normalized_tags = []
-    for tag in tags:
-        # スペースを_に変換
-        normalized_tag = tag.replace(' ', '_')
-        # エスケープされた括弧を通常の括弧に変換
-        normalized_tag = normalized_tag.replace('\\(', '(').replace('\\)', ')')
-        normalized_tags.append(normalized_tag)
-    
+    normalized_tags = [normalize_tag(tag) for tag in tags]
     print(f"Normalized tags: {normalized_tags[:5]}...")
     
     # すべてのタグと確率値を結合
@@ -853,7 +878,7 @@ def visualize_predictions(image, tags, predictions, threshold=0.35, output_path=
         plt.show()
         return None
     
-def visualize_predictions_for_tensorboard(img_tensor, probs, idx_to_tag, threshold=0.35, original_tags=None,  existing_tags_count=None, tag_to_category=None):
+def visualize_predictions_for_tensorboard(img_tensor, probs, idx_to_tag, threshold=0.35, original_tags=None,  tag_to_category=None):
     """
     TensorBoard 用に可視化した結果の画像を生成し、HWC形式のNumPy配列を返す関数。
     
@@ -863,7 +888,6 @@ def visualize_predictions_for_tensorboard(img_tensor, probs, idx_to_tag, thresho
         idx_to_tag: インデックスからタグ名へのマッピング辞書
         threshold: タグの表示に用いる閾値
         original_tags: グラウンドトゥルースラベル (binary numpy配列または torch.Tensor, shape: (num_classes,))
-        existing_tags_count: 既存タグの数
         tag_to_category: タグからカテゴリへのマッピング辞書
     """
     import matplotlib.pyplot as plt
@@ -877,9 +901,6 @@ def visualize_predictions_for_tensorboard(img_tensor, probs, idx_to_tag, thresho
         probs_np = probs.detach().cpu().numpy()
     else:
         probs_np = probs
-    
-    # EVA02モデルでは入力時にRGB→BGRの変換が行われているため、
-    # 表示時にはBGR→RGBに戻す必要がある
     
     # チャンネルの順序を元に戻す (BGR → RGB)
     # [2,1,0] → [0,1,2] の変換を行う
@@ -1173,11 +1194,11 @@ class TagImageDataset(torch.utils.data.Dataset):
 
 # データセットの準備関数
 def prepare_dataset(
+    model: EVA02WithModuleLoRA,
     image_dirs, 
-    existing_tags, 
     val_split=0.1, 
     min_tag_freq=5, 
-    remove_special_prefix=True,
+    remove_special_prefix="remove",
     seed=42
 ):
     """データセットを準備する関数"""
@@ -1218,30 +1239,36 @@ def prepare_dataset(
     if remove_special_prefix:
         filtered_tags = {tag for tag in filtered_tags if not re.match(r'^[a-zA-Z]@', tag)}
     
+    existing_tags = list(model.idx_to_tag.values())
     new_filtered_tags = filtered_tags - set(existing_tags)
     
     print(f"既存タグ数: {len(existing_tags)}")
     print(f"最小頻度以上の新規タグ数: {len(new_filtered_tags)}")
+
+    # idx_to_tagとtag_to_idxのlenが念のため同じかどうかを確認
+    if not len(model.idx_to_tag) == len(model.tag_to_idx):
+        raise ValueError("idx_to_tagとtag_to_idxのlenが異なります。")
+
+    if not len(new_filtered_tags) == 0:
+        # 新規タグのインデックスを追加
+        next_idx = len(model.idx_to_tag)
+        for tag in sorted(new_filtered_tags):  # ソートして順序を一定に
+            model.tag_to_idx[tag] = next_idx
+            next_idx += 1
     
-    # タグをインデックスにマッピング
-    # 既存タグは元のインデックスを維持し、新規タグは既存タグの後に追加
-    tag_to_idx = {tag: i for i, tag in enumerate(existing_tags)}
+        # インデックスからタグへのマッピングを作成
+        model.idx_to_tag = {i: tag for tag, i in model.tag_to_idx.items()}
     
-    # 新規タグのインデックスを追加
-    next_idx = len(existing_tags)
-    for tag in sorted(new_filtered_tags):  # ソートして順序を一定に
-        tag_to_idx[tag] = next_idx
-        next_idx += 1
-    
-    # インデックスからタグへのマッピングを作成
-    idx_to_tag = {i: tag for tag, i in tag_to_idx.items()}
-    
-    print(f"使用されるタグの総数: {len(tag_to_idx)}")
+        print(f"使用されるタグの総数: {len(model.tag_to_idx)}")   
+
+        print(f"モデルの拡張を行います")
+        num_classes = len(model.idx_to_tag)
+        model.extend_head(num_classes)
 
     # idx-to-tag の最初の10件を表示
-    print(f"idx-to-tag の最初の10件: {list(idx_to_tag.items())[:10]}")
+    print(f"idx-to-tag の最初の10件: {list(model.idx_to_tag.items())[:10]}")
     # new tagsのidx-to-tagを表示
-    print(f"new tagsのidx-to-tag: {list(idx_to_tag.items())[len(existing_tags):len(existing_tags)+10]}")
+    print(f"new tagsのidx-to-tag: {list(model.idx_to_tag.items())[len(model.idx_to_tag):len(model.idx_to_tag)+10]}")
 
     # データセットを分割
     indices = list(range(len(image_paths)))
@@ -1261,7 +1288,7 @@ def prepare_dataset(
     print(f"訓練データ数: {len(train_image_paths)}")
     print(f"検証データ数: {len(val_image_paths)}")
     
-    return train_image_paths, train_tags_list, val_image_paths, val_tags_list, tag_to_idx, idx_to_tag
+    return train_image_paths, train_tags_list, val_image_paths, val_tags_list, len(existing_tags), len(new_filtered_tags)
 
 
 # 非対称損失関数（ASL）の実装
@@ -1411,7 +1438,7 @@ def compute_metrics(outputs, targets):
     pr_auc_scores = []
     
     # 各クラスごとのPR曲線とF1スコアを計算
-    for i in range(num_classes):
+    for i in tqdm(range(num_classes), desc="Calculating PR-AUC and F1 scores", leave=False):
         # クラスiのデータが十分にある場合のみ計算
         if np.sum(targets_np[:, i]) > 0:
             precision, recall, _ = precision_recall_curve(targets_np[:, i], outputs_np[:, i])
@@ -1481,7 +1508,6 @@ def compute_metrics(outputs, targets):
     
     return metrics
 
-
 # トレーニング関数
 def train_model(
     model, 
@@ -1491,6 +1517,7 @@ def train_model(
     tag_to_idx,
     idx_to_tag,
     tag_to_category,
+    old_tags_count,
     optimizer, 
     scheduler, 
     criterion, 
@@ -1502,7 +1529,6 @@ def train_model(
     checkpoint_interval=1,
     mixed_precision=False,
     tensorboard=False,
-    existing_tags_count=0,  # 既存タグの数
     initial_threshold=0.35,
     dynamic_threshold=True,
 ):
@@ -1510,7 +1536,7 @@ def train_model(
     # 出力ディレクトリの作成
     os.makedirs(output_dir, exist_ok=True)
 
-    def save_model(output_dir, filename, base_model, save_format, model, optimizer, scheduler, epoch, threshold, val_loss, val_f1, tag_to_idx, idx_to_tag, tag_to_category, existing_tags_count):
+    def save_model(output_dir, filename, base_model, save_format, model, optimizer, scheduler, epoch, threshold, val_loss, val_f1, tag_to_idx, idx_to_tag, tag_to_category):
         os.makedirs(output_dir, exist_ok=True)
         
         # モデルの状態辞書
@@ -1530,7 +1556,6 @@ def train_model(
             'tag_to_idx': tag_to_idx,
             'idx_to_tag': idx_to_tag,
             'tag_to_category': tag_to_category,
-            'existing_tags_count': existing_tags_count
         }
         
         # 完全なチェックポイント
@@ -1550,7 +1575,6 @@ def train_model(
             'tag_to_idx': tag_to_idx,
             'idx_to_tag': idx_to_tag,
             'tag_to_category': tag_to_category,
-            'existing_tags_count': existing_tags_count
         }
 
         if save_format == 'safetensors':
@@ -1599,15 +1623,6 @@ def train_model(
     
     # epochにより動的に閾値を設定する
     threshold = initial_threshold if initial_threshold is not None else 0.35
-    
-    # タグの総数
-    total_tags = len(tag_to_idx)
-    
-    # 既存タグと新規タグのインデックスを分離
-    existing_tag_indices = list(range(existing_tags_count))
-    new_tag_indices = list(range(existing_tags_count, total_tags))
-    
-    print(f"既存タグ数: {len(existing_tag_indices)}, 新規タグ数: {len(new_tag_indices)}")
 
     # 初期検証（もともとの重みにより推論はある程度できるはず）
     model.eval()
@@ -1639,27 +1654,39 @@ def train_model(
             progress_bar.set_postfix({"loss": f"{loss.item():.4f}"})
 
             if i % 5 == 0 and i / 5 < 10:
-                img_grid = visualize_predictions_for_tensorboard(images[0], probs[0], idx_to_tag, threshold=0.35, original_tags=targets[0], existing_tags_count=existing_tags_count)
+                img_grid = visualize_predictions_for_tensorboard(images[0], probs[0], idx_to_tag, threshold=0.35, original_tags=targets[0], tag_to_category=tag_to_category)
 
                 if tensorboard:
                     writer.add_image(f'predictions/val_{i}', img_grid, 0)
     
     # 検証メトリクスの計算
     val_loss /= len(val_loader)
-    val_preds = np.concatenate(val_preds)
-    val_targets = np.concatenate(val_targets)
+    
+    # リストに変換して結合
+    val_preds_list = []
+    val_targets_list = []
+
+    # ランダムに100のindicesを選択
+    random_indices = np.random.choice(len(val_preds), min(100, len(val_preds)), replace=False)
+    for i in tqdm(random_indices, desc="Picking validation data", leave=False):
+        val_preds_list.extend(val_preds[i])
+        val_targets_list.extend(val_targets[i])
+        
+    # 最後にnumpy配列に変換
+    val_preds = np.array(val_preds_list)
+    val_targets = np.array(val_targets_list)
     
     val_metrics = compute_metrics(val_preds, val_targets)
     
     # 既存タグと新規タグに分けてメトリクスを計算
-    if existing_tags_count > 0 and len(new_tag_indices) > 0:
+    if old_tags_count > 0 and len(model.tag_to_idx) > old_tags_count:
         existing_val_metrics = compute_metrics(
-            val_preds[:, existing_tag_indices], 
-            val_targets[:, existing_tag_indices]
+            val_preds[:, :old_tags_count],
+            val_targets[:, :old_tags_count]
         )
         new_val_metrics = compute_metrics(
-            val_preds[:, new_tag_indices], 
-            val_targets[:, new_tag_indices]
+            val_preds[:, old_tags_count:],
+            val_targets[:, old_tags_count:]
         )
         
         print(f"初期検証結果 - 既存タグ F1: {existing_val_metrics['f1']:.4f}, 新規タグ F1: {new_val_metrics['f1']:.4f}")
@@ -1670,7 +1697,7 @@ def train_model(
             writer.add_scalar('Metrics/val/Threshold', threshold, 0)
             writer.add_image('Metrics/val/F1_vs_Threshold', val_metrics['f1_vs_threshold_plot'], 0)
 
-            if existing_tags_count > 0 and len(new_tag_indices) > 0:
+            if old_tags_count > 0 and len(model.tag_to_idx) > old_tags_count:
                 writer.add_scalar('Metrics/val/F1_existing', existing_val_metrics['f1'], 0)
                 writer.add_scalar('Metrics/val/F1_new', new_val_metrics['f1'], 0)
     else:
@@ -1729,7 +1756,7 @@ def train_model(
                 writer.add_scalar('Train/Step_Loss', loss.item(), epoch * len(train_loader) + i)
                 
                 if i % 100 == 0:
-                    img_grid = visualize_predictions_for_tensorboard(images[0], probs[0], idx_to_tag, threshold=0.35, original_tags=targets[0], existing_tags_count=existing_tags_count)
+                    img_grid = visualize_predictions_for_tensorboard(images[0], probs[0], idx_to_tag, threshold=0.35, original_tags=targets[0])
                     writer.add_image(f'predictions/train_epoch_{epoch}', img_grid, i)
         
         # 学習率のスケジューリング
@@ -1739,24 +1766,30 @@ def train_model(
         
         # トレーニングメトリクスの計算
         train_loss /= len(train_loader)
-        train_preds = np.concatenate(train_preds)
-        train_targets = np.concatenate(train_targets)
         
-        train_metrics = compute_metrics(train_preds, train_targets)
+        # リストに変換して結合
+        train_preds_list = []
+        train_targets_list = []
+
+        # ランダムに100のindicesを選択
+        random_indices = np.random.choice(len(train_preds), min(100, len(train_preds)), replace=False)
+        for i in tqdm(random_indices, desc="Picking training data", leave=False):
+            train_preds_list.extend(train_preds[i])
+            train_targets_list.extend(train_targets[i])
+            
+        # 最後にnumpy配列に変換
+        train_preds = np.array(train_preds_list)
+        train_targets = np.array(train_targets_list)
+             
+        train_metrics = compute_metrics(train_preds,train_targets)
 
         if dynamic_threshold:
             threshold = train_metrics['threshold']
         
         # 既存タグと新規タグに分けてメトリクスを計算
-        if existing_tags_count > 0 and len(new_tag_indices) > 0:
-            existing_train_metrics = compute_metrics(
-                train_preds[:, existing_tag_indices], 
-                train_targets[:, existing_tag_indices]
-            )
-            new_train_metrics = compute_metrics(
-                train_preds[:, new_tag_indices], 
-                train_targets[:, new_tag_indices]
-            )
+        if old_tags_count > 0 and len(model.tag_to_idx) > old_tags_count:
+            existing_train_metrics = compute_metrics(train_preds[:,:old_tags_count],train_targets[:,:old_tags_count])
+            new_train_metrics = compute_metrics(train_preds[:,old_tags_count:],train_targets[:,old_tags_count:])
 
             if tensorboard:
                 writer.add_scalar('Metrics/Train/Loss', train_loss, epoch+1)
@@ -1802,7 +1835,7 @@ def train_model(
                 progress_bar.set_postfix({"loss": f"{loss.item():.4f}"})
 
                 if i % 5 == 0 and i / 5 < 10:
-                    img_grid = visualize_predictions_for_tensorboard(images[0], probs[0], idx_to_tag, threshold=0.35, original_tags=targets[0], existing_tags_count=existing_tags_count)
+                    img_grid = visualize_predictions_for_tensorboard(images[0], probs[0], idx_to_tag, threshold=0.35, original_tags=targets[0])
 
                     if tensorboard:
                         writer.add_image(f'predictions/val_{i}', img_grid, epoch+1)
@@ -1815,21 +1848,21 @@ def train_model(
         val_metrics = compute_metrics(val_preds, val_targets)
         
         # 既存タグと新規タグに分けてメトリクスを計算
-        if existing_tags_count > 0 and len(new_tag_indices) > 0:
+        if old_tags_count > 0 and len(model.tag_to_idx) > old_tags_count:
             existing_val_metrics = compute_metrics(
-                val_preds[:, existing_tag_indices], 
-                val_targets[:, existing_tag_indices]
+                val_preds[:, :old_tags_count], 
+                val_targets[:, :old_tags_count]
             )
             new_val_metrics = compute_metrics(
-                val_preds[:, new_tag_indices], 
-                val_targets[:, new_tag_indices]
+                val_preds[:, old_tags_count:], 
+                val_targets[:, old_tags_count:]
             )
         
         # 結果の表示
         print(f"Train Loss: {train_loss:.4f}, Train F1: {train_metrics['f1']:.4f}, "
               f"Val Loss: {val_loss:.4f}, Val F1: {val_metrics['f1']:.4f}")
         
-        if existing_tags_count > 0 and len(new_tag_indices) > 0:
+        if old_tags_count > 0 and len(model.tag_to_idx) > old_tags_count:
             print(f"既存タグ - Train F1: {existing_train_metrics['f1']:.4f}, Val F1: {existing_val_metrics['f1']:.4f}")
             print(f"新規タグ - Train F1: {new_train_metrics['f1']:.4f}, Val F1: {new_val_metrics['f1']:.4f}")
         
@@ -1841,7 +1874,7 @@ def train_model(
             writer.add_scalar('Metrics/val/Threshold', threshold, epoch+1)
             writer.add_image('Metrics/val/F1_vs_Threshold', val_metrics['f1_vs_threshold_plot'], epoch+1)
             
-            if existing_tags_count > 0 and len(new_tag_indices) > 0:
+            if old_tags_count > 0 and len(model.tag_to_idx) > old_tags_count:
                 writer.add_scalar('Metrics/val/F1_existing', existing_val_metrics['f1'], epoch+1)
                 writer.add_scalar('Metrics/val/F1_new', new_val_metrics['f1'], epoch+1)
         
@@ -1864,15 +1897,15 @@ def train_model(
 
         if save_model_flag:
             # モデルの保存
-            save_model(output_dir, f'best_model', base_model, save_format, model, optimizer, scheduler, epoch, threshold, val_loss, val_metrics['f1'], tag_to_idx, idx_to_tag, tag_to_category, existing_tags_count)
+            save_model(output_dir, f'best_model', base_model, save_format, model, optimizer, scheduler, epoch, threshold, val_loss, val_metrics['f1'], tag_to_idx, idx_to_tag, tag_to_category)
             print(f"Best model saved! (Val F1: {val_metrics['f1']:.4f}, Val Loss: {val_loss:.4f})")
     
         elif (epoch + 1) % checkpoint_interval == 0:
-            save_model(output_dir, f'checkpoint_epoch_{epoch+1}', base_model, save_format, model, optimizer, scheduler, epoch, threshold, val_loss, val_metrics['f1'], tag_to_idx, idx_to_tag, tag_to_category, existing_tags_count)
+            save_model(output_dir, f'checkpoint_epoch_{epoch+1}', base_model, save_format, model, optimizer, scheduler, epoch, threshold, val_loss, val_metrics['f1'], tag_to_idx, idx_to_tag, tag_to_category)
             print(f"Checkpoint saved at epoch {epoch+1}")
     
     # 最終モデルの保存
-    save_model(output_dir, f'final_model', base_model, save_format, model, optimizer, scheduler, epoch, threshold, val_loss, val_metrics['f1'], tag_to_idx, idx_to_tag, tag_to_category, existing_tags_count)
+    save_model(output_dir, f'final_model', base_model, save_format, model, optimizer, scheduler, epoch, threshold, val_loss, val_metrics['f1'], tag_to_idx, idx_to_tag, tag_to_category)
     print(f"Final model saved! (Val F1: {val_metrics['f1']:.4f}, Val Loss: {val_loss:.4f})")
 
     save_tag_mapping(output_dir, idx_to_tag, tag_to_category)
@@ -2133,14 +2166,16 @@ def main():
     train_parser.add_argument('--base_model', type=str, default='SmilingWolf/wd-eva02-large-tagger-v3', help='使用するベースモデルのリポジトリ')
     train_parser.add_argument('--model_path', type=str, default=None, help='使用するLoRAモデルのパス（指定しない場合は元のモデルを使用）')
     train_parser.add_argument('--metadata_path', type=str, default=None, help='モデルのメタデータファイルのパス（指定しない場合は_metadata.jsonを使用）')
+
     train_parser.add_argument('--merge_before_train', nargs='?', const=1, type=float, default=None, 
                          help='トレーニング前にLoRAの重みをベースモデルにマージする。数値を指定するとスケーリング係数として使用（デフォルト: 1.0）')
+    train_parser.add_argument('--merge_every_n_epochs', type=int, default=None, help='トレーニング中にマージするエポック数')
 
     # データセット関連の引数
     train_parser.add_argument('--image_dirs', type=str, nargs='+', required=True, help='トレーニング画像のディレクトリ（複数指定可）')
     train_parser.add_argument('--val_split', type=float, default=0.1, help='検証データの割合')
     train_parser.add_argument('--min_tag_freq', type=int, default=5, help='タグの最小出現頻度')
-    train_parser.add_argument('--remove_special_prefix', default=True, action='store_true', help='特殊プレフィックス（例：a@、g@など）を除去する')
+    train_parser.add_argument('--remove_special_prefix', default="omit", choices=["remove", "omit"], help='特殊プレフィックス（例：a@、g@など）を除去する')
     # train_parser.add_argument('--image_size', type=int, default=224, help='画像サイズ')
     train_parser.add_argument('--batch_size', type=int, default=4, help='バッチサイズ')
     train_parser.add_argument('--num_workers', type=int, default=4, help='データローダーのワーカー数')
@@ -2324,8 +2359,6 @@ def main():
 
         print(f"モデルを読み込んでいます...")
         model, labels = load_model(args.model_path, args.metadata_path, base_model=args.base_model, device=device)
-        existing_tags = labels.names
-        print(f"既存タグ数: {len(existing_tags)}")
         
         # ターゲットモジュールの読み込み
         target_modules = None
@@ -2338,47 +2371,28 @@ def main():
         img_size = model.img_size
         print(f"モデルの期待する画像サイズを使用します: {img_size}")
         
-        # 2. データセットの準備（新規タグが検出される）
+        # 2. データセットの準備（新規タグが検出される）,ヘッド拡張もこの中で行われる
         print("データセットを準備しています...")
-        train_image_paths, train_tags_list, val_image_paths, val_tags_list, tag_to_idx, idx_to_tag = prepare_dataset(
+        train_image_paths, train_tags_list, val_image_paths, val_tags_list, old_tags_count, _ = prepare_dataset(
+            model=model,
             image_dirs=args.image_dirs,
-            existing_tags=existing_tags,
             val_split=args.val_split,
             min_tag_freq=args.min_tag_freq,
             remove_special_prefix=args.remove_special_prefix,
             seed=args.seed
-        )
-        
-        # 既存タグの数を記録
-        existing_tags_count = len(existing_tags)
-        print(f"既存タグ数: {len(set(existing_tags) & set(idx_to_tag.values()))}")
-        print(f"新規タグ数: {len(idx_to_tag) - len(set(existing_tags) & set(idx_to_tag.values()))}")
-        
-        # 3. モデルのヘッドを拡張（新規タグに対応）
-        print("モデルのヘッドを拡張しています...")
-        total_classes = len(tag_to_idx)
-
-        # 既存のモデルのクラス数と新しいタグ数を比較
-        if total_classes > model.original_num_classes:
-            model.extend_head(num_classes=total_classes)
-        elif total_classes < model.original_num_classes:
-            print(f"警告: 新しいタグ数({total_classes})が既存モデルのクラス数({model.original_num_classes})より少ないです。")
-            print("既存モデルのヘッドをそのまま使用します。")
-        else:
-            print(f"タグ数が一致しています。ヘッドの拡張は不要です。({total_classes}クラス)")
-
-        model = model.to(device)
+        )        
 
         # トレーニング前にLoRAをマージ（指定された場合）
         if args.merge_before_train is not None:
             # モデルがLoRAを持っているか確認（ベースモデルから始める場合は何もしない）
-            if hasattr(model, 'lora_modules') and model.lora_modules:
+            if hasattr(model, 'lora_layers'):
                 print(f"トレーニング前にLoRAをベースモデルにマージします（スケール: {args.merge_before_train}）...")
                 model.merge_lora_to_base_model(scale=args.merge_before_train)
-                model.to(device)
             else:
-                print("マージするLoRAモジュールがありません。ベースモデルからトレーニングを開始します。")
+                print("マージするLoraレイヤーがありません。ベースモデルからトレーニングを開始します。")
         
+        model = model.to(device)
+
         # データ変換の設定
         from timm.data import create_transform
         
@@ -2386,14 +2400,14 @@ def main():
         train_dataset = TagImageDataset(
             image_paths=train_image_paths,
             tags_list=train_tags_list,
-            tag_to_idx=tag_to_idx,
+            tag_to_idx=model.tag_to_idx,
             transform=model.transform,
         )
         
         val_dataset = TagImageDataset(
             image_paths=val_image_paths,
             tags_list=val_tags_list,
-            tag_to_idx=tag_to_idx,
+            tag_to_idx=model.tag_to_idx,
             transform=model.transform,
         )
         
@@ -2476,8 +2490,13 @@ def main():
 
         tag_to_category = load_tag_categories()
         tag_to_category = {tag: category for tag, category in tag_to_category.items() 
-                          if tag in tag_to_idx}
-        
+                          if tag in model.tag_to_idx}
+        # tag_to_categori に 'general': 'Rating', 'sensitive': 'Rating', 'questionable': 'Rating', 'explicit': 'Rating'を追加あるいは上書きしておく
+        tag_to_category['general'] = 'Rating'
+        tag_to_category['sensitive'] = 'Rating'
+        tag_to_category['questionable'] = 'Rating'
+        tag_to_category['explicit'] = 'Rating'
+
         # トレーニングの実行
         print("トレーニングを開始します...")
         train_model(
@@ -2485,9 +2504,10 @@ def main():
             base_model=args.base_model,
             train_loader=train_loader,
             val_loader=val_loader,
-            tag_to_idx=tag_to_idx,
-            idx_to_tag=idx_to_tag,
+            tag_to_idx=model.tag_to_idx,
+            idx_to_tag=model.idx_to_tag,
             tag_to_category=tag_to_category,
+            old_tags_count=old_tags_count,
             optimizer=optimizer,
             scheduler=scheduler,
             criterion=criterion,
@@ -2499,7 +2519,6 @@ def main():
             checkpoint_interval=args.checkpoint_interval,
             mixed_precision=args.mixed_precision,
             tensorboard=True,
-            existing_tags_count=existing_tags_count,
             initial_threshold=args.initial_threshold,
             dynamic_threshold=args.dynamic_threshold
         )
@@ -2520,3 +2539,4 @@ def main():
 if __name__ == "__main__":
     import math  # LoRALayer初期化に必要
     main()
+

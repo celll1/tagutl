@@ -1,7 +1,7 @@
 # 指定されたディレクトリを無視
 images/
 lora_checkpoints/
-lora_model/
+lora_model*/
 old_files/
 prediction/
 predictions/
