@@ -279,12 +279,9 @@ class EVA02WithModuleLoRA(nn.Module):
             ]
         else:
             self.target_modules = target_modules
-        
-        # 各モジュールにLoRAを適用
-        self._apply_lora_to_modules()
-        
-        # LoRAパラメータのみを訓練可能に設定
-        self._freeze_non_lora_parameters()
+
+        if self.lora_rank is not None and self.lora_rank > 0:
+            self.apply_lora_to_modules()
     
     def _extend_head(self, num_classes):
         """
@@ -334,7 +331,7 @@ class EVA02WithModuleLoRA(nn.Module):
         for param in self.backbone.head.parameters():
             param.requires_grad = True
     
-    def _apply_lora_to_modules(self):
+    def apply_lora_to_modules(self):
         """モデルの各モジュールにLoRAを適用する"""
         # 正規表現パターンをコンパイル
         patterns = [re.compile(pattern) for pattern in self.target_modules]
@@ -369,6 +366,8 @@ class EVA02WithModuleLoRA(nn.Module):
                 
                 # 適用されたLoRA層を記録
                 self.lora_layers[name] = lora_module
+
+        self._freeze_non_lora_parameters()
         
         print(f"Applied LoRA to {len(self.lora_layers)} modules")
 
@@ -511,8 +510,10 @@ class EVA02WithModuleLoRA(nn.Module):
         gc.collect()
         torch.cuda.empty_cache()
 
-        # LoRAを再適用（空のLoRAを適用）
-        self._apply_lora_to_modules()
+        if self.lora_rank is not None and self.lora_rank > 0:   
+            # LoRAを再適用（空のLoRAを適用）
+            self.apply_lora_to_modules()
+            print(f"LoRAを再適用しました。")
         
         return merged_count
     
@@ -526,12 +527,12 @@ class EVA02WithModuleLoRA(nn.Module):
 
 def load_model(model_path=None, 
                metadata_path=None, 
-               base_model='SmilingWolf/wd-eva02-large-tagger-v3', 
-               device=torch_device,
-               lora_rank=32,
-               lora_alpha=16,
-               lora_dropout=0.0,
-               pretrained=True
+               base_model='SmilingWolf/wd-eva02-large-tagger-v3',
+               lora_rank=None,
+               lora_alpha=None,
+               lora_dropout=None,
+               pretrained=True,
+               device=torch_device
     ) -> tuple[EVA02WithModuleLoRA, LabelData]:
     """モデルを読み込む関数"""
     print(f" === Load Model === ")
@@ -547,7 +548,7 @@ def load_model(model_path=None,
         idx_to_tag = {i: name for i, name in enumerate(labels.names)}
         tag_to_idx = {name: i for i, name in enumerate(labels.names)}
         tag_to_category = {name: 'Rating' if i in labels.rating else 'Character' if i in labels.character else 'General' for i, name in enumerate(labels.names)}
-        print(f"カテゴリごとのタグ数: Rating: {len(labels.rating)}, Character: {len(labels.character)}, General: {len(labels.general)}")
+        print(f"カテゴリごとのタグ数: Rating: {len(labels.rating)}, Character: {len(labels.character)}, General: {len(labels.general)}, Artist: {len(labels.artist)}, Copyright: {len(labels.copyright)}, Meta: {len(labels.meta)}")
 
         print(f"初期化されたLoRAモデルを使用します（ベースモデル: {base_model}, lora_rank: {lora_rank}, lora_alpha: {lora_alpha}, lora_dropout: {lora_dropout}")
 
@@ -611,7 +612,7 @@ def load_model(model_path=None,
             # labels.rating.extend([i for i, name in enumerate(labels.names) if name not in tag_to_category and name in ['general', 'sensitive', 'questionable', 'explicit']])
             # labels.general.extend([i for i, name in enumerate(labels.names) if name not in tag_to_category and name not in ['general', 'sensitive', 'questionable', 'explicit']])  
 
-        print(f"カテゴリごとのタグ数: Rating: {len(labels.rating)}, Character: {len(labels.character)}, General: {len(labels.general)}")
+        print(f"カテゴリごとのタグ数: Rating: {len(labels.rating)}, Character: {len(labels.character)}, General: {len(labels.general)}, Artist: {len(labels.artist)}, Copyright: {len(labels.copyright)}, Meta: {len(labels.meta)}")
         
         # モデルを作成
         model = EVA02WithModuleLoRA(
@@ -655,9 +656,9 @@ def load_model(model_path=None,
             # メタデータからLoRA設定を取得
             try:
                 base_model = metadata.get('base_model', 'SmilingWolf/wd-eva02-large-tagger-v3')
-                lora_rank = int(metadata.get('lora_rank', lora_rank))
-                lora_alpha = float(metadata.get('lora_alpha', lora_alpha))
-                lora_dropout = float(metadata.get('lora_dropout', lora_dropout))
+                lora_rank = metadata.get('lora_rank', lora_rank)
+                lora_alpha = metadata.get('lora_alpha', lora_alpha)
+                lora_dropout = metadata.get('lora_dropout', lora_dropout)
                 print(f"LoRA設定: lora_rank: {lora_rank}, lora_alpha: {lora_alpha}, lora_dropout: {lora_dropout}")
             except Exception as e:
                 print(f"チェックポイントからLoRA設定が見つかりません...")
@@ -700,7 +701,7 @@ def load_model(model_path=None,
                 tag_to_idx = {name: i for i, name in enumerate(labels.names)}
                 tag_to_category = {name: 'Rating' if i in labels.rating else 'Character' if i in labels.character else 'General' for i, name in enumerate(labels.names)}
 
-            print(f"カテゴリごとのタグ数: Rating: {len(labels.rating)}, Character: {len(labels.character)}, General: {len(labels.general)}")
+            print(f"カテゴリごとのタグ数: Rating: {len(labels.rating)}, Character: {len(labels.character)}, General: {len(labels.general)}, Artist: {len(labels.artist)}, Copyright: {len(labels.copyright)}, Meta: {len(labels.meta)}")
 
             # モデルの読み込み
             from safetensors.torch import load_file
@@ -2389,7 +2390,7 @@ def main():
     merge_parser.add_argument('--output_dir', type=str, default='merged_model', help='出力ディレクトリ')
 
     merge_parser.add_argument('--scale', type=float, default=1.0, help='マージ時のスケーリング係数（デフォルト: 1.0）')
-    merge_parser.add_argument('--save_format', type=str, default='safetensors', choices=['safetensors', 'pytorch'], help='モデルの保存形式')
+    merge_parser.add_argument('--save_format', type=str, default='safetensors', choices=['safetensors', 'pytorch', 'onnx'], help='モデルの保存形式')
 
     merge_parser.add_argument('--merge_type', type=str, default='lora', choices=['lora'], help='マージするモデルの種類')
     """
@@ -2587,6 +2588,14 @@ def main():
                 model.merge_lora_to_base_model(scale=args.merge_before_train)
             else:
                 print("マージするLoraレイヤーがありません。ベースモデルからトレーニングを開始します。")
+
+        # modelにまだLoRAが適用されていない場合は適用する
+        if model.lora_rank is None:
+            print(f"LoRAを適用します（lora_rank: {args.lora_rank}, lora_alpha: {args.lora_alpha}, lora_dropout: {args.lora_dropout})")
+            model.lora_rank = args.lora_rank
+            model.lora_alpha = args.lora_alpha
+            model.lora_dropout = args.lora_dropout
+            model.apply_lora_to_modules()
         
         model = model.to(device)
 
@@ -2759,20 +2768,83 @@ def main():
                 torch.save(checkpoint, os.path.join(output_dir, f'{filename}.pt'))
                 print(f"Model saved as {os.path.join(output_dir, f'{filename}.pt')}")
 
+        def export_onnx(model, output_dir, filename, simplify=True):
+            # ONNX形式で保存
+            from timm.utils.model import reparameterize_model
+            from timm.utils.onnx import onnx_export
+
+            onnx_path = os.path.join(output_dir, f'{filename}.onnx')
+
+            model = reparameterize_model(model)
+
+            # モデルをONNX形式に変換
+            dummy_input = torch.randn(1, 3, 448, 448, device="cpu")
+            model.to("cpu")
+
+            print(f"ONNX形式で保存します: {onnx_path}")
+            onnx_export(
+                model,
+                onnx_path,
+                opset=14,
+                dynamic_size=True,
+                aten_fallback=False,
+                keep_initializers=False,
+                check_forward=True,
+                training=False,
+                verbose=True,
+                use_dynamo=False,
+                input_size=(3, 448, 448),
+                batch_size=1,
+            )
+
+            import onnx
+            from onnxsim import simplify
+
+            # ONNXモデルの簡略化
+            if simplify:
+                model_onnx = onnx.load(onnx_path)
+                model_onnx, check = simplify(model_onnx)
+                onnx.save(model_onnx, onnx_path)
+                print(f"ONNXモデルを簡略化して保存しました: {onnx_path}")
+
         # モデルの読み込み
         model, labels = load_model(args.model_path, args.metadata_path, base_model=args.base_model, device=torch_device)
 
         # マージタイプに応じた処理
         if args.merge_type == 'lora':
             # LoRAをベースモデルにマージ
+            model.lora_rank = None
+            model.lora_alpha = None
+            model.lora_dropout = None
+
             model.merge_lora_to_base_model(scale=args.scale)
             
             # LoRA層を削除
             model._remove_lora_from_modules()
+            # 入力ファイル名から拡張子を除去し、'_merged'を追加
+            filename = os.path.splitext(os.path.basename(args.model_path))[0] + '_merged'
 
-            filename = os.path.basename(args.model_path) + '_merged'
-            
-            save_model(args.output_dir, filename, args.base_model, args.save_format, model, None, None, None, model.threshold, None, None, model.tag_to_idx, model.idx_to_tag, model.tag_to_category)
+            if args.save_format == 'safetensors':
+                save_model(
+                    output_dir=args.output_dir,
+                    filename=filename,
+                    base_model=args.base_model,
+                    save_format=args.save_format,
+                    model=model,
+                optimizer=None,
+                scheduler=None,
+                epoch=None,
+                threshold=model.threshold,
+                val_loss=None,
+                val_f1=None,
+                tag_to_idx=model.tag_to_idx,
+                idx_to_tag=model.idx_to_tag,
+                tag_to_category=model.tag_to_category
+                )
+
+            elif args.save_format == 'onnx':
+                export_onnx(model, args.output_dir, filename)
+
             # タグマッピングの保存
             save_tag_mapping(args.output_dir, model.idx_to_tag, model.tag_to_category)
         else:
