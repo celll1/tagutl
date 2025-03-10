@@ -35,7 +35,7 @@ torch_device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 # Loraレイヤーの定義
 class LoRALayer(nn.Module):
-    def __init__(self, in_features, out_features, rank=4, alpha=1.0):
+    def __init__(self, in_features, out_features, rank=32, alpha=16.0):
         super().__init__()
         self.in_features = in_features
         self.out_features = out_features
@@ -59,7 +59,7 @@ class LoRALayer(nn.Module):
 
 # LoRA適用済み線形層
 class LoRALinear(nn.Module):
-    def __init__(self, base_layer, rank=4, alpha=1.0, dropout=0.0):
+    def __init__(self, base_layer, rank=32, alpha=16.0, dropout=0.0):
         super().__init__()
         self.base_layer = base_layer
         self.rank = rank
@@ -346,7 +346,8 @@ class EVA02WithModuleLoRA(nn.Module):
         for name, module in tqdm(self.backbone.named_modules(), desc="LoRA適用中", leave=True):
             # パターンに一致するか確認
             if isinstance(module, nn.Linear) and any(pattern.search(name) for pattern in patterns):
-                tqdm.write(f"Applying LoRA to module: {name}")
+                # debug(コメントを消さない)
+                # tqdm.write(f"Applying LoRA to module: {name}")
                 
                 # モジュールの親を取得
                 parent_name, child_name = name.rsplit('.', 1)
@@ -452,14 +453,18 @@ class EVA02WithModuleLoRA(nn.Module):
             if isinstance(module, LoRALinear):
                 # LoRAの計算: x @ (A @ B) * scale
                 # ベースの重みに A @ B * scale を加算
-                tqdm.write(f"マージ中のモジュール: {name}")
+
+                # debug(コメントを消さない)
+                # tqdm.write(f"マージ中のモジュール: {name}")
+
                 with torch.no_grad():
                     # 行列のサイズを確認
                     base_weight_shape = module.base_layer.weight.shape
                     lora_a_shape = module.lora.lora_A.shape
                     lora_b_shape = module.lora.lora_B.shape
                     
-                    tqdm.write(f"base_weight: {base_weight_shape}, lora_A: {lora_a_shape}, lora_B: {lora_b_shape}")
+                    # debug(コメントを消さない)
+                    # tqdm.write(f"base_weight: {base_weight_shape}, lora_A: {lora_a_shape}, lora_B: {lora_b_shape}")
                     
                     # 行列の掛け算と転置を適切に行う
                     if base_weight_shape[0] == lora_b_shape[1] and base_weight_shape[1] == lora_a_shape[0]:
@@ -480,7 +485,8 @@ class EVA02WithModuleLoRA(nn.Module):
                     lora_weight = lora_weight * (module.lora.scale * scale)
                     
                     # 行列のサイズを確認
-                    tqdm.write(f"  計算されたlora_weight: {lora_weight.shape}")
+                    # debug(コメントを消さない)
+                    # tqdm.write(f"  計算されたlora_weight: {lora_weight.shape}")
                     
                     # ベースの重みに加算する前に次元が一致するか確認
                     if lora_weight.shape == base_weight_shape:
@@ -513,7 +519,10 @@ class EVA02WithModuleLoRA(nn.Module):
     def forward(self, x):
         # モデル全体を通して推論
         return self.backbone(x)
-
+    
+    def to(self, device):
+        self.backbone.to(device)
+        return self
 
 def load_model(model_path=None, 
                metadata_path=None, 
@@ -660,7 +669,7 @@ def load_model(model_path=None,
                 print(f"チェックポイントからtarget_modulesが見つかりません...")
                 target_modules = None
 
-            labels = LabelData(names=[], rating=[], general=[], character=[])
+            labels = LabelData(names=[], rating=[], general=[], character=[], artist=[], copyright=[], meta=[])
 
             try:
                 idx_to_tag = ast.literal_eval(metadata['idx_to_tag'])
@@ -965,7 +974,7 @@ def visualize_predictions(image, tags, predictions, threshold=0.35, output_path=
         plt.show()
         return None
     
-def visualize_predictions_for_tensorboard(img_tensor, probs, idx_to_tag, threshold=0.35, original_tags=None,  tag_to_category=None):
+def visualize_predictions_for_tensorboard(img_tensor, probs, idx_to_tag, threshold=0.35, original_tags=None, tag_to_category=None):
     """
     TensorBoard 用に可視化した結果の画像を生成し、HWC形式のNumPy配列を返す関数。
     
@@ -1253,27 +1262,48 @@ class TagImageDataset(torch.utils.data.Dataset):
         return len(self.image_paths)
     
     def __getitem__(self, idx):
-        # 画像の読み込みと前処理
-        img_path = self.image_paths[idx]
-        image = Image.open(img_path)
-        image = pil_ensure_rgb(image)
-        image = pil_pad_square(image)
+        # 最大再試行回数
+        max_retries = 5
+        current_idx = idx
         
-        if self.transform:
-            image = self.transform(image)
-            # RGB to BGR for EVA02 model
-            image = image[[2, 1, 0]]
+        for _ in range(max_retries):
+            # 画像の読み込みと前処理
+            img_path = self.image_paths[current_idx]
+            
+            try:
+                image = Image.open(img_path)
+                image = pil_ensure_rgb(image)
+                image = pil_pad_square(image)
+                
+                if self.transform:
+                    image = self.transform(image)
+                    # RGB to BGR for EVA02 model
+                    image = image[[2, 1, 0]]
+                
+                # タグをone-hotエンコーディング
+                tags = self.tags_list[current_idx]
+                num_classes = len(self.tag_to_idx)
+                label = torch.zeros(num_classes)
+                
+                for tag in tags:
+                    if tag in self.tag_to_idx:
+                        label[self.tag_to_idx[tag]] = 1.0
+                
+                return image, label
+                
+            except (Image.UnidentifiedImageError, OSError, IOError) as e:
+                # 画像が読み込めない場合のエラーログ
+                print(f"Warning: 画像の読み込みに失敗しました: {img_path}, エラー: {str(e)}")
+                
+                # 次のインデックスを試す
+                current_idx = (current_idx + 1) % len(self)
         
-        # タグをone-hotエンコーディング
-        tags = self.tags_list[idx]
-        num_classes = len(self.tag_to_idx)
-        label = torch.zeros(num_classes)
+        # すべての再試行が失敗した場合、ダミーデータを返す
+        print(f"Error: {max_retries}回の再試行後も画像を読み込めませんでした。ダミーデータを返します。")
+        dummy_image = torch.zeros(3, 224, 224)  # モデルの入力サイズに合わせて調整
+        dummy_target = torch.zeros(num_classes)
         
-        for tag in tags:
-            if tag in self.tag_to_idx:
-                label[self.tag_to_idx[tag]] = 1.0
-        
-        return image, label
+        return dummy_image, dummy_target
 
 
 # データセットの準備関数
@@ -1602,8 +1632,9 @@ def train_model(
     idx_to_tag,
     tag_to_category,
     old_tags_count,
-    optimizer, 
-    scheduler, 
+    learning_rate,
+    weight_decay,
+    use_8bit_optimizer,
     criterion, 
     num_epochs, 
     device, 
@@ -1689,7 +1720,7 @@ def train_model(
         timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
         
         # 実行設定の概要を含むrun名を作成
-        run_name = f"run_{timestamp}_lr{optimizer.param_groups[0]['lr']}_bs{train_loader.batch_size}"
+        run_name = f"run_{timestamp}_bs{train_loader.batch_size}"
         
         # ディレクトリを作成
         tb_log_dir = os.path.join(output_dir, 'tensorboard_logs')
@@ -1698,6 +1729,50 @@ def train_model(
         # run_nameをログディレクトリに含める
         writer = SummaryWriter(log_dir=os.path.join(tb_log_dir, run_name))
         print(f"TensorBoard logs will be saved to: {os.path.join(tb_log_dir, run_name)}")
+
+    def setup_optimizer(model, learning_rate, weight_decay, use_8bit_optimizer):
+        """オプティマイザを設定する関数
+        
+        Args:
+            model: 対象のモデル
+            learning_rate (float): 学習率
+            weight_decay (float): Weight decay
+            use_8bit_optimizer (bool): 8-bitオプティマイザを使用するかどうか
+            
+        Returns:
+            optimizer: 設定されたオプティマイザ
+        """
+        if use_8bit_optimizer:
+            try:
+                optimizer = bnb.optim.AdamW8bit(
+                    model.parameters(),
+                    lr=learning_rate,
+                    weight_decay=weight_decay
+                )
+                print("8-bitオプティマイザを使用します")
+            except ImportError:
+                print("bitsandbytesがインストールされていないため、通常のAdamWを使用します")
+                optimizer = torch.optim.AdamW(
+                    model.parameters(),
+                    lr=learning_rate,
+                    weight_decay=weight_decay
+                )
+        else:
+            optimizer = torch.optim.AdamW(
+                model.parameters(),
+                lr=learning_rate,
+                weight_decay=weight_decay
+            )
+        return optimizer
+
+    # オプティマイザの設定
+    optimizer = setup_optimizer(model, learning_rate, weight_decay, use_8bit_optimizer)
+    
+    # 学習率スケジューラの設定
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+        optimizer,
+        T_max=num_epochs
+    )
     
     # 混合精度トレーニングのスケーラー
     scaler = torch.amp.GradScaler(device=device) if mixed_precision else None
@@ -1890,14 +1965,6 @@ def train_model(
                 writer.add_scalar('Metrics/Train/Threshold', threshold, epoch+1)
                 writer.add_image('Metrics/Train/F1_vs_Threshold', train_metrics['f1_vs_threshold_plot'], epoch+1)
 
-        if merge_every_n_epochs is not None and (epoch + 1) % merge_every_n_epochs == 0:
-            model.merge_lora_to_base_model()
-            # optimizer, schedulerをリセット
-            if isinstance(optimizer, bnb.optim.AdamW8bit):
-                optimizer = bnb.optim.AdamW8bit(model.parameters(), lr=optimizer.param_groups[0]['lr'], weight_decay=optimizer.param_groups[0]['weight_decay'])
-            else:
-                optimizer = torch.optim.AdamW(model.parameters(), lr=optimizer.param_groups[0]['lr'], weight_decay=optimizer.param_groups[0]['weight_decay'])
-
         # 検証フェーズ
         model.eval()
         val_loss = 0.0
@@ -1993,9 +2060,15 @@ def train_model(
             save_model(output_dir, f'best_model', base_model, save_format, model, optimizer, scheduler, epoch, threshold, val_loss, val_metrics['f1'], tag_to_idx, idx_to_tag, tag_to_category)
             print(f"Best model saved! (Val F1: {val_metrics['f1']:.4f}, Val Loss: {val_loss:.4f})")
     
-        elif (epoch + 1) % checkpoint_interval == 0:
+        if (epoch + 1) % checkpoint_interval == 0:
             save_model(output_dir, f'checkpoint_epoch_{epoch+1}', base_model, save_format, model, optimizer, scheduler, epoch, threshold, val_loss, val_metrics['f1'], tag_to_idx, idx_to_tag, tag_to_category)
             print(f"Checkpoint saved at epoch {epoch+1}")
+
+        if merge_every_n_epochs is not None and (epoch + 1) % merge_every_n_epochs == 0:
+            model.merge_lora_to_base_model()
+            # optimizer, schedulerをリセット
+            optimizer = setup_optimizer(model, learning_rate, weight_decay, use_8bit_optimizer)
+            # schedulerは通常、warmupをやり直すが、ここでは未実装
     
     # 最終モデルの保存
     save_model(output_dir, f'final_model', base_model, save_format, model, optimizer, scheduler, epoch, threshold, val_loss, val_metrics['f1'], tag_to_idx, idx_to_tag, tag_to_category)
@@ -2283,6 +2356,7 @@ def main():
     train_parser.add_argument('--num_epochs', type=int, default=10, help='エポック数')
     train_parser.add_argument('--learning_rate', type=float, default=1e-4, help='学習率')
     train_parser.add_argument('--weight_decay', type=float, default=0.01, help='重み減衰')
+    train_parser.add_argument('--use_8bit_optimizer', action='store_true', help='8-bitオプティマイザを使用する')
 
     train_parser.add_argument('--initial_threshold', type=float, default=0.35, help='初期閾値')
     train_parser.add_argument('--dynamic_threshold', type=float, default=True, help='動的閾値')
@@ -2301,7 +2375,6 @@ def main():
     
     # その他のオプション
     train_parser.add_argument('--mixed_precision', action='store_true', help='混合精度トレーニングを使用する')
-    train_parser.add_argument('--use_8bit_optimizer', action='store_true', help='8-bitオプティマイザを使用する')
     train_parser.add_argument('--tensorboard', action='store_true', help='TensorBoardを使用する')
     train_parser.add_argument('--tensorboard_port', type=int, default=6006, help='TensorBoardのポート番号')
     train_parser.add_argument('--bind_all', action='store_true', help='TensorBoardをすべてのネットワークインターフェースにバインドする')
@@ -2571,35 +2644,6 @@ def main():
             print("損失関数が指定されていません。BCEWithLogitsLossを使用します。")
             criterion = nn.BCEWithLogitsLoss()
         
-        # オプティマイザの設定
-        if args.use_8bit_optimizer:
-            try:
-                optimizer = bnb.optim.AdamW8bit(
-                    model.parameters(),
-                    lr=args.learning_rate,
-                    weight_decay=args.weight_decay
-                )
-                print("8-bitオプティマイザを使用します")
-            except ImportError:
-                print("bitsandbytesがインストールされていないため、通常のAdamWを使用します")
-                optimizer = torch.optim.AdamW(
-                    model.parameters(),
-                    lr=args.learning_rate,
-                    weight_decay=args.weight_decay
-                )
-        else:
-            optimizer = torch.optim.AdamW(
-                model.parameters(),
-                lr=args.learning_rate,
-                weight_decay=args.weight_decay
-            )
-        
-        # 学習率スケジューラの設定
-        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-            optimizer,
-            T_max=args.num_epochs
-        )
-        
         # TensorBoardの設定
         if args.tensorboard:
             try:
@@ -2631,8 +2675,9 @@ def main():
             idx_to_tag=model.idx_to_tag,
             tag_to_category=tag_to_category,
             old_tags_count=old_tags_count,
-            optimizer=optimizer,
-            scheduler=scheduler,
+            learning_rate=args.learning_rate,
+            weight_decay=args.weight_decay,
+            use_8bit_optimizer=args.use_8bit_optimizer,
             criterion=criterion,
             num_epochs=args.num_epochs,
             device=device,
