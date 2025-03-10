@@ -2768,20 +2768,28 @@ def main():
                 torch.save(checkpoint, os.path.join(output_dir, f'{filename}.pt'))
                 print(f"Model saved as {os.path.join(output_dir, f'{filename}.pt')}")
 
-        def export_onnx(model, output_dir, filename, simplify=True):
+        def export_onnx(model, output_dir, filename, simplify=True, optimize_for_gpu=True):
             # ONNX形式で保存
             from timm.utils.model import reparameterize_model
             from timm.utils.onnx import onnx_export
+            import os
+            import torch
 
             onnx_path = os.path.join(output_dir, f'{filename}.onnx')
+            optimized_path = os.path.join(output_dir, f'{filename}_optimized.onnx')
 
+            # モデルの再パラメータ化
             model = reparameterize_model(model)
 
+            # モデルをCPUに移動
+            model.to("cpu")
+            
             # モデルをONNX形式に変換
             dummy_input = torch.randn(1, 3, 448, 448, device="cpu")
-            model.to("cpu")
 
             print(f"ONNX形式で保存します: {onnx_path}")
+            
+            # timmのonnx_exportを使用
             onnx_export(
                 model,
                 onnx_path,
@@ -2797,15 +2805,69 @@ def main():
                 batch_size=1,
             )
 
-            import onnx
-            from onnxsim import simplify
-
             # ONNXモデルの簡略化
             if simplify:
-                model_onnx = onnx.load(onnx_path)
-                model_onnx, check = simplify(model_onnx)
-                onnx.save(model_onnx, onnx_path)
-                print(f"ONNXモデルを簡略化して保存しました: {onnx_path}")
+                try:
+                    import onnx
+                    from onnxsim import simplify
+                    
+                    print("ONNXモデルを簡略化しています...")
+                    # ONNXモデルの読み込み
+                    model_onnx = onnx.load(onnx_path)
+                    
+                    # モデルの簡略化
+                    model_onnx, check = simplify(model_onnx)
+                    if not check:
+                        print("警告: 簡略化されたモデルの検証に失敗しました")
+                    else:
+                        print("モデルの簡略化に成功しました")
+                        onnx.save(model_onnx, onnx_path)
+                        print(f"簡略化されたONNXモデルを保存しました: {onnx_path}")
+                except Exception as e:
+                    print(f"モデルの簡略化中にエラーが発生しました: {e}")
+            
+            # GPU向けの最適化
+            if optimize_for_gpu:
+                try:
+                    import onnxruntime as ort
+                    
+                    print("ONNX Runtimeを使用してモデルをGPU向けに最適化しています...")
+                    
+                    # セッションオプションを設定
+                    sess_options = ort.SessionOptions()
+                    sess_options.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
+                    sess_options.optimized_model_filepath = optimized_path
+                    
+                    # 利用可能なプロバイダーを確認
+                    providers = ort.get_available_providers()
+                    print(f"利用可能なプロバイダー: {providers}")
+                    
+                    if 'CUDAExecutionProvider' in providers:
+                        provider_list = ['CUDAExecutionProvider', 'CPUExecutionProvider']
+                        print("CUDAプロバイダーを使用して最適化します")
+                    else:
+                        provider_list = ['CPUExecutionProvider']
+                        print("CPUプロバイダーを使用して最適化します")
+                    
+                    # セッションを作成して最適化
+                    _ = ort.InferenceSession(onnx_path, sess_options, providers=provider_list)
+                    
+                    print(f"最適化されたモデルを保存しました: {optimized_path}")
+                    
+                    # 最適化されたモデルが正常に生成されたか確認
+                    if os.path.exists(optimized_path) and os.path.getsize(optimized_path) > 0:
+                        print(f"最適化されたモデルのサイズ: {os.path.getsize(optimized_path) / (1024*1024):.2f} MB")
+                        return optimized_path
+                    else:
+                        print("警告: 最適化されたモデルが正常に生成されませんでした。元のモデルを使用します。")
+                        return onnx_path
+                    
+                except Exception as e:
+                    print(f"GPU最適化中にエラーが発生しました: {e}")
+                    print("元のONNXモデルを使用します")
+                    return onnx_path
+            
+            return onnx_path
 
         # モデルの読み込み
         model, labels = load_model(args.model_path, args.metadata_path, base_model=args.base_model, device=torch_device)

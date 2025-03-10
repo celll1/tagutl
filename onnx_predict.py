@@ -142,15 +142,31 @@ def get_tags(probs, labels, gen_threshold, char_threshold):
     
     return result
 
-def visualize_predictions(image, tags, predictions, threshold=0.35, output_path=None, max_tags=15):
+def visualize_predictions(image, tags, predictions, threshold=0.35, output_path=None, max_tags_per_category=None):
     # Create figure with subplots
     matplotlib.use('Agg')  # Use non-interactive backend
     
     # Set font that supports English characters
     plt.rcParams['font.family'] = 'DejaVu Sans'
     
-    # Create figure with two columns
-    fig = plt.figure(figsize=(20, 12))
+    # Filter out unwanted meta tags
+    filtered_meta = []
+    excluded_meta_patterns = ['id', 'commentary']
+    
+    for tag, prob in predictions["meta"]:
+        # Skip tags containing 'id' or 'commentary'
+        if not any(pattern in tag.lower() for pattern in excluded_meta_patterns):
+            filtered_meta.append((tag, prob))
+    
+    # Replace meta tags with filtered list
+    predictions["meta"] = filtered_meta
+
+    # メタタグのコピーを保存（フィルタリング前）
+    original_meta = predictions["meta"].copy()
+    
+    # 固定サイズのプロットを作成（1000x1200px）
+    # 20インチ x 12インチ @ 100dpi = 1000x1200px
+    fig = plt.figure(figsize=(20, 12), dpi=100)
     gs = fig.add_gridspec(1, 2, width_ratios=[1.2, 1])
     
     # Left side: Image
@@ -178,43 +194,43 @@ def visualize_predictions(image, tags, predictions, threshold=0.35, output_path=
         'meta': 'gray'
     }
     
-    # Add rating tags
+    # Add rating tags (all of them)
     for tag, prob in predictions["rating"]:
         all_tags.append(f"[R] {tag}")
         all_probs.append(prob)
         all_colors.append(color_map['rating'])
         all_categories.append('rating')
     
-    # Add character tags
-    for tag, prob in predictions["character"][:max_tags]:
+    # Add character tags (all above threshold)
+    for tag, prob in predictions["character"]:
         all_tags.append(f"[C] {tag}")
         all_probs.append(prob)
         all_colors.append(color_map['character'])
         all_categories.append('character')
     
-    # Add copyright tags
-    for tag, prob in predictions["copyright"][:max_tags]:
+    # Add copyright tags (all above threshold)
+    for tag, prob in predictions["copyright"]:
         all_tags.append(f"[©] {tag}")
         all_probs.append(prob)
         all_colors.append(color_map['copyright'])
         all_categories.append('copyright')
     
-    # Add artist tags
-    for tag, prob in predictions["artist"][:max_tags]:
+    # Add artist tags (all above threshold)
+    for tag, prob in predictions["artist"]:
         all_tags.append(f"[A] {tag}")
         all_probs.append(prob)
         all_colors.append(color_map['artist'])
         all_categories.append('artist')
     
-    # Add general tags (limit to max_tags)
-    for tag, prob in predictions["general"][:max_tags]:
+    # Add general tags (all above threshold)
+    for tag, prob in predictions["general"]:
         all_tags.append(f"[G] {tag}")
         all_probs.append(prob)
         all_colors.append(color_map['general'])
         all_categories.append('general')
     
-    # Add meta tags
-    for tag, prob in predictions["meta"][:max_tags]:
+    # Add meta tags (filtered, all above threshold)
+    for tag, prob in predictions["meta"]:
         all_tags.append(f"[M] {tag}")
         all_probs.append(prob)
         all_colors.append(color_map['meta'])
@@ -227,39 +243,54 @@ def visualize_predictions(image, tags, predictions, threshold=0.35, output_path=
     all_colors = [all_colors[i] for i in sorted_indices]
     all_categories = [all_categories[i] for i in sorted_indices]
     
-    # Limit to top 30 tags overall
-    max_display = min(30, len(all_tags))
-    all_tags = all_tags[:max_display]
-    all_probs = all_probs[:max_display]
-    all_colors = all_colors[:max_display]
-    all_categories = all_categories[:max_display]
-    
     # Reverse lists for bottom-to-top display
     all_tags.reverse()
     all_probs.reverse()
     all_colors.reverse()
     all_categories.reverse()
     
-    # Plot horizontal bars
-    bars = ax_tags.barh(range(len(all_tags)), all_probs, color=all_colors)
-    
-    # Set y-ticks and labels
-    ax_tags.set_yticks(range(len(all_tags)))
-    ax_tags.set_yticklabels(all_tags)
+    # タグの数に応じてバーの高さを調整
+    num_tags = len(all_tags)
+    if num_tags > 0:
+        # 固定サイズのプロット内にすべてのタグを表示するための調整
+        bar_height = 1.2  # デフォルトの高さ
+        if num_tags > 30:  # タグが多い場合は高さを調整
+            bar_height = 1.2 * (30 / num_tags)
+        
+        # Y位置を計算（均等に分布）
+        y_positions = np.linspace(0, num_tags-1, num_tags)
+        
+        # Plot horizontal bars
+        bars = ax_tags.barh(y_positions, all_probs, height=bar_height, color=all_colors)
+        
+        # Set y-ticks and labels
+        ax_tags.set_yticks(y_positions)
+        ax_tags.set_yticklabels(all_tags)
+        
+        # フォントサイズを調整（タグが多い場合は小さく）
+        fontsize = 10
+        if num_tags > 40:
+            fontsize = 8
+        elif num_tags > 60:
+            fontsize = 6
+        
+        # ラベルのフォントサイズを設定
+        for label in ax_tags.get_yticklabels():
+            label.set_fontsize(fontsize)
+        
+        # Add probability values at the end of each bar
+        for i, (bar, prob) in enumerate(zip(bars, all_probs)):
+            ax_tags.text(
+                min(prob + 0.02, 0.98),  # Slightly offset from bar end
+                y_positions[i],          # Y position
+                f"{prob:.3f}",           # Probability text
+                va='center',             # Vertical alignment
+                fontsize=fontsize        # Adjusted font size
+            )
     
     # Set x-axis limit
     ax_tags.set_xlim(0, 1)
     ax_tags.set_title(f"Tags (threshold={threshold})")
-    
-    # Add probability values at the end of each bar
-    for i, (bar, prob) in enumerate(zip(bars, all_probs)):
-        ax_tags.text(
-            min(prob + 0.02, 0.98),  # Slightly offset from bar end
-            i,                        # Y position
-            f"{prob:.3f}",            # Probability text
-            va='center',              # Vertical alignment
-            fontsize=8                # Smaller font size
-        )
     
     # Add legend
     from matplotlib.patches import Patch
@@ -271,7 +302,13 @@ def visualize_predictions(image, tags, predictions, threshold=0.35, output_path=
         Patch(facecolor=color_map['general'], label='General'),
         Patch(facecolor=color_map['meta'], label='Meta')
     ]
-    ax_tags.legend(handles=legend_elements, loc='lower right')
+    ax_tags.legend(handles=legend_elements, loc='lower right', fontsize=8)
+    
+    # Add original tags as text at the bottom of the figure
+    if tags:
+        tag_text = "Original Tags: " + ", ".join(tags[:20])
+        fig.text(0.5, 0.01, tag_text, wrap=True, 
+                horizontalalignment='center', fontsize=10)
     
     # Adjust layout
     plt.tight_layout()
@@ -293,7 +330,7 @@ def visualize_predictions(image, tags, predictions, threshold=0.35, output_path=
     
     plt.close(fig)
     
-    # Also create a text file with all predictions
+    # Also create a text file with all predictions (including filtered meta tags)
     if output_path:
         txt_path = os.path.splitext(output_path)[0] + ".txt"
         with open(txt_path, 'w', encoding='utf-8') as f:
@@ -317,9 +354,21 @@ def visualize_predictions(image, tags, predictions, threshold=0.35, output_path=
             for tag, prob in predictions["general"]:
                 f.write(f"{tag}: {prob:.3f}\n")
                 
+            # Save all meta tags to text file, but mark filtered ones
             f.write("\n=== Meta Tags ===\n")
             for tag, prob in predictions["meta"]:
                 f.write(f"{tag}: {prob:.3f}\n")
+            
+            # Add a section for filtered meta tags
+            filtered_count = 0
+            f.write("\n=== Filtered Meta Tags (not displayed) ===\n")
+            for tag, prob in original_meta:
+                if any(pattern in tag.lower() for pattern in excluded_meta_patterns):
+                    f.write(f"{tag}: {prob:.3f}\n")
+                    filtered_count += 1
+            
+            if filtered_count == 0:
+                f.write("None\n")
         
         print(f"Detailed results saved: {txt_path}")
     
@@ -425,10 +474,47 @@ def preprocess_image(image_path, target_size=(448, 448)):
     
     return image, img_array
 
-def predict_with_onnx(image_path, model_path, tag_mapping_path, gen_threshold=0.35, char_threshold=0.45, output_path=None):
+def predict_with_onnx(image_path, model_path, tag_mapping_path, gen_threshold=0.35, char_threshold=0.45, output_path=None, use_gpu=False):
     # ONNXモデルでの予測
     print(f"Loading model: {model_path}")
-    session = ort.InferenceSession(model_path)
+    
+    # 利用可能なプロバイダーを確認
+    available_providers = ort.get_available_providers()
+    print(f"Available providers: {available_providers}")
+    
+    # GPUの使用設定
+    if use_gpu:
+        try:
+            # セッションオプションを設定
+            session_options = ort.SessionOptions()
+            
+            # 利用可能なGPUプロバイダーを選択
+            providers = []
+            if 'CUDAExecutionProvider' in available_providers:
+                providers.append('CUDAExecutionProvider')
+            elif 'DmlExecutionProvider' in available_providers:
+                providers.append('DmlExecutionProvider')
+            elif 'TensorrtExecutionProvider' in available_providers:
+                providers.append('TensorrtExecutionProvider')
+            
+            # CPUはフォールバック用に常に追加
+            providers.append('CPUExecutionProvider')
+            
+            if not providers or len(providers) == 1:  # CPUしかない場合
+                print("No GPU providers available, using CPU only")
+                session = ort.InferenceSession(model_path)
+            else:
+                print(f"Using providers: {providers}")
+                session = ort.InferenceSession(model_path, providers=providers)
+                print(f"Active provider: {session.get_providers()[0]}")
+        except Exception as e:
+            print(f"GPU acceleration failed: {e}")
+            print("Falling back to CPU")
+            session = ort.InferenceSession(model_path)
+    else:
+        # CPUのみを使用
+        session = ort.InferenceSession(model_path)
+        print("Using CPU for inference")
     
     # タグマッピングの読み込み
     print(f"Loading tag mapping: {tag_mapping_path}")
@@ -445,13 +531,22 @@ def predict_with_onnx(image_path, model_path, tag_mapping_path, gen_threshold=0.
     print("Running inference...")
     input_name = session.get_inputs()[0].name
     output_name = session.get_outputs()[0].name
+    
+    # 推論時間の計測
+    import time
+    start_time = time.time()
     outputs = session.run([output_name], {input_name: input_data})[0]
+    inference_time = time.time() - start_time
+    print(f"Inference completed in {inference_time:.3f} seconds")
     
     # シグモイド関数を適用して確率に変換
     outputs = 1 / (1 + np.exp(-outputs))
     
     # 確率からタグを取得
     predictions = get_tags(outputs[0], labels, gen_threshold, char_threshold)
+    
+    # メタタグのコピーを保存（フィルタリング前）
+    original_meta = predictions["meta"].copy()
     
     # 結果の表示
     print("--------")
@@ -481,8 +576,16 @@ def predict_with_onnx(image_path, model_path, tag_mapping_path, gen_threshold=0.
     
     print("--------")
     print(f"Meta tags (threshold={gen_threshold}):")
+    # Filter out unwanted meta tags for display
+    filtered_meta = []
+    excluded_meta_patterns = ['id', 'commentary']
+    
     for tag, conf in predictions["meta"]:
-        print(f"  {tag}: {conf:.3f}")
+        if not any(pattern in tag.lower() for pattern in excluded_meta_patterns):
+            print(f"  {tag}: {conf:.3f}")
+            filtered_meta.append((tag, conf))
+        else:
+            print(f"  [FILTERED] {tag}: {conf:.3f}")
     
     # 結果の可視化
     if output_path is None and image_path.startswith(("http://", "https://")):
@@ -497,6 +600,7 @@ def predict_with_onnx(image_path, model_path, tag_mapping_path, gen_threshold=0.
         if not output_path.lower().endswith(('.png', '.jpg', '.jpeg')):
             output_path += ".png"
     
+    # Pass original_meta to visualize_predictions
     result_image = visualize_predictions(
         original_image, 
         original_tags, 
@@ -558,6 +662,7 @@ def main():
     parser.add_argument('--output', type=str, default=None, help='結果画像の出力パス')
     parser.add_argument('--gen_threshold', type=float, default=0.35, help='一般タグの閾値')
     parser.add_argument('--char_threshold', type=float, default=0.45, help='キャラクタータグの閾値')
+    parser.add_argument('--gpu', action='store_true', help='GPUを使用して推論を実行')
     
     args = parser.parse_args()
     
@@ -567,8 +672,26 @@ def main():
         args.tag_mapping,
         args.gen_threshold,
         args.char_threshold,
-        args.output
+        args.output,
+        use_gpu=args.gpu
     )
 
+# GPUが利用可能かチェックする関数
+def check_gpu_availability():
+    try:
+        providers = ort.get_available_providers()
+        if 'CUDAExecutionProvider' in providers:
+            print("CUDA is available for ONNX Runtime")
+            return True
+        else:
+            print("CUDA is not available for ONNX Runtime")
+            print("Available providers:", providers)
+            return False
+    except Exception as e:
+        print(f"Error checking GPU availability: {e}")
+        return False
+
 if __name__ == "__main__":
+    # GPUの利用可能性をチェック
+    check_gpu_availability()
     main() 

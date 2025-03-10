@@ -42,3 +42,4 @@ lora_target_layers.txt
 *.jpg
 *.jpeg
 batch_results.json
+result*
