@@ -21,9 +21,26 @@ class LabelData:
     meta: list[np.int64]
 
 def pil_ensure_rgb(image: Image.Image) -> Image.Image:
+    """
+    画像を確実にRGB形式に変換する
+    
+    Args:
+        image: PIL Image オブジェクト
+    Returns:
+        RGB形式の PIL Image
+    """
     # convert to RGB/RGBA if not already (deals with palette images etc.)
-    if image.mode not in ("RGB", "RGBA"):
-        image = image.convert("RGB")
+    if image.mode not in ["RGB", "RGBA"]:
+        image = image.convert("RGBA") if "transparency" in image.info else image.convert("RGB")
+    
+    # RGBAの場合は白背景でRGBに変換
+    if image.mode == "RGBA":
+        # 白背景のキャンバスを作成
+        background = Image.new("RGB", image.size, (255, 255, 255))
+        # アルファチャンネルを考慮して合成
+        background.paste(image, mask=image.split()[3])  # 3はアルファチャンネル
+        image = background
+    
     return image
 
 def pil_pad_square(image: Image.Image) -> Image.Image:
@@ -478,6 +495,20 @@ def predict_with_onnx(image_path, model_path, tag_mapping_path, gen_threshold=0.
     # ONNXモデルでの予測
     print(f"Loading model: {model_path}")
     
+    # モデルがFP16かどうかを確認
+    is_fp16_model = False
+    try:
+        import onnx
+        model = onnx.load(model_path)
+        # モデルの最初の入力のデータ型をチェック
+        for tensor in model.graph.initializer:
+            if tensor.data_type == 10:  # FLOAT16
+                is_fp16_model = True
+                break
+        print(f"Model is {'FP16' if is_fp16_model else 'FP32'}")
+    except Exception as e:
+        print(f"Failed to check model precision: {e}")
+    
     # 利用可能なプロバイダーを確認
     available_providers = ort.get_available_providers()
     print(f"Available providers: {available_providers}")
@@ -491,7 +522,18 @@ def predict_with_onnx(image_path, model_path, tag_mapping_path, gen_threshold=0.
             # 利用可能なGPUプロバイダーを選択
             providers = []
             if 'CUDAExecutionProvider' in available_providers:
-                providers.append('CUDAExecutionProvider')
+                # FP16モデルの場合、CUDA設定を最適化
+                if is_fp16_model:
+                    cuda_provider_options = {
+                        'device_id': 0,
+                        'arena_extend_strategy': 'kNextPowerOfTwo',
+                        'gpu_mem_limit': 2 * 1024 * 1024 * 1024,  # 2GB
+                        'cudnn_conv_algo_search': 'EXHAUSTIVE',
+                        'do_copy_in_default_stream': True,
+                    }
+                    providers.append(('CUDAExecutionProvider', cuda_provider_options))
+                else:
+                    providers.append('CUDAExecutionProvider')
             elif 'DmlExecutionProvider' in available_providers:
                 providers.append('DmlExecutionProvider')
             elif 'TensorrtExecutionProvider' in available_providers:
@@ -524,6 +566,20 @@ def predict_with_onnx(image_path, model_path, tag_mapping_path, gen_threshold=0.
     print(f"Processing image: {image_path}")
     original_image, input_data = preprocess_image(image_path)
     
+    # 入力データ型を確認
+    expected_input_type = session.get_inputs()[0].type
+    print(f"Model expects input type: {expected_input_type}")
+    
+    # 入力データ型を調整（FP16モデルでも入力はFP32のまま）
+    # FP16モデルを作成する際に keep_io_types=True を使用した場合、
+    # 入力はFP32のままにする必要があります
+    if "float16" in expected_input_type:
+        input_data = input_data.astype(np.float16)
+        print("Using FP16 input")
+    else:
+        input_data = input_data.astype(np.float32)
+        print("Using FP32 input")
+    
     # 元のタグを読み込む
     original_tags = read_tags_from_file(image_path)
     
@@ -539,8 +595,31 @@ def predict_with_onnx(image_path, model_path, tag_mapping_path, gen_threshold=0.
     inference_time = time.time() - start_time
     print(f"Inference completed in {inference_time:.3f} seconds")
     
-    # シグモイド関数を適用して確率に変換
-    outputs = 1 / (1 + np.exp(-outputs))
+    # NaNチェック
+    if np.isnan(outputs).any():
+        print("警告: 推論結果にNaNが含まれています")
+        # NaNを0に置き換え
+        outputs = np.nan_to_num(outputs, nan=0.0)
+        print("NaNを0に置き換えました")
+    
+    # 無限大チェック
+    if np.isinf(outputs).any():
+        print("警告: 推論結果に無限大が含まれています")
+        # 無限大を大きな値に置き換え
+        outputs = np.nan_to_num(outputs, posinf=100.0, neginf=-100.0)
+        print("無限大を有限値に置き換えました")
+    
+    # シグモイド関数を適用して確率に変換（数値安定性を考慮）
+    def stable_sigmoid(x):
+        # 数値安定性のためのシグモイド実装
+        # 大きな負の値に対する対策
+        return np.where(
+            x >= 0,
+            1 / (1 + np.exp(-x)),
+            np.exp(x) / (1 + np.exp(x))
+        )
+    
+    outputs = stable_sigmoid(outputs)
     
     # 確率からタグを取得
     predictions = get_tags(outputs[0], labels, gen_threshold, char_threshold)

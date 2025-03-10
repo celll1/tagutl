@@ -2391,6 +2391,7 @@ def main():
 
     merge_parser.add_argument('--scale', type=float, default=1.0, help='マージ時のスケーリング係数（デフォルト: 1.0）')
     merge_parser.add_argument('--save_format', type=str, default='safetensors', choices=['safetensors', 'pytorch', 'onnx'], help='モデルの保存形式')
+    merge_parser.add_argument('--fp16', action='store_true', help='FP16モデルを保存する')
 
     merge_parser.add_argument('--merge_type', type=str, default='lora', choices=['lora'], help='マージするモデルの種類')
     """
@@ -2768,7 +2769,7 @@ def main():
                 torch.save(checkpoint, os.path.join(output_dir, f'{filename}.pt'))
                 print(f"Model saved as {os.path.join(output_dir, f'{filename}.pt')}")
 
-        def export_onnx(model, output_dir, filename, simplify=True, optimize_for_gpu=True):
+        def export_onnx(model, output_dir, filename, fp16=False ,simplify=True, optimize_for_gpu=True):
             # ONNX形式で保存
             from timm.utils.model import reparameterize_model
             from timm.utils.onnx import onnx_export
@@ -2783,9 +2784,6 @@ def main():
 
             # モデルをCPUに移動
             model.to("cpu")
-            
-            # モデルをONNX形式に変換
-            dummy_input = torch.randn(1, 3, 448, 448, device="cpu")
 
             print(f"ONNX形式で保存します: {onnx_path}")
             
@@ -2805,26 +2803,39 @@ def main():
                 batch_size=1,
             )
 
-            # ONNXモデルの簡略化
-            if simplify:
-                try:
-                    import onnx
+            # ONNXモデルの変換と簡略化
+            try:
+                import onnx
+                
+                # ONNXモデルの読み込み
+                model_onnx = onnx.load(onnx_path)
+                
+                # FP16変換
+                if fp16:
+                    from onnxconverter_common import float16
+                    model_onnx =  float16.convert_float_to_float16(
+                        model_onnx,
+                        keep_io_types=True,
+                        op_block_list=['Sigmoid']  # Sigmoidなど特定の演算子はfloat32のまま
+                    )
+                
+                # モデルの簡略化
+                if simplify:
                     from onnxsim import simplify
-                    
                     print("ONNXモデルを簡略化しています...")
-                    # ONNXモデルの読み込み
-                    model_onnx = onnx.load(onnx_path)
-                    
-                    # モデルの簡略化
                     model_onnx, check = simplify(model_onnx)
+                    
                     if not check:
                         print("警告: 簡略化されたモデルの検証に失敗しました")
                     else:
                         print("モデルの簡略化に成功しました")
-                        onnx.save(model_onnx, onnx_path)
-                        print(f"簡略化されたONNXモデルを保存しました: {onnx_path}")
-                except Exception as e:
-                    print(f"モデルの簡略化中にエラーが発生しました: {e}")
+                
+                # 変換後のモデルを保存
+                onnx.save(model_onnx, onnx_path)
+                print(f"変換されたONNXモデルを保存しました: {onnx_path}")
+                
+            except Exception as e:
+                print(f"モデルの変換/簡略化中にエラーが発生しました: {e}")
             
             # GPU向けの最適化
             if optimize_for_gpu:
@@ -2905,7 +2916,7 @@ def main():
                 )
 
             elif args.save_format == 'onnx':
-                export_onnx(model, args.output_dir, filename)
+                export_onnx(model, args.output_dir, filename, fp16=args.fp16)
 
             # タグマッピングの保存
             save_tag_mapping(args.output_dir, model.idx_to_tag, model.tag_to_category)
