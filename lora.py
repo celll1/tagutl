@@ -1814,11 +1814,12 @@ def train_model(
             
             progress_bar.set_postfix({"loss": f"{loss.item():.4f}"})
 
-            if i % 5 == 0 and i / 5 < 10:
-                img_grid = visualize_predictions_for_tensorboard(images[0], probs[0], idx_to_tag, threshold=threshold, original_tags=targets[0])
+            # タグ拡張が多いとき著しく重いので、いったんコメントアウト
+            # if i % 5 == 0 and i / 5 < 10:
+                # img_grid = visualize_predictions_for_tensorboard(images[0], probs[0], idx_to_tag, threshold=threshold, original_tags=targets[0])
 
-                if tensorboard:
-                    writer.add_image(f'predictions/val_{i}', img_grid, 0)
+                # if tensorboard:
+                #     writer.add_image(f'predictions/val_{i}', img_grid, 0)
     
     # 検証メトリクスの計算
     val_loss /= len(val_loader)
@@ -2882,6 +2883,10 @@ def main():
 
         # モデルの読み込み
         model, labels = load_model(args.model_path, args.metadata_path, base_model=args.base_model, device=torch_device)
+
+        # 出力ディレクトリがない場合は作成
+        if not os.path.exists(args.output_dir):
+            os.makedirs(args.output_dir)
 
         # マージタイプに応じた処理
         if args.merge_type == 'lora':

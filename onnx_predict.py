@@ -1,4 +1,5 @@
 import os
+import time
 import json
 import argparse
 import numpy as np
@@ -159,7 +160,7 @@ def get_tags(probs, labels, gen_threshold, char_threshold):
     
     return result
 
-def visualize_predictions(image, tags, predictions, threshold=0.35, output_path=None, max_tags_per_category=None):
+def visualize_predictions(image, tags, predictions, threshold=0.45, output_path=None, max_tags_per_category=None):
     # Create figure with subplots
     matplotlib.use('Agg')  # Use non-interactive backend
     
@@ -270,9 +271,9 @@ def visualize_predictions(image, tags, predictions, threshold=0.35, output_path=
     num_tags = len(all_tags)
     if num_tags > 0:
         # 固定サイズのプロット内にすべてのタグを表示するための調整
-        bar_height = 1.2  # デフォルトの高さ
+        bar_height = 0.8  # デフォルトの高さ
         if num_tags > 30:  # タグが多い場合は高さを調整
-            bar_height = 1.2 * (30 / num_tags)
+            bar_height = 0.8 * (30 / num_tags)
         
         # Y位置を計算（均等に分布）
         y_positions = np.linspace(0, num_tags-1, num_tags)
@@ -322,10 +323,10 @@ def visualize_predictions(image, tags, predictions, threshold=0.35, output_path=
     ax_tags.legend(handles=legend_elements, loc='lower right', fontsize=8)
     
     # Add original tags as text at the bottom of the figure
-    if tags:
-        tag_text = "Original Tags: " + ", ".join(tags[:20])
-        fig.text(0.5, 0.01, tag_text, wrap=True, 
-                horizontalalignment='center', fontsize=10)
+    # if tags:
+    #     tag_text = "Original Tags: " + ", ".join(tags[:20])
+    #     fig.text(0.5, 0.01, tag_text, wrap=True, 
+    #             horizontalalignment='center', fontsize=10)
     
     # Adjust layout
     plt.tight_layout()
@@ -491,7 +492,56 @@ def preprocess_image(image_path, target_size=(448, 448)):
     
     return image, img_array
 
-def predict_with_onnx(image_path, model_path, tag_mapping_path, gen_threshold=0.35, char_threshold=0.45, output_path=None, use_gpu=False):
+def convert_tag_format(tag: str) -> str:
+    """
+    タグの形式を変換する
+    aaaa_bbbb_(cccc) -> aaaa bbbb \(cccc\)
+    
+    Args:
+        tag: 変換前のタグ
+    Returns:
+        変換後のタグ
+    """
+    # 括弧をエスケープする
+    tag = tag.replace('(', '\\(').replace(')', '\\)')
+    
+    # アンダースコアをスペースに変換
+    tag = tag.replace('_', ' ')
+    
+    return tag
+
+def save_tags_as_csv(predictions, output_path, threshold=0.45):
+    """
+    予測されたタグをカンマ区切りのテキストファイルとして保存する
+    
+    Args:
+        predictions: 予測結果の辞書
+        output_path: 出力ファイルパス
+        threshold: タグの閾値
+    """
+    # すべてのタグを収集
+    all_tags = []
+    
+    # レーティングタグ（最も確率の高いもののみ）
+    if predictions["rating"]:
+        all_tags.append(convert_tag_format(predictions["rating"][0][0]))
+    
+    # 他のカテゴリのタグを追加
+    for category in ["character", "copyright", "artist", "general", "meta"]:
+        for tag, prob in predictions[category]:
+            # メタタグの中でidやcommentaryを含むものは除外
+            if category == "meta" and any(pattern in tag.lower() for pattern in ['id', 'commentary']):
+                continue
+            all_tags.append(convert_tag_format(tag))
+    
+    # カンマ区切りで保存（カンマの後にスペースを入れる）
+    with open(output_path, 'w', encoding='utf-8') as f:
+        f.write(", ".join(all_tags))
+    
+    print(f"タグをカンマ区切りで保存しました: {output_path}")
+    return all_tags
+
+def predict_with_onnx(image_path, model_path, tag_mapping_path, gen_threshold=0.45, char_threshold=0.45, output_path=None, use_gpu=False, output_mode="visualization"):
     # ONNXモデルでの予測
     print(f"Loading model: {model_path}")
     
@@ -733,27 +783,240 @@ def debug_preprocessing(image_path):
     
     print("前処理のデバッグ画像を保存しました: preprocessing_debug.png")
 
+def batch_predict(dir, model_path, tag_mapping_path, gen_threshold=0.45, char_threshold=0.45, 
+                 use_gpu=False, output_mode="visualization", recursive=False, batch_size=1):
+    """
+    ディレクトリ内の画像に対してバッチ推論を実行する
+    
+    Args:
+        dir: 画像ディレクトリのパス
+        model_path: ONNXモデルのパス
+        tag_mapping_path: タグマッピングJSONファイルのパス
+        gen_threshold: 一般タグの閾値
+        char_threshold: キャラクタータグの閾値
+        use_gpu: GPUを使用するかどうか
+        output_mode: 出力モード
+        recursive: サブディレクトリも処理するかどうか
+        batch_size: バッチサイズ（デフォルト: 1）
+    """
+    print(f"モデルを読み込み中: {model_path}")
+    
+    # モデルがFP16かどうかを確認
+    is_fp16_model = False
+    try:
+        import onnx
+        model = onnx.load(model_path)
+        for tensor in model.graph.initializer:
+            if tensor.data_type == 10:  # FLOAT16
+                is_fp16_model = True
+                break
+        print(f"モデルは {'FP16' if is_fp16_model else 'FP32'} です")
+    except Exception as e:
+        print(f"モデル精度の確認に失敗しました: {e}")
+    
+    # 利用可能なプロバイダーを確認
+    available_providers = ort.get_available_providers()
+    
+    # GPUの使用設定とセッションの作成
+    if use_gpu:
+        try:
+            providers = []
+            if 'CUDAExecutionProvider' in available_providers:
+                if is_fp16_model:
+                    cuda_provider_options = {
+                        'device_id': 0,
+                        'arena_extend_strategy': 'kNextPowerOfTwo',
+                        'gpu_mem_limit': 2 * 1024 * 1024 * 1024,
+                        'cudnn_conv_algo_search': 'EXHAUSTIVE',
+                        'do_copy_in_default_stream': True,
+                    }
+                    providers.append(('CUDAExecutionProvider', cuda_provider_options))
+                else:
+                    providers.append('CUDAExecutionProvider')
+            providers.append('CPUExecutionProvider')
+            
+            session = ort.InferenceSession(model_path, providers=providers)
+            print(f"使用するプロバイダー: {session.get_providers()}")
+        except Exception as e:
+            print(f"GPU高速化に失敗しました: {e}")
+            print("CPUにフォールバックします")
+            session = ort.InferenceSession(model_path, providers=['CPUExecutionProvider'])
+    else:
+        session = ort.InferenceSession(model_path, providers=['CPUExecutionProvider'])
+    
+    # タグマッピングの読み込み
+    print(f"タグマッピングを読み込み中: {tag_mapping_path}")
+    labels, idx_to_tag, tag_to_category = load_tag_mapping(tag_mapping_path)
+    
+    # 画像ファイルのリストを取得
+    image_files = []
+    if recursive:
+        for root, _, files in os.walk(dir):
+            for file in files:
+                if file.lower().endswith(('.jpg', '.jpeg', '.png', '.bmp', '.webp')):
+                    image_files.append(os.path.join(root, file))
+    else:
+        for file in os.listdir(dir):
+            if file.lower().endswith(('.jpg', '.jpeg', '.png', '.bmp', '.webp')):
+                image_files.append(os.path.join(dir, file))
+    
+    if not image_files:
+        print(f"指定されたディレクトリ '{dir}' に画像ファイルが見つかりませんでした")
+        return
+    
+    total_images = len(image_files)
+    print(f"処理する画像ファイル数: {total_images}")
+    print(f"バッチサイズ: {batch_size}")
+    
+    # バッチ処理
+    for batch_start in range(0, total_images, batch_size):
+        batch_end = min(batch_start + batch_size, total_images)
+        current_batch_size = batch_end - batch_start
+        print(f"\nバッチ処理中: {batch_start+1}～{batch_end}/{total_images}")
+        
+        try:
+            # バッチ用の入力データを準備
+            batch_inputs = []
+            batch_images = []
+            batch_paths = []
+            
+            # バッチ内の各画像を前処理
+            for i in range(batch_start, batch_end):
+                image_path = image_files[i]
+                try:
+                    original_image, input_data = preprocess_image(image_path)
+                    batch_inputs.append(input_data[0])  # バッチ次元を除去
+                    batch_images.append(original_image)
+                    batch_paths.append(image_path)
+                except Exception as e:
+                    print(f"画像の前処理でエラー ({image_path}): {e}")
+                    continue
+            
+            if not batch_inputs:
+                continue
+            
+            # バッチ入力の作成
+            batch_input = np.stack(batch_inputs, axis=0)
+            
+            # 入力データ型の調整
+            expected_input_type = session.get_inputs()[0].type
+            if "float16" in expected_input_type:
+                batch_input = batch_input.astype(np.float16)
+            else:
+                batch_input = batch_input.astype(np.float32)
+            
+            # バッチ推論の実行
+            input_name = session.get_inputs()[0].name
+            output_name = session.get_outputs()[0].name
+            
+            start_time = time.time()
+            outputs = session.run([output_name], {input_name: batch_input})[0]
+            inference_time = time.time() - start_time
+            print(f"バッチ推論が {inference_time:.3f} 秒で完了しました")
+            print(f"画像あたりの平均推論時間: {inference_time/current_batch_size:.3f} 秒")
+            
+            # バッチ内の各画像の結果を処理
+            for idx, (original_image, image_path, output) in enumerate(zip(batch_images, batch_paths, outputs)):
+                try:
+                    # 出力の後処理
+                    output = np.nan_to_num(output, nan=0.0, posinf=100.0, neginf=-100.0)
+                    output = 1 / (1 + np.exp(-output))  # シグモイド関数
+                    
+                    # タグの取得
+                    predictions = get_tags(output, labels, gen_threshold, char_threshold)
+                    
+                    # 出力パスの設定
+                    base_filename = os.path.splitext(os.path.basename(image_path))[0]
+                    if output_mode == "visualization":
+                        prediction_dir = "prediction"
+                        os.makedirs(prediction_dir, exist_ok=True)
+                        output_path = os.path.join(prediction_dir, f"{base_filename}.png")
+                    else:
+                        output_dir = os.path.dirname(image_path)
+                        output_path = os.path.join(output_dir, f"{base_filename}.txt")
+                    
+                    # 結果の保存
+                    if output_mode == "visualization":
+                        original_tags = read_tags_from_file(image_path)
+                        visualize_predictions(
+                            original_image,
+                            original_tags,
+                            predictions,
+                            threshold=gen_threshold,
+                            output_path=output_path
+                        )
+                    else:
+                        save_tags_as_csv(predictions, output_path, threshold=gen_threshold)
+                    
+                    print(f"処理完了 [{batch_start+idx+1}/{total_images}]: {image_path}")
+                    
+                except Exception as e:
+                    print(f"結果の保存でエラー ({image_path}): {e}")
+                    import traceback
+                    print(traceback.format_exc())
+        
+        except Exception as e:
+            print(f"バッチ処理でエラー: {e}")
+            import traceback
+            print(traceback.format_exc())
+    
+    print(f"\nバッチ処理が完了しました。{total_images}個のファイルを処理しました。")
+
 def main():
     parser = argparse.ArgumentParser(description='ONNXモデルを使用した画像タグ予測')
-    parser.add_argument('--image', type=str, required=True, help='予測する画像のパスまたはURL')
+    
+    # 入力関連の引数
+    input_group = parser.add_mutually_exclusive_group(required=True)
+    input_group.add_argument('--image', type=str, help='予測する画像のパスまたはURL')
+    input_group.add_argument('--dir', type=str, help='予測する画像ディレクトリのパス（バッチモード）')
+    
+    # モデル関連の引数
     parser.add_argument('--model', type=str, required=True, help='ONNXモデルのパス')
     parser.add_argument('--tag_mapping', type=str, required=True, help='タグマッピングJSONファイルのパス')
-    parser.add_argument('--output', type=str, default=None, help='結果画像の出力パス')
-    parser.add_argument('--gen_threshold', type=float, default=0.35, help='一般タグの閾値')
+    
+    # 出力関連の引数
+    parser.add_argument('--output', type=str, default=None, help='結果の出力パス（単一画像モードのみ）')
+    parser.add_argument('--output_mode', type=str, choices=['visualization', 'tags'], default='visualization',
+                        help='出力モード: visualization=可視化画像, tags=カンマ区切りタグ')
+    
+    # 閾値関連の引数
+    parser.add_argument('--gen_threshold', type=float, default=0.45, help='一般タグの閾値')
     parser.add_argument('--char_threshold', type=float, default=0.45, help='キャラクタータグの閾値')
+    
+    # その他のオプション
     parser.add_argument('--gpu', action='store_true', help='GPUを使用して推論を実行')
+    parser.add_argument('--recursive', action='store_true', help='ディレクトリモードでサブディレクトリも処理する')
+    
+    # バッチサイズの引数を追加
+    parser.add_argument('--batch_size', type=int, default=1, help='バッチ処理時のバッチサイズ')
     
     args = parser.parse_args()
     
-    predict_with_onnx(
-        args.image,
-        args.model,
-        args.tag_mapping,
-        args.gen_threshold,
-        args.char_threshold,
-        args.output,
-        use_gpu=args.gpu
-    )
+    # 単一画像モード
+    if args.image:
+        predict_with_onnx(
+            args.image,
+            args.model,
+            args.tag_mapping,
+            args.gen_threshold,
+            args.char_threshold,
+            args.output,
+            use_gpu=args.gpu,
+            output_mode=args.output_mode
+        )
+    # バッチモード
+    elif args.dir:
+        batch_predict(
+            args.dir,
+            args.model,
+            args.tag_mapping,
+            args.gen_threshold,
+            args.char_threshold,
+            use_gpu=args.gpu,
+            output_mode=args.output_mode,
+            recursive=args.recursive,
+            batch_size=args.batch_size
+        )
 
 # GPUが利用可能かチェックする関数
 def check_gpu_availability():
