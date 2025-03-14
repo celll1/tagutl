@@ -45,13 +45,12 @@ def import_xformers():
         print("xformersをインポートできませんでした。pip install xformersでインストールしてください")
         return False
     
-# timmのattentionモジュールを上書きする関数
 def replace_timm_attn_with_xformers(model, use_xformers=False):
     """
-    timmのVision Transformerモデルのattentionをxformersのメモリ効率の良いバージョンに置き換える
+    EVA02モデルのattentionをxformersのメモリ効率の良いバージョンに置き換える
     
     Args:
-        model: timmのモデル
+        model: EVA02モデル
         use_xformers: xformersを使用するかどうか
     """
     if not use_xformers:
@@ -62,51 +61,117 @@ def replace_timm_attn_with_xformers(model, use_xformers=False):
         print("xformersが利用できないため、標準のattentionを使用します")
         return model
     
-    # モデル内のAttentionモジュールを検索して置き換え
-    import timm.models.vision_transformer
+    # モデル内のEvaAttentionモジュールを検索
+    import xformers.ops
+    from timm.models.eva import EvaAttention, apply_rot_embed_cat
     
-    # オリジナルのAttentionクラス
-    orig_attn = timm.models.vision_transformer.Attention
-    
-    # xformersを使用するAttentionクラス
-    class XFormersAttention(orig_attn):
-        def forward(self, x):
+    # xformers対応のEvaAttentionクラスを定義
+    class XFormersEvaAttention(nn.Module):
+        def __init__(self, original_module):
+            super().__init__()
+            # 元のモジュールから必要な属性をコピー
+            self.num_heads = original_module.num_heads
+            self.scale = original_module.scale
+            self.num_prefix_tokens = original_module.num_prefix_tokens
+            
+            # 元のモジュールから層をコピー
+            self.q_proj = original_module.q_proj
+            self.k_proj = original_module.k_proj
+            self.v_proj = original_module.v_proj
+            self.qkv = original_module.qkv
+            self.q_bias = original_module.q_bias
+            self.k_bias = original_module.k_bias
+            self.v_bias = original_module.v_bias
+            self.qkv_bias_separate = getattr(original_module, 'qkv_bias_separate', False)
+            
+            self.attn_drop = original_module.attn_drop
+            self.norm = original_module.norm
+            self.proj = original_module.proj
+            self.proj_drop = original_module.proj_drop
+            
+            # head_dimを計算
+            if self.q_proj is not None:
+                all_head_dim = self.q_proj.out_features
+            else:
+                all_head_dim = self.qkv.out_features // 3
+            self.head_dim = all_head_dim // self.num_heads
+            
+        def forward(self, x, rope=None, attn_mask=None):
             B, N, C = x.shape
-            qkv = self.qkv(x).reshape(B, N, 3, self.num_heads, C // self.num_heads).permute(2, 0, 3, 1, 4)
-            q, k, v = qkv.unbind(0)
+            
+            # 元のq, k, vの計算ロジックを再利用
+            if self.qkv is not None:
+                if self.q_bias is None:
+                    qkv = self.qkv(x)
+                else:
+                    qkv_bias = torch.cat((self.q_bias, self.k_bias, self.v_bias))
+                    if self.qkv_bias_separate:
+                        qkv = self.qkv(x)
+                        qkv += qkv_bias
+                    else:
+                        qkv = F.linear(x, weight=self.qkv.weight, bias=qkv_bias)
+                qkv = qkv.reshape(B, N, 3, self.num_heads, -1).permute(2, 0, 3, 1, 4)
+                q, k, v = qkv.unbind(0)  # B, num_heads, N, head_dim
+            else:
+                q = self.q_proj(x).reshape(B, N, self.num_heads, -1).transpose(1, 2)  # B, num_heads, N, C
+                k = self.k_proj(x).reshape(B, N, self.num_heads, -1).transpose(1, 2)
+                v = self.v_proj(x).reshape(B, N, self.num_heads, -1).transpose(1, 2)
+            
+            # ropeが指定されている場合は適用
+            if rope is not None:
+                npt = self.num_prefix_tokens
+                q = torch.cat([q[:, :, :npt, :], apply_rot_embed_cat(q[:, :, npt:, :], rope)], dim=2).type_as(v)
+                k = torch.cat([k[:, :, :npt, :], apply_rot_embed_cat(k[:, :, npt:, :], rope)], dim=2).type_as(v)
             
             # xformersのメモリ効率の良いattentionを使用
+            # attn_maskがある場合は対応するattn_biasを作成
+            attn_bias = None
+            if attn_mask is not None:
+                # xformersのattn_biasに変換
+                attn_bias = torch.zeros(
+                    (B, self.num_heads, N, N), device=x.device, dtype=x.dtype
+                )
+                attn_bias = attn_bias.masked_fill(
+                    ~attn_mask.bool().unsqueeze(1).unsqueeze(1), float("-inf")
+                )
+            
             x = xformers.ops.memory_efficient_attention(
                 q, k, v,
-                attn_bias=None,
+                attn_bias=attn_bias,
                 op=None  # 最適なattentionアルゴリズムを自動選択
             )
             
             # 元の形状に戻す
-            x = x.transpose(1, 2).reshape(B, N, C)
+            x = x.transpose(1, 2).reshape(B, N, -1)
+            
+            # 残りの処理（norm, proj層など）
+            x = self.norm(x)
             x = self.proj(x)
             x = self.proj_drop(x)
+            
             return x
     
-    # モデル内のAttentionモジュールを置き換え
+    # EvaAttentionクラスを特定して置き換え
+    replaced_count = 0
     for name, module in model.named_modules():
-        if isinstance(module, orig_attn):
+        if isinstance(module, EvaAttention):
+            # 親モジュールを取得
             parent_name = '.'.join(name.split('.')[:-1])
             child_name = name.split('.')[-1]
             
             if parent_name:
                 parent = model.get_submodule(parent_name)
-                setattr(parent, child_name, XFormersAttention(
-                    module.dim, module.num_heads, module.qkv_bias, module.attn_drop, module.proj_drop
-                ))
-            else:
-                setattr(model, child_name, XFormersAttention(
-                    module.dim, module.num_heads, module.qkv_bias, module.attn_drop, module.proj_drop
-                ))
+                
+                # 新しいXFormersEvaAttentionインスタンスを作成
+                new_attn = XFormersEvaAttention(module)
+                
+                # 置き換え
+                setattr(parent, child_name, new_attn)
+                replaced_count += 1
+                print(f"xformers対応に置き換え: {name}")
     
-    print("モデルのattentionをxformersのメモリ効率の良いバージョンに置き換えました")
+    print(f"モデルのattentionをxformersのメモリ効率の良いバージョンに置き換えました（{replaced_count}層）")
     return model
-
 
 # Loraレイヤーの定義
 class LoRALayer(nn.Module):
@@ -829,7 +894,7 @@ def load_model(model_path=None,
     
     # xformersを使用する場合はattentionを置き換え
     if use_xformers:
-        model.backbone = replace_timm_attn_with_xformers(model.backbone, use_xformers=True)
+        model = replace_timm_attn_with_xformers(model, use_xformers=True)
     
     model = model.to(device)
     model.eval()
