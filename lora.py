@@ -34,6 +34,80 @@ from tqdm.auto import tqdm
 # デバイスの設定
 torch_device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
+# xformersのインポート（オプション引数が有効な場合のみ）
+def import_xformers():
+    try:
+        import xformers
+        import xformers.ops
+        print("xformersが正常にインポートされました")
+        return True
+    except ImportError:
+        print("xformersをインポートできませんでした。pip install xformersでインストールしてください")
+        return False
+    
+# timmのattentionモジュールを上書きする関数
+def replace_timm_attn_with_xformers(model, use_xformers=False):
+    """
+    timmのVision Transformerモデルのattentionをxformersのメモリ効率の良いバージョンに置き換える
+    
+    Args:
+        model: timmのモデル
+        use_xformers: xformersを使用するかどうか
+    """
+    if not use_xformers:
+        return model
+    
+    # xformersが利用可能かチェック
+    if not import_xformers():
+        print("xformersが利用できないため、標準のattentionを使用します")
+        return model
+    
+    # モデル内のAttentionモジュールを検索して置き換え
+    import timm.models.vision_transformer
+    
+    # オリジナルのAttentionクラス
+    orig_attn = timm.models.vision_transformer.Attention
+    
+    # xformersを使用するAttentionクラス
+    class XFormersAttention(orig_attn):
+        def forward(self, x):
+            B, N, C = x.shape
+            qkv = self.qkv(x).reshape(B, N, 3, self.num_heads, C // self.num_heads).permute(2, 0, 3, 1, 4)
+            q, k, v = qkv.unbind(0)
+            
+            # xformersのメモリ効率の良いattentionを使用
+            x = xformers.ops.memory_efficient_attention(
+                q, k, v,
+                attn_bias=None,
+                op=None  # 最適なattentionアルゴリズムを自動選択
+            )
+            
+            # 元の形状に戻す
+            x = x.transpose(1, 2).reshape(B, N, C)
+            x = self.proj(x)
+            x = self.proj_drop(x)
+            return x
+    
+    # モデル内のAttentionモジュールを置き換え
+    for name, module in model.named_modules():
+        if isinstance(module, orig_attn):
+            parent_name = '.'.join(name.split('.')[:-1])
+            child_name = name.split('.')[-1]
+            
+            if parent_name:
+                parent = model.get_submodule(parent_name)
+                setattr(parent, child_name, XFormersAttention(
+                    module.dim, module.num_heads, module.qkv_bias, module.attn_drop, module.proj_drop
+                ))
+            else:
+                setattr(model, child_name, XFormersAttention(
+                    module.dim, module.num_heads, module.qkv_bias, module.attn_drop, module.proj_drop
+                ))
+    
+    print("モデルのattentionをxformersのメモリ効率の良いバージョンに置き換えました")
+    return model
+
+
 # Loraレイヤーの定義
 class LoRALayer(nn.Module):
     def __init__(self, in_features, out_features, rank=32, alpha=16.0):
@@ -533,7 +607,8 @@ def load_model(model_path=None,
                lora_alpha=None,
                lora_dropout=None,
                pretrained=True,
-               device=torch_device
+               device=torch_device,
+               use_xformers=False  # xformersを使用するかどうかのフラグを追加
     ) -> tuple[EVA02WithModuleLoRA, LabelData]:
     """モデルを読み込む関数"""
     print(f" === Load Model === ")
@@ -751,6 +826,10 @@ def load_model(model_path=None,
             raise ValueError(f"メタデータファイルが見つかりません: {metadata_path}")
     else:
         raise ValueError("モデルパスが指定されていません")  
+    
+    # xformersを使用する場合はattentionを置き換え
+    if use_xformers:
+        model.backbone = replace_timm_attn_with_xformers(model.backbone, use_xformers=True)
     
     model = model.to(device)
     model.eval()
@@ -2644,6 +2723,7 @@ def main():
     predict_parser.add_argument('--output_dir', type=str, default='predictions', help='予測結果を保存するディレクトリ')
     predict_parser.add_argument('--gen_threshold', type=float, default=None, help='一般タグの閾値')
     predict_parser.add_argument('--char_threshold', type=float, default=None, help='キャラクタータグの閾値')
+    predict_parser.add_argument('--xformers', action='store_true', help='xformersを使用してメモリ効率の良いattentionを有効化')
     
     # バッチ推論コマンド
     batch_parser = subparsers.add_parser('batch', help='複数の画像からタグを予測します')
@@ -2654,6 +2734,7 @@ def main():
     batch_parser.add_argument('--output_dir', type=str, default='predictions', help='予測結果を保存するディレクトリ')
     batch_parser.add_argument('--gen_threshold', type=float, default=None, help='一般タグの閾値')
     batch_parser.add_argument('--char_threshold', type=float, default=None, help='キャラクタータグの閾値')
+    batch_parser.add_argument('--xformers', action='store_true', help='xformersを使用してメモリ効率の良いattentionを有効化')
     
     # トレーニングコマンド
     train_parser = subparsers.add_parser('train', help='LoRAモデルをトレーニングします')
@@ -2709,6 +2790,8 @@ def main():
     train_parser.add_argument('--bind_all', action='store_true', help='TensorBoardをすべてのネットワークインターフェースにバインドする')
     train_parser.add_argument('--seed', type=int, default=42, help='乱数シード')
 
+    train_parser.add_argument('--xformers', action='store_true', help='xformersを使用してメモリ効率の良いattentionを有効化')
+
     # モデルマージコマンド
     merge_parser = subparsers.add_parser('merge', help='LoRAモデルをマージします')
 
@@ -2726,7 +2809,7 @@ def main():
     lora: LoRAモデルを元のモデルにマージし、LoRA層を削除する
     """
     
-    debug_parser = subparsers.add_parser('debug', help='モデルのデバッグを行います')
+    # debug_parser = subparsers.add_parser('debug', help='モデルのデバッグを行います')
 
     args = parser.parse_args()
     
@@ -2740,7 +2823,7 @@ def main():
         print(f"使用デバイス: {device}")
 
         # 単一画像の予測
-        model, labels = load_model(args.model_path, args.metadata_path, base_model=args.base_model, device=device)
+        model, labels = load_model(args.model_path, args.metadata_path, base_model=args.base_model, device=device, use_xformers=args.xformers)
         
         # 画像に紐づくタグを読み込む
         actual_tags = read_tags_from_file(args.image)
@@ -2812,7 +2895,7 @@ def main():
         print(f"使用デバイス: {device}")
 
         # モデルの読み込み
-        model, labels = load_model(args.model_path, args.metadata_path, base_model=args.base_model, device=device)
+        model, labels = load_model(args.model_path, args.metadata_path, base_model=args.base_model, device=device, use_xformers=args.xformers)
         
         # 画像ファイルのリストを取得
         import glob
@@ -2885,7 +2968,7 @@ def main():
         print(f"使用デバイス: {device}")
 
         print(f"モデルを読み込んでいます...")
-        model, labels = load_model(args.model_path, args.metadata_path, base_model=args.base_model, lora_rank=args.lora_rank, lora_alpha=args.lora_alpha, lora_dropout=args.lora_dropout, device=device)
+        model, labels = load_model(args.model_path, args.metadata_path, base_model=args.base_model, lora_rank=args.lora_rank, lora_alpha=args.lora_alpha, lora_dropout=args.lora_dropout, device=device, use_xformers=args.xformers)
         
         # ターゲットモジュールの読み込み
         target_modules = None
@@ -3027,7 +3110,7 @@ def main():
             mixed_precision=args.mixed_precision,
             tensorboard=True,
             initial_threshold=args.initial_threshold,
-            dynamic_threshold=args.dynamic_threshold
+            dynamic_threshold=args.dynamic_threshold,
         )
         
         print("トレーニングが完了しました！")
