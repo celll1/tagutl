@@ -783,13 +783,13 @@ def debug_preprocessing(image_path):
     
     print("前処理のデバッグ画像を保存しました: preprocessing_debug.png")
 
-def batch_predict(dir, model_path, tag_mapping_path, gen_threshold=0.45, char_threshold=0.45, 
+def batch_predict(dirs, model_path, tag_mapping_path, gen_threshold=0.45, char_threshold=0.45, 
                  use_gpu=False, output_mode="visualization", recursive=False, batch_size=1):
     """
-    ディレクトリ内の画像に対してバッチ推論を実行する
+    複数のディレクトリ内の画像に対してバッチ推論を実行する
     
     Args:
-        dir: 画像ディレクトリのパス
+        dirs: 入力画像ディレクトリのパスのリスト
         model_path: ONNXモデルのパス
         tag_mapping_path: タグマッピングJSONファイルのパス
         gen_threshold: 一般タグの閾値
@@ -848,24 +848,33 @@ def batch_predict(dir, model_path, tag_mapping_path, gen_threshold=0.45, char_th
     print(f"タグマッピングを読み込み中: {tag_mapping_path}")
     labels, idx_to_tag, tag_to_category = load_tag_mapping(tag_mapping_path)
     
-    # 画像ファイルのリストを取得
+    # 全ディレクトリから画像ファイルのリストを取得
     image_files = []
-    if recursive:
-        for root, _, files in os.walk(dir):
-            for file in files:
+    for dir_path in dirs:
+        if not os.path.exists(dir_path):
+            print(f"警告: ディレクトリが存在しません: {dir_path}")
+            continue
+            
+        dir_files = []
+        if recursive:
+            for root, _, files in os.walk(dir_path):
+                for file in files:
+                    if file.lower().endswith(('.jpg', '.jpeg', '.png', '.bmp', '.webp')):
+                        dir_files.append(os.path.join(root, file))
+        else:
+            for file in os.listdir(dir_path):
                 if file.lower().endswith(('.jpg', '.jpeg', '.png', '.bmp', '.webp')):
-                    image_files.append(os.path.join(root, file))
-    else:
-        for file in os.listdir(dir):
-            if file.lower().endswith(('.jpg', '.jpeg', '.png', '.bmp', '.webp')):
-                image_files.append(os.path.join(dir, file))
+                    dir_files.append(os.path.join(dir_path, file))
+        
+        print(f"ディレクトリ '{dir_path}' から {len(dir_files)} 個の画像を見つけました")
+        image_files.extend(dir_files)
     
     if not image_files:
-        print(f"指定されたディレクトリ '{dir}' に画像ファイルが見つかりませんでした")
+        print("処理する画像ファイルが見つかりませんでした")
         return
     
     total_images = len(image_files)
-    print(f"処理する画像ファイル数: {total_images}")
+    print(f"合計処理する画像ファイル数: {total_images}")
     print(f"バッチサイズ: {batch_size}")
     
     # バッチ処理
@@ -968,7 +977,7 @@ def main():
     # 入力関連の引数
     input_group = parser.add_mutually_exclusive_group(required=True)
     input_group.add_argument('--image', type=str, help='予測する画像のパスまたはURL')
-    input_group.add_argument('--dir', type=str, help='予測する画像ディレクトリのパス（バッチモード）')
+    input_group.add_argument('--dirs', type=str, nargs='+', help='予測する画像ディレクトリのパス（複数指定可）')
     
     # モデル関連の引数
     parser.add_argument('--model', type=str, required=True, help='ONNXモデルのパス')
@@ -992,7 +1001,6 @@ def main():
     
     args = parser.parse_args()
     
-    # 単一画像モード
     if args.image:
         predict_with_onnx(
             args.image,
@@ -1004,10 +1012,9 @@ def main():
             use_gpu=args.gpu,
             output_mode=args.output_mode
         )
-    # バッチモード
-    elif args.dir:
+    elif args.dirs:
         batch_predict(
-            args.dir,
+            args.dirs,  # 複数ディレクトリを渡す
             args.model,
             args.tag_mapping,
             args.gen_threshold,

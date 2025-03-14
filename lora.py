@@ -14,6 +14,7 @@ from collections import defaultdict
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
+from matplotlib.lines import Line2D
 import math
 import torch
 from huggingface_hub import hf_hub_download
@@ -975,7 +976,7 @@ def visualize_predictions(image, tags, predictions, threshold=0.35, output_path=
         plt.show()
         return None
     
-def visualize_predictions_for_tensorboard(img_tensor, probs, idx_to_tag, threshold=0.35, original_tags=None, tag_to_category=None):
+def visualize_predictions_for_tensorboard(img_tensor, probs, idx_to_tag, threshold=0.35, original_tags=None, tag_to_category=None, neg_means=None, neg_variance=None, neg_counts=None):
     """
     TensorBoard 用に可視化した結果の画像を生成し、HWC形式のNumPy配列を返す関数。
     
@@ -986,6 +987,9 @@ def visualize_predictions_for_tensorboard(img_tensor, probs, idx_to_tag, thresho
         threshold: タグの表示に用いる閾値
         original_tags: グラウンドトゥルースラベル (binary numpy配列または torch.Tensor, shape: (num_classes,))
         tag_to_category: タグからカテゴリへのマッピング辞書
+        neg_means: 陰性群の平均値
+        neg_variance: 陰性群の分散
+        neg_counts: 陰性群のサンプル数
     """
     import matplotlib.pyplot as plt
     import numpy as np
@@ -1109,14 +1113,89 @@ def visualize_predictions_for_tensorboard(img_tensor, probs, idx_to_tag, thresho
         axs[1].text(threshold, len(tag_names) - 1, f'Threshold: {threshold}', 
                     horizontalalignment='right', verticalalignment='bottom')
     
+    # 陰性群の平均値を追加
+    if all(x is not None for x in [neg_means, neg_variance, neg_counts]):
+        # タグごとのインデックスを取得
+        for i, (tag, prob, category) in enumerate(all_display):
+            # 偽陽性（赤いバー）のタグのみを処理
+            if colors[i] == 'red':
+                # 元のインデックスを取得
+                tag_idx = [idx for idx, t in idx_to_tag.items() if t == tag][0]
+                
+                mean_val = neg_means[tag_idx]
+                std_val = np.sqrt(neg_variance[tag_idx])
+                n = neg_counts[tag_idx]
+                
+                # シグモイド関数の出力値を対数オッズに戻す
+                mean_logit = np.log(mean_val + 1e-7) - np.log(1 - mean_val + 1e-7)
+                
+                # ロジットスケールでの標準誤差を計算
+                # デルタ法による分散の伝播
+                sigmoid_derivative = mean_val * (1 - mean_val)
+                std_logit = std_val / sigmoid_derivative
+                
+                # 95%信頼区間の計算（ロジットスケール）
+                from scipy import stats
+
+                eps = 0.0005 / len(neg_means) # Bonferroni correction
+
+                if n < 30:
+                    ci_logit = stats.t.ppf(1-eps, df=n-1) * (std_logit / np.sqrt(n))
+                else:
+                    ci_logit = stats.norm.ppf(1-eps) * (std_logit / np.sqrt(n))
+                
+                # ロジットスケールの信頼区間を確率スケールに変換
+                ci_lower = 1 / (1 + np.exp(-(mean_logit - ci_logit)))
+                ci_upper = 1 / (1 + np.exp(-(mean_logit + ci_logit)))
+                # 有意な統計情報がある場合のみ表示
+                if mean_val > 0 and n >= 5:  # サンプル数が5以上の場合のみ表示
+                    # 平均値をシアンのドットで表示
+                    axs[1].scatter(
+                        mean_val,
+                        i,
+                        color='blue',
+                        alpha=0.7,
+                        s=30,
+                        zorder=5
+                    )
+                    
+                    # 95%信頼区間をエラーバーとして表示
+                    axs[1].hlines(
+                        y=i,
+                        xmin=ci_lower,
+                        xmax=ci_upper,
+                        color='blue',
+                        alpha=0.5,
+                        linewidth=2,
+                        zorder=4
+                    )
+                    
+                    # 統計情報をテキストで表示
+                    stats_text = f'{ci_lower:.2f} ~ {ci_upper:.2f}'
+                    
+                    # テキストの位置を調整（信頼区間の右端から少し離す）
+                    text_x = min(ci_upper + 0.02, 0.98)
+                    axs[1].text(
+                        x=text_x,          # x座標
+                        y=i,               # y座標
+                        s=stats_text,      # 表示テキスト
+                        color='blue',
+                        alpha=1,
+                        fontsize=10,
+                        verticalalignment='center'
+                    )
+
     # 凡例の追加
     from matplotlib.patches import Patch
+    from matplotlib.lines import Line2D
     legend_elements = [
-        Patch(facecolor='green', label='True Positive (threshold+ & in tags)'),
-        Patch(facecolor='red', label='False Positive (threshold+ & not in tags)'),
-        Patch(facecolor='blue', label='False Negative (threshold- & in tags)')
+        Patch(facecolor='green', label='True Positive'),
+        Patch(facecolor='red', label='False Positive'),
+        Patch(facecolor='blue', label='False Negative'),
+        Line2D([0], [0], color='cyan', marker='o', linestyle='-', 
+               label='Neg. Mean & 95% CI', markersize=5, alpha=0.7)
     ]
-    axs[1].legend(handles=legend_elements, loc='upper right')
+    axs[1].legend(handles=legend_elements, loc='lower right', fontsize=8)
     
     plt.tight_layout()
     # プロットをPIL画像に変換
@@ -1128,7 +1207,6 @@ def visualize_predictions_for_tensorboard(img_tensor, probs, idx_to_tag, thresho
     # PIL画像をテンソルに変換
     pil_img = Image.open(buf)
     img_tensor = transforms.ToTensor()(pil_img)
-    
     return img_tensor
 
 def analyze_model_structure(base_model='SmilingWolf/wd-eva02-large-tagger-v3'):
@@ -1516,7 +1594,113 @@ class AsymmetricLossOptimized(nn.Module):
         return -self.loss.mean()
 
 
-# 評価指標の計算関数
+# # 評価指標の計算関数
+# def compute_metrics(outputs, targets):
+#     """
+#     評価指標を計算する関数
+    
+#     Args:
+#         outputs: モデルの出力（シグモイド適用済み）
+#         targets: 正解ラベル
+#         thresholds: 閾値のリスト（Noneの場合は0.1から0.9まで0.05刻み）
+    
+#     Returns:
+#         metrics: 評価指標の辞書
+#     """
+#     import matplotlib.pyplot as plt
+#     from PIL import Image as PILImage
+#     import io
+#     from torchvision import transforms
+#     from sklearn.metrics import precision_recall_curve, auc, f1_score
+       
+#     thresholds = np.arange(0.1, 0.9, 0.05)
+    
+#     # CPU上のnumpy配列に変換
+#     if isinstance(outputs, torch.Tensor):
+#         outputs_np = outputs.cpu().numpy()
+#     else:
+#         outputs_np = outputs
+
+#     if isinstance(targets, torch.Tensor):
+#         targets_np = targets.cpu().numpy()
+#     else:
+#         targets_np = targets
+    
+#     num_classes = targets_np.shape[1]
+#     f1_scores = np.zeros((len(thresholds), num_classes))
+#     pr_auc_scores = []
+    
+#     # 各クラスごとのPR曲線とF1スコアを計算
+#     for i in tqdm(range(num_classes), desc="Calculating PR-AUC and F1 scores", leave=False):
+#         # クラスiのデータが十分にある場合のみ計算
+#         if np.sum(targets_np[:, i]) > 0:
+#             precision, recall, _ = precision_recall_curve(targets_np[:, i], outputs_np[:, i])
+#             pr_auc = auc(recall, precision)
+#             pr_auc_scores.append(pr_auc)
+            
+#             # 各閾値でのF1スコアを計算
+#             for t_idx, threshold in enumerate(thresholds):
+#                 preds = (outputs_np[:, i] >= threshold).astype(int)
+#                 if np.sum(preds) > 0:  # 予測に陽性がある場合のみ
+#                     f1 = f1_score(targets_np[:, i], preds)
+#                     f1_scores[t_idx, i] = f1
+    
+#     # 平均PR-AUC
+#     macro_pr_auc = np.mean(pr_auc_scores) if pr_auc_scores else 0
+    
+#     # 各閾値でのマクロF1スコア（クラス平均）
+#     macro_f1_scores = np.mean(f1_scores, axis=1)
+    
+#     # 最適な閾値を選択（マクロF1スコアが最大となる閾値）
+#     best_threshold_idx = np.argmax(macro_f1_scores)
+#     best_threshold = thresholds[best_threshold_idx]
+#     best_macro_f1 = macro_f1_scores[best_threshold_idx]
+    
+#     # 最適な閾値での予測を作成
+#     predictions = (outputs_np >= best_threshold).astype(int)
+    
+#     # クラスごとのF1スコア
+#     class_f1_scores = []
+#     for i in range(num_classes):
+#         if np.sum(predictions[:, i]) > 0 and np.sum(targets_np[:, i]) > 0:
+#             class_f1 = f1_score(targets_np[:, i], predictions[:, i])
+#             class_f1_scores.append(class_f1)
+    
+#     # マクロF1スコア（クラス平均）
+#     macro_f1 = np.mean(class_f1_scores) if class_f1_scores else 0
+    
+#     # F1スコア vs 閾値のプロット生成
+#     fig, ax = plt.subplots(figsize=(10, 6))
+#     for t_idx, threshold in enumerate(thresholds):
+#         ax.plot(t_idx, macro_f1_scores[t_idx], 'bo')
+#     ax.plot(best_threshold_idx, best_macro_f1, 'ro', markersize=10)
+#     ax.set_xticks(range(len(thresholds)))
+#     ax.set_xticklabels([f"{t:.2f}" for t in thresholds], rotation=45)
+#     ax.set_xlabel('Threshold')
+#     ax.set_ylabel('Macro F1 Score')
+#     ax.set_title(f'Macro F1 Score vs Threshold (Optimal Value: {best_threshold:.2f})')
+#     ax.grid(True)
+    
+#     # プロットをバイトストリームに変換
+#     buf = io.BytesIO()
+#     fig.tight_layout()
+#     plt.savefig(buf, format='png')
+#     plt.close(fig)
+#     buf.seek(0)
+    
+#     # 画像をテンソルに変換
+#     plot_image = transforms.ToTensor()(PILImage.open(buf))
+    
+#     metrics = {
+#         'pr_auc': macro_pr_auc,
+#         'f1': macro_f1,
+#         'threshold': best_threshold,
+#         'class_f1s': class_f1_scores,
+#         'f1_vs_threshold_plot': plot_image
+#     }
+    
+#     return metrics
+
 def compute_metrics(outputs, targets):
     """
     評価指標を計算する関数
@@ -1524,20 +1708,23 @@ def compute_metrics(outputs, targets):
     Args:
         outputs: モデルの出力（シグモイド適用済み）
         targets: 正解ラベル
-        thresholds: 閾値のリスト（Noneの場合は0.1から0.9まで0.05刻み）
     
     Returns:
-        metrics: 評価指標の辞書
+        metrics: 評価指標の辞書。さらに各クラスごとの最適な閾値も追加される。
     """
     import matplotlib.pyplot as plt
     from PIL import Image as PILImage
     import io
     from torchvision import transforms
     from sklearn.metrics import precision_recall_curve, auc, f1_score
-       
+    from tqdm import tqdm
+    import numpy as np
+    import torch
+    
+    # 閾値の設定（0.1～0.85まで0.05刻み）
     thresholds = np.arange(0.1, 0.9, 0.05)
     
-    # CPU上のnumpy配列に変換
+    # テンソルの場合はNumPy配列に変換
     if isinstance(outputs, torch.Tensor):
         outputs_np = outputs.cpu().numpy()
     else:
@@ -1549,61 +1736,85 @@ def compute_metrics(outputs, targets):
         targets_np = targets
     
     num_classes = targets_np.shape[1]
-    f1_scores = np.zeros((len(thresholds), num_classes))
     pr_auc_scores = []
     
-    # 各クラスごとのPR曲線とF1スコアを計算
+    # 各クラスごとにPR曲線とAUCを計算
     for i in tqdm(range(num_classes), desc="Calculating PR-AUC and F1 scores", leave=False):
-        # クラスiのデータが十分にある場合のみ計算
         if np.sum(targets_np[:, i]) > 0:
             precision, recall, _ = precision_recall_curve(targets_np[:, i], outputs_np[:, i])
             pr_auc = auc(recall, precision)
             pr_auc_scores.append(pr_auc)
-            
-            # 各閾値でのF1スコアを計算
-            for t_idx, threshold in enumerate(thresholds):
-                preds = (outputs_np[:, i] >= threshold).astype(int)
-                if np.sum(preds) > 0:  # 予測に陽性がある場合のみ
-                    f1 = f1_score(targets_np[:, i], preds)
-                    f1_scores[t_idx, i] = f1
     
     # 平均PR-AUC
     macro_pr_auc = np.mean(pr_auc_scores) if pr_auc_scores else 0
     
-    # 各閾値でのマクロF1スコア（クラス平均）
-    macro_f1_scores = np.mean(f1_scores, axis=1)
+    # 各閾値でのマクロF1スコアを計算（予測にも正解にも陽性があるクラスのみ）
+    macro_f1_scores = []
+    for threshold in thresholds:
+        preds = (outputs_np >= threshold).astype(int)
+        class_f1_scores_threshold = []
+        for i in range(num_classes):
+            if np.sum(preds[:, i]) > 0 and np.sum(targets_np[:, i]) > 0:
+                f1 = f1_score(targets_np[:, i], preds[:, i])
+                class_f1_scores_threshold.append(f1)
+        if class_f1_scores_threshold:
+            macro_f1_scores.append(np.mean(class_f1_scores_threshold))
+        else:
+            macro_f1_scores.append(0)
+    macro_f1_scores = np.array(macro_f1_scores)
     
-    # 最適な閾値を選択（マクロF1スコアが最大となる閾値）
+    # 最適な閾値（全体のマクロF1スコアが最大となる閾値）の選択
     best_threshold_idx = np.argmax(macro_f1_scores)
     best_threshold = thresholds[best_threshold_idx]
     best_macro_f1 = macro_f1_scores[best_threshold_idx]
     
-    # 最適な閾値での予測を作成
+    # 最適な閾値での予測作成
     predictions = (outputs_np >= best_threshold).astype(int)
     
-    # クラスごとのF1スコア
+    # 最適な閾値で、予測と正解に陽性があるクラスのみF1スコアを計算（個別クラスのF1）
     class_f1_scores = []
     for i in range(num_classes):
         if np.sum(predictions[:, i]) > 0 and np.sum(targets_np[:, i]) > 0:
             class_f1 = f1_score(targets_np[:, i], predictions[:, i])
             class_f1_scores.append(class_f1)
     
-    # マクロF1スコア（クラス平均）
+    # 最終的なマクロF1スコア（フィルタリング付き）
     macro_f1 = np.mean(class_f1_scores) if class_f1_scores else 0
     
-    # F1スコア vs 閾値のプロット生成
+    # --- ここから各クラスごとの最適閾値の計算 ---
+    class_best_thresholds = []
+    # 各クラスごとに、全閾値でのF1スコアを求める
+    for i in range(num_classes):
+        best_thresh = None
+        best_f1 = 0
+        # 正例があるクラスのみ計算
+        if np.sum(targets_np[:, i]) > 0:
+            for threshold in thresholds:
+                preds = (outputs_np[:, i] >= threshold).astype(int)
+                # 予測と正解両方に陽性がある場合のみF1を計算
+                if np.sum(preds) > 0 and np.sum(targets_np[:, i]) > 0:
+                    f1 = f1_score(targets_np[:, i], preds)
+                    if f1 > best_f1:
+                        best_f1 = f1
+                        best_thresh = threshold
+        else:
+            best_thresh = best_threshold
+        class_best_thresholds.append(best_thresh)
+    # --- ここまで各クラスごとの最適閾値の計算 ---
+    
+    # F1スコアと閾値の関係のプロット生成
     fig, ax = plt.subplots(figsize=(10, 6))
-    for t_idx, threshold in enumerate(thresholds):
-        ax.plot(t_idx, macro_f1_scores[t_idx], 'bo')
-    ax.plot(best_threshold_idx, best_macro_f1, 'ro', markersize=10)
+    ax.plot(range(len(thresholds)), macro_f1_scores, 'bo-', label="Macro F1 Score")
+    ax.plot(best_threshold_idx, best_macro_f1, 'ro', markersize=10, label="Best Threshold")
     ax.set_xticks(range(len(thresholds)))
     ax.set_xticklabels([f"{t:.2f}" for t in thresholds], rotation=45)
     ax.set_xlabel('Threshold')
     ax.set_ylabel('Macro F1 Score')
     ax.set_title(f'Macro F1 Score vs Threshold (Optimal Value: {best_threshold:.2f})')
     ax.grid(True)
+    ax.legend()
     
-    # プロットをバイトストリームに変換
+    # プロット画像をバイトストリームに変換
     buf = io.BytesIO()
     fig.tight_layout()
     plt.savefig(buf, format='png')
@@ -1618,7 +1829,8 @@ def compute_metrics(outputs, targets):
         'f1': macro_f1,
         'threshold': best_threshold,
         'class_f1s': class_f1_scores,
-        'f1_vs_threshold_plot': plot_image
+        'f1_vs_threshold_plot': plot_image,
+        'class_best_thresholds': class_best_thresholds  # 追加：各クラスごとの最適な閾値リスト
     }
     
     return metrics
@@ -1790,6 +2002,9 @@ def train_model(
     val_loss = 0.0
     val_preds = []
     val_targets = []
+
+    val_neg_preds = []
+    val_pos_preds = []
     
     with torch.no_grad():
         progress_bar = tqdm(val_loader, desc=f"Initial Validation")
@@ -1809,7 +2024,13 @@ def train_model(
             
             # シグモイド関数で確率に変換
             probs = torch.sigmoid(outputs).cpu().numpy()
+            neg_probs = torch.sigmoid(outputs)*(1-targets)
+            neg_probs = neg_probs.cpu().numpy()  # CPUに移動してからNumPy配列に変換
+            pos_probs = torch.sigmoid(outputs)*targets
+            pos_probs = pos_probs.cpu().numpy()  # CPUに移動してからNumPy配列に変換
             val_preds.append(probs)
+            val_neg_preds.append(neg_probs)
+            val_pos_preds.append(pos_probs)
             val_targets.append(targets.cpu().numpy())
             
             progress_bar.set_postfix({"loss": f"{loss.item():.4f}"})
@@ -1823,6 +2044,77 @@ def train_model(
     
     # 検証メトリクスの計算
     val_loss /= len(val_loader)
+    
+    def calculate_group_stats(preds_list):
+        """
+        予測値の平均と分散を計算する関数
+        
+        Args:
+            preds_list: バッチごとの予測値のリスト
+            num_classes: クラス数
+            
+        Returns:
+            stats: 平均、分散、サンプル数を含む辞書
+        """
+        # 各タグごとの統計量を格納する配列
+        sum_vals = np.zeros(preds_list[0].shape[1])
+        count = np.zeros(preds_list[0].shape[1])
+        sq_sum = np.zeros(preds_list[0].shape[1])  # 二乗和（分散計算用）
+
+        # バッチごとの統計量を集計
+        for batch in preds_list:
+            for pred in batch:
+                # シグモイド関数の出力値を対数オッズに戻す
+                # logit(p) = log(p/(1-p))
+                logits = np.log(pred + 1e-7) - np.log(1 - pred + 1e-7)
+                
+                # マスク（サンプルの特定）
+                mask = pred > 0
+                
+                # 統計量の更新
+                sum_vals[mask] += logits[mask]
+                count[mask] += 1
+                sq_sum[mask] += logits[mask] ** 2
+        
+        # ゼロ除算を防ぐ
+        count = np.maximum(count, 1)
+        
+        # 平均と分散を計算（logitスケール）
+        means_logit = sum_vals / count
+        variance_logit = (sq_sum / count) - (means_logit ** 2)
+        
+        # logitスケールから確率スケールに変換
+        means = 1 / (1 + np.exp(-means_logit))
+        
+        # 分散の伝播（デルタ法）
+        # Var(sigmoid(x)) ≈ (sigmoid'(μ))^2 * Var(x)
+        sigmoid_derivative = means * (1 - means)
+        variance = (sigmoid_derivative ** 2) * variance_logit
+
+        # 結果を返す
+        return {
+            'means': means,
+            'variance': variance,
+            'counts': count
+        }
+
+    # 陽性群と陰性群の統計を計算
+    pos_stats = calculate_group_stats(val_pos_preds)
+    neg_stats = calculate_group_stats(val_neg_preds)
+    
+    # 上位と下位の統計情報を表示
+    tag_indices = list(range(len(neg_stats['means'])))
+    sorted_by_mean = sorted(tag_indices, key=lambda i: neg_stats['means'][i], reverse=True)
+    
+    print("\n陰性群の予測値が高いタグ（誤検出リスクが高い）:")
+    for i in sorted_by_mean[:10]:
+        tag_name = idx_to_tag[i] if i in idx_to_tag else f"Unknown({i})"
+        print(f"  {tag_name}: 平均={neg_stats['means'][i]:.4f}, 分散={neg_stats['variance'][i]:.4f}, サンプル数={int(neg_stats['counts'][i])}")
+    
+    print("\n陰性群の予測値が低いタグ（誤検出リスクが低い）:")
+    for i in sorted_by_mean[-10:]:
+        tag_name = idx_to_tag[i] if i in idx_to_tag else f"Unknown({i})"
+        print(f"  {tag_name}: 平均={neg_stats['means'][i]:.4f}, 分散={neg_stats['variance'][i]:.4f}, サンプル数={int(neg_stats['counts'][i])}")
     
     # リストに変換して結合
     val_preds_list = []
@@ -1918,7 +2210,17 @@ def train_model(
                 writer.add_scalar('Train/Step_Loss', loss.item(), epoch * len(train_loader) + i)
                 
                 if i % 100 == 0:
-                    img_grid = visualize_predictions_for_tensorboard(images[0], probs[0], idx_to_tag, threshold=threshold, original_tags=targets[0])
+                    img_grid = visualize_predictions_for_tensorboard(
+                        images[0], 
+                        probs[0], 
+                        idx_to_tag, 
+                        threshold=threshold, 
+                        original_tags=targets[0],
+                        tag_to_category=tag_to_category,
+                        neg_means=neg_stats['means'],  # 陰性群の平均値を追加
+                        neg_variance=neg_stats['variance'],  # 陰性群の分散を追加
+                        neg_counts=neg_stats['counts']  # 陰性群のサンプル数を追加
+                    )
                     writer.add_image(f'predictions/train_epoch_{epoch}', img_grid, i)
         
         # 学習率のスケジューリング
@@ -1972,6 +2274,9 @@ def train_model(
         val_loss = 0.0
         val_preds = []
         val_targets = []
+
+        val_neg_preds = []
+        val_pos_preds = []
         
         with torch.no_grad():
             progress_bar = tqdm(val_loader, desc=f"Validation")
@@ -1991,17 +2296,39 @@ def train_model(
                 
                 # シグモイド関数で確率に変換
                 probs = torch.sigmoid(outputs).cpu().numpy()
-                val_preds.append(probs)
+                neg_probs = torch.sigmoid(outputs)*(1-targets)  
+                neg_probs = neg_probs.cpu().numpy()  # CPUに移動してからNumPy配列に変換
+                pos_probs = torch.sigmoid(outputs)*targets
+                pos_probs = pos_probs.cpu().numpy()  # CPUに移動してからNumPy配列に変換
+                val_preds.append(probs) 
+                val_neg_preds.append(neg_probs)
+                val_pos_preds.append(pos_probs)
                 val_targets.append(targets.cpu().numpy())
                 
                 progress_bar.set_postfix({"loss": f"{loss.item():.4f}"})
 
-                if i % 5 == 0 and i / 5 < 10:
-                    img_grid = visualize_predictions_for_tensorboard(images[0], probs[0], idx_to_tag, threshold=threshold, original_tags=targets[0])
+                if i % 5 == 0 and i / 5 < 10:                        
+                    # 予測の可視化
+                    img_grid = visualize_predictions_for_tensorboard(
+                        images[0], 
+                        probs[0], 
+                        idx_to_tag, 
+                        threshold=threshold, 
+                        original_tags=targets[0],
+                        tag_to_category=tag_to_category,
+                        neg_means=neg_stats['means'],  # 陰性群の平均値を追加
+                        neg_variance=neg_stats['variance'],  # 陰性群の分散を追加
+                        neg_counts=neg_stats['counts']  # 陰性群のサンプル数を追加
+                    )
 
                     if tensorboard:
                         writer.add_image(f'predictions/val_{i}', img_grid, epoch+1)
-            
+
+
+        # 陽性群と陰性群の統計を計算
+        pos_stats = calculate_group_stats(val_pos_preds)
+        neg_stats = calculate_group_stats(val_neg_preds)
+
         # 検証メトリクスの計算
         val_loss /= len(val_loader)
         val_preds = np.concatenate(val_preds)
