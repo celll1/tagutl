@@ -47,59 +47,56 @@ def import_xformers():
     
 def replace_timm_attn_with_xformers(model, use_xformers=False):
     """
-    EVA02モデルのattentionをxformersのメモリ効率の良いバージョンに置き換える
-    
+    EVA02モデルのattentionをxformersのメモリ効率の良いバージョンに置き換えます。
+
+    ※注意:
+       - attn_mask は元々利用されていないため、今回の乖離はスケーリングのタイミングに起因している可能性が高いです。
+       - そのため、事前に q に対して self.scale を掛けるのではなく、xformers に内部スケーリングを任せます。
+
     Args:
         model: EVA02モデル
         use_xformers: xformersを使用するかどうか
     """
     if not use_xformers:
         return model
-    
-    # xformersが利用可能かチェック
+
     if not import_xformers():
         print("xformersが利用できないため、標準のattentionを使用します")
         return model
-    
-    # モデル内のEvaAttentionモジュールを検索
+
+    print("xformersが正常にインポートされました")
+
     import xformers.ops
     from timm.models.eva import EvaAttention, apply_rot_embed_cat
-    
-    # xformers対応のEvaAttentionクラスを定義
+
     class XFormersEvaAttention(nn.Module):
         def __init__(self, original_module):
             super().__init__()
-            # 元のモジュールから必要な属性をコピー
+            # 属性のコピー
             self.num_heads = original_module.num_heads
             self.scale = original_module.scale
             self.num_prefix_tokens = original_module.num_prefix_tokens
-            
-            # 元のモジュールから層をコピー
+            self.fused_attn = False  # xformers利用時はFalse
+            self.qkv_bias_separate = getattr(original_module, 'qkv_bias_separate', False)
+
+            # 層のコピー
+            self.qkv = original_module.qkv
             self.q_proj = original_module.q_proj
             self.k_proj = original_module.k_proj
             self.v_proj = original_module.v_proj
-            self.qkv = original_module.qkv
             self.q_bias = original_module.q_bias
             self.k_bias = original_module.k_bias
             self.v_bias = original_module.v_bias
-            self.qkv_bias_separate = getattr(original_module, 'qkv_bias_separate', False)
-            
+
             self.attn_drop = original_module.attn_drop
             self.norm = original_module.norm
             self.proj = original_module.proj
             self.proj_drop = original_module.proj_drop
-            
-            # head_dimを計算
-            if self.q_proj is not None:
-                all_head_dim = self.q_proj.out_features
-            else:
-                all_head_dim = self.qkv.out_features // 3
-            self.head_dim = all_head_dim // self.num_heads
-            
+
         def forward(self, x, rope=None, attn_mask=None):
             B, N, C = x.shape
-            
-            # 元のq, k, vの計算ロジックを再利用
+
+            # q, k, v計算（連続性のためcontiguous()を呼ぶ）
             if self.qkv is not None:
                 if self.q_bias is None:
                     qkv = self.qkv(x)
@@ -110,66 +107,58 @@ def replace_timm_attn_with_xformers(model, use_xformers=False):
                         qkv += qkv_bias
                     else:
                         qkv = F.linear(x, weight=self.qkv.weight, bias=qkv_bias)
-                qkv = qkv.reshape(B, N, 3, self.num_heads, -1).permute(2, 0, 3, 1, 4)
-                q, k, v = qkv.unbind(0)  # B, num_heads, N, head_dim
+                qkv = qkv.reshape(B, N, 3, self.num_heads, -1).permute(2, 0, 3, 1, 4).contiguous()
+                q, k, v = qkv.unbind(0)  # 各テンソル shape: (B, num_heads, N, head_dim)
             else:
-                q = self.q_proj(x).reshape(B, N, self.num_heads, -1).transpose(1, 2)  # B, num_heads, N, C
-                k = self.k_proj(x).reshape(B, N, self.num_heads, -1).transpose(1, 2)
-                v = self.v_proj(x).reshape(B, N, self.num_heads, -1).transpose(1, 2)
-            
-            # ropeが指定されている場合は適用
+                q = self.q_proj(x).reshape(B, N, self.num_heads, -1).transpose(1, 2).contiguous()
+                k = self.k_proj(x).reshape(B, N, self.num_heads, -1).transpose(1, 2).contiguous()
+                v = self.v_proj(x).reshape(B, N, self.num_heads, -1).transpose(1, 2).contiguous()
+
+            # ropeの適用（rotary embedding）
             if rope is not None:
                 npt = self.num_prefix_tokens
                 q = torch.cat([q[:, :, :npt, :], apply_rot_embed_cat(q[:, :, npt:, :], rope)], dim=2).type_as(v)
                 k = torch.cat([k[:, :, :npt, :], apply_rot_embed_cat(k[:, :, npt:, :], rope)], dim=2).type_as(v)
-            
-            # xformersのメモリ効率の良いattentionを使用
-            # attn_maskがある場合は対応するattn_biasを作成
-            attn_bias = None
-            if attn_mask is not None:
-                # xformersのattn_biasに変換
-                attn_bias = torch.zeros(
-                    (B, self.num_heads, N, N), device=x.device, dtype=x.dtype
+
+            # ※ここでは q の事前スケーリングを削除します
+            # q = q * self.scale
+
+            # xformers の attention 呼び出し時に内部スケーリングを指定
+            try:
+                x_out = xformers.ops.memory_efficient_attention(
+                    q, k, v,
+                    attn_bias=None,  # attn_mask はもともと利用されていない前提
+                    p=self.attn_drop.p if self.training else 0.0,
+                    scale=self.scale,  # 内部でのスケーリングを行う
                 )
-                attn_bias = attn_bias.masked_fill(
-                    ~attn_mask.bool().unsqueeze(1).unsqueeze(1), float("-inf")
-                )
-            
-            x = xformers.ops.memory_efficient_attention(
-                q, k, v,
-                attn_bias=attn_bias,
-                op=None  # 最適なattentionアルゴリズムを自動選択
-            )
-            
-            # 元の形状に戻す
-            x = x.transpose(1, 2).reshape(B, N, -1)
-            
-            # 残りの処理（norm, proj層など）
-            x = self.norm(x)
-            x = self.proj(x)
-            x = self.proj_drop(x)
-            
-            return x
-    
-    # EvaAttentionクラスを特定して置き換え
+            except Exception as e:
+                print(f"xformersのattentionでエラーが発生しました: {e}")
+                print("標準のattentionにフォールバックします")
+                attn = (q @ k.transpose(-2, -1))
+                attn = attn.softmax(dim=-1)
+                attn = self.attn_drop(attn)
+                x_out = attn @ v
+
+            # 元の形状に戻し、正規化・投影処理
+            x_out = x_out.transpose(1, 2).reshape(B, N, -1)
+            x_out = self.norm(x_out)
+            x_out = self.proj(x_out)
+            x_out = self.proj_drop(x_out)
+            return x_out
+
+    # モデル内の EvaAttention モジュールを置換
     replaced_count = 0
     for name, module in model.named_modules():
         if isinstance(module, EvaAttention):
-            # 親モジュールを取得
             parent_name = '.'.join(name.split('.')[:-1])
             child_name = name.split('.')[-1]
-            
             if parent_name:
                 parent = model.get_submodule(parent_name)
-                
-                # 新しいXFormersEvaAttentionインスタンスを作成
                 new_attn = XFormersEvaAttention(module)
-                
-                # 置き換え
                 setattr(parent, child_name, new_attn)
                 replaced_count += 1
                 print(f"xformers対応に置き換え: {name}")
-    
+
     print(f"モデルのattentionをxformersのメモリ効率の良いバージョンに置き換えました（{replaced_count}層）")
     return model
 
@@ -507,7 +496,7 @@ class EVA02WithModuleLoRA(nn.Module):
                 # 適用されたLoRA層を記録
                 self.lora_layers[name] = lora_module
 
-        self._freeze_non_lora_parameters()
+        self.freeze_non_lora_parameters()
         
         print(f"Applied LoRA to {len(self.lora_layers)} modules")
 
@@ -546,7 +535,7 @@ class EVA02WithModuleLoRA(nn.Module):
         print(f"Removed LoRA from {removed_count} modules")
         return self
     
-    def _freeze_non_lora_parameters(self):
+    def freeze_non_lora_parameters(self):
         """LoRAパラメータ以外を凍結する"""
         # バックボーンのすべてのパラメータを凍結
         for param in self.backbone.parameters():
@@ -559,6 +548,14 @@ class EVA02WithModuleLoRA(nn.Module):
                     param.requires_grad = True
         
         # ヘッドのパラメータも訓練可能に設定
+        for param in self.backbone.head.parameters():
+            param.requires_grad = True
+
+    def freeze_non_head_parameters(self):
+        """ヘッドのパラメータのみ訓練可能に設定する"""
+        for param in self.backbone.parameters():
+            param.requires_grad = False
+
         for param in self.backbone.head.parameters():
             param.requires_grad = True
 
@@ -1630,7 +1627,7 @@ def prepare_dataset(
 
 # 非対称損失関数（ASL）の実装
 class AsymmetricLoss(nn.Module):
-    def __init__(self, gamma_neg=4, gamma_pos=1, clip=0.05, eps=1e-6, disable_torch_grad_focal_loss=False):
+    def __init__(self, gamma_neg=4, gamma_pos=1, clip=0.05, eps=1e-6, disable_torch_grad_focal_loss=False, neg_tanh=False):
         super(AsymmetricLoss, self).__init__()
 
         self.gamma_neg = gamma_neg
@@ -1638,6 +1635,7 @@ class AsymmetricLoss(nn.Module):
         self.clip = clip
         self.disable_torch_grad_focal_loss = disable_torch_grad_focal_loss
         self.eps = eps
+        self.neg_tanh = neg_tanh
 
     def forward(self, x, y):
         """"
@@ -1657,7 +1655,8 @@ class AsymmetricLoss(nn.Module):
 
         # Basic CE calculation
         los_pos = y * torch.log(xs_pos.clamp(min=self.eps))
-        los_neg = (1 - y) * torch.log(xs_neg.clamp(min=self.eps))
+        los_neg = (1 - y) * torch.log(xs_neg.clamp(min=self.eps)) if not self.neg_tanh \
+            else (1 - y) * torch.tanh(torch.log(xs_neg.clamp(min=self.eps)))
         loss = los_pos + los_neg
 
         # Asymmetric Focusing
@@ -2004,6 +2003,7 @@ def train_model(
     tensorboard=False,
     initial_threshold=0.35,
     dynamic_threshold=True,
+    head_only_train_steps=0,  # 変更: new_head_only_train_steps → head_only_train_steps
 ):
     """モデルをトレーニングする関数"""
     # 出力ディレクトリの作成
@@ -2306,6 +2306,13 @@ def train_model(
             writer.add_scalar('Metrics/val/Threshold', threshold, 0)
             writer.add_image('Metrics/val/F1_vs_Threshold', val_metrics['f1_vs_threshold_plot'], 0)
 
+
+    global_step = 0
+    # トレーニングループの前に以下を追加
+    if head_only_train_steps > 0:
+        print(f"最初の{head_only_train_steps}ステップではヘッド部分のみを学習します")
+        model.freeze_non_head_parameters()
+
     # トレーニングループ
     for epoch in range(num_epochs):
         print(f"Epoch {epoch+1}/{num_epochs}")
@@ -2318,6 +2325,7 @@ def train_model(
         
         progress_bar = tqdm(train_loader, desc=f"Training")
         for i, (images, targets) in enumerate(progress_bar):
+            global_step += 1
             images = images.to(device)
             targets = targets.to(device)
             
@@ -2366,6 +2374,10 @@ def train_model(
                         neg_counts=neg_stats['counts']  # 陰性群のサンプル数を追加
                     )
                     writer.add_image(f'predictions/train_epoch_{epoch}', img_grid, i)
+
+            if global_step == head_only_train_steps:
+                tqdm.write("ヘッド部分の訓練を終了します")
+                model.freeze_non_lora_parameters()
         
         # 学習率のスケジューリング
         scheduler.step()
@@ -2833,6 +2845,9 @@ def main():
     train_parser.add_argument('--weight_decay', type=float, default=0.01, help='重み減衰')
     train_parser.add_argument('--use_8bit_optimizer', action='store_true', help='8-bitオプティマイザを使用する')
 
+    train_parser.add_argument('--head_only_train_steps', type=int, default=0,
+                      help='最初のN回のステップでヘッド部分のみを学習し、他のパラメータをフリーズします')
+
     train_parser.add_argument('--initial_threshold', type=float, default=0.35, help='初期閾値')
     train_parser.add_argument('--dynamic_threshold', type=float, default=True, help='動的閾値')
 
@@ -2847,7 +2862,8 @@ def main():
     train_parser.add_argument('--gamma_neg', type=float, default=4, help='ASL: 負例のガンマ値')
     train_parser.add_argument('--gamma_pos', type=float, default=1, help='ASL: 正例のガンマ値')
     train_parser.add_argument('--clip', type=float, default=0.05, help='ASL: クリップ値')
-    
+    train_parser.add_argument('--neg_tanh', default=False, action='store_true', help='ASL: 負例のtanhを使用する')
+
     # その他のオプション
     train_parser.add_argument('--mixed_precision', action='store_true', help='混合精度トレーニングを使用する')
     train_parser.add_argument('--tensorboard', action='store_true', help='TensorBoardを使用する')
@@ -3118,13 +3134,15 @@ def main():
             criterion = AsymmetricLoss(
                 gamma_neg=args.gamma_neg,
                 gamma_pos=args.gamma_pos,
-                clip=args.clip
+                clip=args.clip,
+                neg_tanh=args.neg_tanh
             )
         elif args.loss_fn == 'asl_optimized':
             criterion = AsymmetricLossOptimized(
                 gamma_neg=args.gamma_neg,
                 gamma_pos=args.gamma_pos,
-                clip=args.clip
+                clip=args.clip,
+                neg_tanh=args.neg_tanh
             )
         else:
             print("損失関数が指定されていません。BCEWithLogitsLossを使用します。")
@@ -3176,6 +3194,7 @@ def main():
             tensorboard=True,
             initial_threshold=args.initial_threshold,
             dynamic_threshold=args.dynamic_threshold,
+            head_only_train_steps=args.head_only_train_steps,  # 変更: new_head_only_train_steps → head_only_train_steps
         )
         
         print("トレーニングが完了しました！")
