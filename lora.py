@@ -33,6 +33,7 @@ from tqdm.auto import tqdm
 
 # デバイスの設定
 torch_device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+Image.MAX_IMAGE_PIXELS = None
 
 # xformersのインポート（オプション引数が有効な場合のみ）
 def import_xformers():
@@ -433,8 +434,8 @@ class EVA02WithModuleLoRA(nn.Module):
         # 新しいヘッドを作成
         new_head = nn.Linear(self.feature_dim, num_classes)
                 
-        # 新規タグの重みを初期化（Xavierの初期化）
-        nn.init.xavier_uniform_(new_head.weight.data[self.original_num_classes:])
+        # 新規タグの重みを初期化
+        nn.init.zeros_(new_head.weight.data[self.original_num_classes:])
         if new_head.bias is not None:
             nn.init.zeros_(new_head.bias.data[self.original_num_classes:])
 
