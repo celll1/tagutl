@@ -3,6 +3,7 @@ import time
 import json
 import argparse
 import numpy as np
+import cv2
 from PIL import Image, ImageDraw, ImageFont
 from dataclasses import dataclass
 from typing import List, Dict, Optional, Tuple
@@ -541,6 +542,55 @@ def save_tags_as_csv(predictions, output_path, threshold=0.45):
     print(f"タグをカンマ区切りで保存しました: {output_path}")
     return all_tags
 
+def extract_frames_from_video(video_path, num_frames):
+    """
+    動画ファイルから等間隔でフレームを抽出する
+    
+    Args:
+        video_path: 動画ファイルのパス
+        num_frames: 抽出するフレーム数
+    
+    Returns:
+        frames: 抽出されたフレームのリスト（PILイメージ）
+    """
+    cap = cv2.VideoCapture(video_path)
+    if not cap.isOpened():
+        print(f"Error: Cannot open video file: {video_path}")
+        return []
+    
+    # 動画の情報を取得
+    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    fps = cap.get(cv2.CAP_PROP_FPS)
+    
+    if total_frames <= 0 or fps <= 0:
+        print(f"Error: Invalid video file: {video_path}")
+        cap.release()
+        return []
+    
+    print(f"Video info: {video_path}, Total frames: {total_frames}, FPS: {fps}")
+    
+    # 抽出するフレームの間隔を計算
+    if num_frames > total_frames:
+        num_frames = total_frames
+        
+    interval = max(1, total_frames // num_frames)
+    frame_indices = [i * interval for i in range(num_frames)]
+    
+    frames = []
+    for idx in frame_indices:
+        cap.set(cv2.CAP_PROP_POS_FRAMES, idx)
+        ret, frame = cap.read()
+        if ret:
+            # BGRからRGBに変換してPIL Imageに変換
+            frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            pil_img = Image.fromarray(frame_rgb)
+            frames.append(pil_img)
+        else:
+            print(f"Warning: Failed to read frame at index {idx}")
+    
+    cap.release()
+    return frames
+
 def predict_with_onnx(image_path, model_path, tag_mapping_path, gen_threshold=0.45, char_threshold=0.45, output_path=None, use_gpu=False, output_mode="visualization"):
     # ONNXモデルでの予測
     print(f"Loading model: {model_path}")
@@ -716,29 +766,46 @@ def predict_with_onnx(image_path, model_path, tag_mapping_path, gen_threshold=0.
         else:
             print(f"  [FILTERED] {tag}: {conf:.3f}")
     
-    # 結果の可視化
-    if output_path is None and image_path.startswith(("http://", "https://")):
-        # URLの場合はファイル名を抽出
-        import urllib.parse
-        filename = os.path.basename(urllib.parse.urlparse(image_path).path)
-        output_path = f"result_{filename}.png"
-    elif output_path is None:
-        # ローカルファイルの場合
-        output_path = f"result_{os.path.basename(image_path)}"
-        # 拡張子がない場合は追加
-        if not output_path.lower().endswith(('.png', '.jpg', '.jpeg')):
-            output_path += ".png"
+    # 出力パスの設定
+    base_filename = os.path.splitext(os.path.basename(image_path))[0]
+    if output_mode == "visualization":
+        # 可視化モードの場合は prediction ディレクトリに保存
+        if output_path:
+            prediction_dir = output_path
+        else:
+            prediction_dir = "prediction"
+        os.makedirs(prediction_dir, exist_ok=True)
+        viz_output_path = os.path.join(prediction_dir, f"{base_filename}.png")
+    else:
+        # タグのみの出力の場合
+        if output_path:
+            # 出力ディレクトリが指定されている場合はそこに保存
+            tag_output_dir = output_path
+            os.makedirs(tag_output_dir, exist_ok=True)
+            tag_output_path = os.path.join(tag_output_dir, f"{base_filename}.txt")
+        else:
+            # 出力ディレクトリが指定されていない場合
+            # バッチ推論時は画像と同じディレクトリ、単一推論時はカレントディレクトリ
+            if batch_mode:
+                tag_output_dir = os.path.dirname(image_path)
+            else:
+                tag_output_dir = "."
+            tag_output_path = os.path.join(tag_output_dir, f"{base_filename}.txt")
+
+    # 結果の保存
+    if output_mode == "visualization":
+        original_tags = read_tags_from_file(image_path)
+        visualize_predictions(
+            original_image,
+            original_tags,
+            predictions,
+            threshold=gen_threshold,
+            output_path=viz_output_path
+        )
+    else:
+        save_tags_as_csv(predictions, tag_output_path, threshold=gen_threshold)
     
-    # Pass original_meta to visualize_predictions
-    result_image = visualize_predictions(
-        original_image, 
-        original_tags, 
-        predictions, 
-        threshold=gen_threshold, 
-        output_path=output_path
-    )
-    
-    return predictions, result_image
+    return predictions, output_path
 
 def debug_preprocessing(image_path):
     # デバッグ用の関数
@@ -783,7 +850,7 @@ def debug_preprocessing(image_path):
     
     print("前処理のデバッグ画像を保存しました: preprocessing_debug.png")
 
-def batch_predict(dirs, model_path, tag_mapping_path, gen_threshold=0.45, char_threshold=0.45, 
+def batch_predict(dirs, model_path, tag_mapping_path, gen_threshold=0.45, char_threshold=0.45, video_frames=3,
                  use_gpu=False, output_mode="visualization", recursive=False, batch_size=1):
     """
     複数のディレクトリ内の画像に対してバッチ推論を実行する
@@ -794,6 +861,7 @@ def batch_predict(dirs, model_path, tag_mapping_path, gen_threshold=0.45, char_t
         tag_mapping_path: タグマッピングJSONファイルのパス
         gen_threshold: 一般タグの閾値
         char_threshold: キャラクタータグの閾値
+        video_frames: 動画から抽出するフレーム数
         use_gpu: GPUを使用するかどうか
         output_mode: 出力モード
         recursive: サブディレクトリも処理するかどうか
@@ -848,128 +916,574 @@ def batch_predict(dirs, model_path, tag_mapping_path, gen_threshold=0.45, char_t
     print(f"タグマッピングを読み込み中: {tag_mapping_path}")
     labels, idx_to_tag, tag_to_category = load_tag_mapping(tag_mapping_path)
     
-    # 全ディレクトリから画像ファイルのリストを取得
+    # 全ディレクトリから画像ファイルと動画ファイルのリストを取得
     image_files = []
+    video_files = []
+    
     for dir_path in dirs:
         if not os.path.exists(dir_path):
             print(f"警告: ディレクトリが存在しません: {dir_path}")
             continue
             
-        dir_files = []
+        dir_images = []
+        dir_videos = []
+        
         if recursive:
             for root, _, files in os.walk(dir_path):
                 for file in files:
                     if file.lower().endswith(('.jpg', '.jpeg', '.png', '.bmp', '.webp')):
-                        dir_files.append(os.path.join(root, file))
+                        dir_images.append(os.path.join(root, file))
+                    elif file.lower().endswith(('.mp4', '.webm', '.avi', '.mov', '.mkv')):
+                        dir_videos.append(os.path.join(root, file))
         else:
             for file in os.listdir(dir_path):
                 if file.lower().endswith(('.jpg', '.jpeg', '.png', '.bmp', '.webp')):
-                    dir_files.append(os.path.join(dir_path, file))
+                    dir_images.append(os.path.join(dir_path, file))
+                elif file.lower().endswith(('.mp4', '.webm', '.avi', '.mov', '.mkv')):
+                    dir_videos.append(os.path.join(dir_path, file))
         
-        print(f"ディレクトリ '{dir_path}' から {len(dir_files)} 個の画像を見つけました")
-        image_files.extend(dir_files)
+        if dir_videos:
+            print(f"ディレクトリ '{dir_path}' から {len(dir_videos)} 個の動画を見つけました")
+            video_files.extend(dir_videos)
+            
+        if dir_images:
+            print(f"ディレクトリ '{dir_path}' から {len(dir_images)} 個の画像を見つけました")
+            image_files.extend(dir_images)
     
-    if not image_files:
-        print("処理する画像ファイルが見つかりませんでした")
+    if not image_files and not video_files:
+        print("処理するファイルが見つかりませんでした")
         return
     
     total_images = len(image_files)
+    total_videos = len(video_files)
     print(f"合計処理する画像ファイル数: {total_images}")
-    print(f"バッチサイズ: {batch_size}")
+    print(f"合計処理する動画ファイル数: {total_videos}")
+    print(f"画像処理のバッチサイズ: {batch_size}")
     
-    # バッチ処理
-    for batch_start in range(0, total_images, batch_size):
-        batch_end = min(batch_start + batch_size, total_images)
-        current_batch_size = batch_end - batch_start
-        print(f"\nバッチ処理中: {batch_start+1}～{batch_end}/{total_images}")
-        
-        try:
-            # バッチ用の入力データを準備
-            batch_inputs = []
-            batch_images = []
-            batch_paths = []
+    # 画像ファイルのバッチ処理
+    if total_images > 0:
+        print("\n=== 画像ファイルの処理を開始 ===")
+        for batch_start in range(0, total_images, batch_size):
+            batch_end = min(batch_start + batch_size, total_images)
+            current_batch_size = batch_end - batch_start
+            print(f"\nバッチ処理中: {batch_start+1}～{batch_end}/{total_images}")
             
-            # バッチ内の各画像を前処理
-            for i in range(batch_start, batch_end):
-                image_path = image_files[i]
-                try:
-                    original_image, input_data = preprocess_image(image_path)
-                    batch_inputs.append(input_data[0])  # バッチ次元を除去
-                    batch_images.append(original_image)
-                    batch_paths.append(image_path)
-                except Exception as e:
-                    print(f"画像の前処理でエラー ({image_path}): {e}")
+            try:
+                # バッチ用の入力データを準備
+                batch_inputs = []
+                batch_images = []
+                batch_paths = []
+                
+                # バッチ内の各画像を前処理
+                for i in range(batch_start, batch_end):
+                    image_path = image_files[i]
+                    try:
+                        original_image, input_data = preprocess_image(image_path)
+                        batch_inputs.append(input_data[0])  # バッチ次元を除去
+                        batch_images.append(original_image)
+                        batch_paths.append(image_path)
+                    except Exception as e:
+                        print(f"画像の前処理でエラー ({image_path}): {e}")
+                        continue
+                
+                if not batch_inputs:
                     continue
+                
+                # バッチ入力の作成
+                batch_input = np.stack(batch_inputs, axis=0)
+                
+                # 入力データ型の調整
+                expected_input_type = session.get_inputs()[0].type
+                if "float16" in expected_input_type:
+                    batch_input = batch_input.astype(np.float16)
+                else:
+                    batch_input = batch_input.astype(np.float32)
+                
+                # バッチ推論の実行
+                input_name = session.get_inputs()[0].name
+                output_name = session.get_outputs()[0].name
+                
+                start_time = time.time()
+                outputs = session.run([output_name], {input_name: batch_input})[0]
+                inference_time = time.time() - start_time
+                print(f"バッチ推論が {inference_time:.3f} 秒で完了しました")
+                print(f"画像あたりの平均推論時間: {inference_time/current_batch_size:.3f} 秒")
+                
+                # バッチ内の各画像の結果を処理
+                for idx, (original_image, image_path, output) in enumerate(zip(batch_images, batch_paths, outputs)):
+                    try:
+                        # 出力の後処理
+                        output = np.nan_to_num(output, nan=0.0, posinf=100.0, neginf=-100.0)
+                        output = 1 / (1 + np.exp(-output))  # シグモイド関数
+                        
+                        # タグの取得
+                        predictions = get_tags(output, labels, gen_threshold, char_threshold)
+                        
+                        # 出力パスの設定
+                        base_filename = os.path.splitext(os.path.basename(image_path))[0]
+                        
+                        if output_mode == "visualization":
+                            # 可視化モードの場合は prediction ディレクトリに保存
+                            prediction_dir = "prediction"
+                            os.makedirs(prediction_dir, exist_ok=True)
+                            output_path = os.path.join(prediction_dir, f"{base_filename}.png")
+                        else:
+                            # タグのみの出力の場合、画像と同じディレクトリに保存
+                            tag_output_dir = os.path.dirname(image_path)
+                            output_path = os.path.join(tag_output_dir, f"{base_filename}.txt")
+                        
+                        # 結果の保存
+                        if output_mode == "visualization":
+                            original_tags = read_tags_from_file(image_path)
+                            visualize_predictions(
+                                original_image,
+                                original_tags,
+                                predictions,
+                                threshold=gen_threshold,
+                                output_path=output_path
+                            )
+                        else:
+                            save_tags_as_csv(predictions, output_path, threshold=gen_threshold)
+                        
+                        print(f"処理完了 [{batch_start+idx+1}/{total_images}]: {image_path}")
+                        
+                    except Exception as e:
+                        print(f"結果の保存でエラー ({image_path}): {e}")
+                        import traceback
+                        print(traceback.format_exc())
             
-            if not batch_inputs:
-                continue
+            except Exception as e:
+                print(f"バッチ処理でエラー: {e}")
+                import traceback
+                print(traceback.format_exc())
+    
+    # 動画ファイルの処理
+    if total_videos > 0:
+        print("\n=== 動画ファイルの処理を開始 ===")
+        for i, video_path in enumerate(video_files):
+            try:
+                print(f"\n動画処理中 [{i+1}/{total_videos}]: {video_path}")
+                
+                # 動画のフレームを抽出
+                frames = extract_frames_from_video(video_path, video_frames)
+                if not frames:
+                    print(f"警告: 動画からフレームを抽出できませんでした: {video_path}")
+                    continue
+                    
+                print(f"{len(frames)}フレームを抽出しました")
+                
+                # 各フレームの予測結果を保存するリスト
+                all_frame_predictions = []
+                
+                # フレームごとの処理
+                for j, frame in enumerate(frames):
+                    try:
+                        print(f"フレーム {j+1}/{len(frames)} の処理中...")
+                        
+                        # フレームを一時的にファイルとして保存
+                        temp_frame_path = f"temp_frame_{j}.png"
+                        frame.save(temp_frame_path)
+                        
+                        # preprocess_image関数を使用して前処理
+                        try:
+                            original_frame, input_data = preprocess_image(temp_frame_path)
+                            
+                            # 入力データ型の調整
+                            expected_input_type = session.get_inputs()[0].type
+                            if "float16" in expected_input_type:
+                                input_data = input_data.astype(np.float16)
+                            else:
+                                input_data = input_data.astype(np.float32)
+                            
+                            # 推論実行
+                            input_name = session.get_inputs()[0].name
+                            output_name = session.get_outputs()[0].name
+                            
+                            # 推論時間の計測
+                            start_time = time.time()
+                            outputs = session.run([output_name], {input_name: input_data})[0]
+                            inference_time = time.time() - start_time
+                            print(f"フレーム {j+1} の推論が {inference_time:.3f} 秒で完了しました")
+                            
+                            # 出力の後処理
+                            outputs = np.nan_to_num(outputs[0], nan=0.0, posinf=100.0, neginf=-100.0)
+                            
+                            # シグモイド関数を適用して確率に変換（数値安定性を考慮）
+                            def stable_sigmoid(x):
+                                return np.where(
+                                    x >= 0,
+                                    1 / (1 + np.exp(-x)),
+                                    np.exp(x) / (1 + np.exp(x))
+                                )
+                            
+                            outputs = stable_sigmoid(outputs)
+                            
+                            # タグの取得
+                            frame_predictions = get_tags(outputs, labels, gen_threshold, char_threshold)
+                            all_frame_predictions.append(frame_predictions)
+                            
+                        finally:
+                            # 一時ファイルを削除
+                            if os.path.exists(temp_frame_path):
+                                os.remove(temp_frame_path)
+                    
+                    except Exception as e:
+                        print(f"フレーム処理でエラー: {e}")
+                        import traceback
+                        print(traceback.format_exc())
+                
+                if not all_frame_predictions:
+                    print(f"警告: 動画の全フレームの処理に失敗しました: {video_path}")
+                    continue
+                
+                # 全フレームの予測結果を統合
+                combined_predictions = combine_frame_predictions(all_frame_predictions, gen_threshold, char_threshold)
+                
+                # 出力パスの設定
+                base_filename = os.path.splitext(os.path.basename(video_path))[0]
+                
+                if output_mode == "visualization":
+                    # 可視化モードの場合は prediction ディレクトリに保存
+                    prediction_dir = "prediction"
+                    os.makedirs(prediction_dir, exist_ok=True)
+                    output_path = os.path.join(prediction_dir, f"{base_filename}.png")
+                else:
+                    # タグのみの出力の場合、動画と同じディレクトリに保存
+                    tag_output_dir = os.path.dirname(video_path)
+                    output_path = os.path.join(tag_output_dir, f"{base_filename}.txt")
+                
+                # 結果の保存
+                if output_mode == "visualization":
+                    original_tags = read_tags_from_file(video_path)
+                    visualize_predictions(
+                        frame,  # 動画からの最初のフレーム
+                        original_tags,
+                        combined_predictions,
+                        threshold=gen_threshold,
+                        output_path=output_path
+                    )
+                else:
+                    save_tags_as_csv(combined_predictions, output_path, threshold=gen_threshold)
+                
+                print(f"動画処理完了: {video_path}")
             
-            # バッチ入力の作成
-            batch_input = np.stack(batch_inputs, axis=0)
+            except Exception as e:
+                print(f"動画処理でエラー ({video_path}): {e}")
+                import traceback
+                print(traceback.format_exc())
+    
+    print(f"\nバッチ処理が完了しました。{total_images}個の画像と{total_videos}個の動画を処理しました。")
+
+def combine_frame_predictions(frame_predictions, gen_threshold=0.45, char_threshold=0.45):
+    """
+    複数フレームの予測結果を統合する
+    
+    Args:
+        frame_predictions: 各フレームの予測結果のリスト
+        gen_threshold: 一般タグの閾値
+        char_threshold: キャラクタータグの閾値
+    
+    Returns:
+        combined_predictions: 統合された予測結果
+    """
+    if not frame_predictions:
+        return None
+    
+    # カテゴリごとにタグの最大確率を保持する辞書
+    combined = {
+        "rating": {},
+        "general": {},
+        "character": {},
+        "copyright": {},
+        "artist": {},
+        "meta": {}
+    }
+    
+    # 各フレームの予測を処理
+    for predictions in frame_predictions:
+        for category in combined.keys():
+            for tag, prob in predictions[category]:
+                # タグがまだ辞書になければ追加
+                if tag not in combined[category]:
+                    combined[category][tag] = prob
+                else:
+                    # 既存のタグなら確率を最大値で更新
+                    combined[category][tag] = max(combined[category][tag], prob)
+    
+    # 結果を元の形式に変換
+    result = {
+        "rating": [],
+        "general": [],
+        "character": [],
+        "copyright": [],
+        "artist": [],
+        "meta": []
+    }
+    
+    # レーティングは最大確率のものを選択
+    if combined["rating"]:
+        top_rating = max(combined["rating"].items(), key=lambda x: x[1])
+        result["rating"].append(top_rating)
+    
+    # その他のカテゴリは閾値以上のタグを含める
+    for tag, prob in combined["general"].items():
+        if prob >= gen_threshold:
+            result["general"].append((tag, prob))
+    
+    for tag, prob in combined["character"].items():
+        if prob >= char_threshold:
+            result["character"].append((tag, prob))
+    
+    for tag, prob in combined["copyright"].items():
+        if prob >= char_threshold:
+            result["copyright"].append((tag, prob))
+    
+    for tag, prob in combined["artist"].items():
+        if prob >= char_threshold:
+            result["artist"].append((tag, prob))
+    
+    for tag, prob in combined["meta"].items():
+        if prob >= gen_threshold:
+            result["meta"].append((tag, prob))
+    
+    # 各カテゴリ内で確率の降順にソート
+    for category in result:
+        result[category] = sorted(result[category], key=lambda x: x[1], reverse=True)
+    
+    return result
+
+def predict_video_with_onnx(video_path, model_path, tag_mapping_path, gen_threshold=0.45, char_threshold=0.45, 
+                           output_path=None, use_gpu=False, output_mode="visualization", video_frames=3):
+    """
+    単一の動画ファイルに対して推論を実行する
+    
+    Args:
+        video_path: 入力動画のパス
+        model_path: ONNXモデルのパス
+        tag_mapping_path: タグマッピングJSONファイルのパス
+        gen_threshold: 一般タグの閾値
+        char_threshold: キャラクタータグの閾値
+        output_path: 出力パス
+        use_gpu: GPUを使用するかどうか
+        output_mode: 出力モード
+        video_frames: 動画から抽出するフレーム数
+    """
+    print(f"モデルを読み込み中: {model_path}")
+    
+    # モデルがFP16かどうかを確認
+    is_fp16_model = False
+    try:
+        import onnx
+        model = onnx.load(model_path)
+        # モデルの最初の入力のデータ型をチェック
+        for tensor in model.graph.initializer:
+            if tensor.data_type == 10:  # FLOAT16
+                is_fp16_model = True
+                break
+        print(f"モデルは {'FP16' if is_fp16_model else 'FP32'} です")
+    except Exception as e:
+        print(f"モデル精度の確認に失敗しました: {e}")
+    
+    # 利用可能なプロバイダーを確認
+    available_providers = ort.get_available_providers()
+    print(f"利用可能なプロバイダー: {available_providers}")
+    
+    # GPUの使用設定
+    if use_gpu:
+        try:
+            # セッションオプションを設定
+            session_options = ort.SessionOptions()
             
-            # 入力データ型の調整
-            expected_input_type = session.get_inputs()[0].type
-            if "float16" in expected_input_type:
-                batch_input = batch_input.astype(np.float16)
+            # 利用可能なGPUプロバイダーを選択
+            providers = []
+            if 'CUDAExecutionProvider' in available_providers:
+                # FP16モデルの場合、CUDA設定を最適化
+                if is_fp16_model:
+                    cuda_provider_options = {
+                        'device_id': 0,
+                        'arena_extend_strategy': 'kNextPowerOfTwo',
+                        'gpu_mem_limit': 2 * 1024 * 1024 * 1024,  # 2GB
+                        'cudnn_conv_algo_search': 'EXHAUSTIVE',
+                        'do_copy_in_default_stream': True,
+                    }
+                    providers.append(('CUDAExecutionProvider', cuda_provider_options))
+                else:
+                    providers.append('CUDAExecutionProvider')
+            elif 'DmlExecutionProvider' in available_providers:
+                providers.append('DmlExecutionProvider')
+            elif 'TensorrtExecutionProvider' in available_providers:
+                providers.append('TensorrtExecutionProvider')
+            
+            # CPUはフォールバック用に常に追加
+            providers.append('CPUExecutionProvider')
+            
+            if not providers or len(providers) == 1:  # CPUしかない場合
+                print("GPU用のプロバイダーが利用できません。CPUのみを使用します。")
+                session = ort.InferenceSession(model_path)
             else:
-                batch_input = batch_input.astype(np.float32)
-            
-            # バッチ推論の実行
-            input_name = session.get_inputs()[0].name
-            output_name = session.get_outputs()[0].name
-            
-            start_time = time.time()
-            outputs = session.run([output_name], {input_name: batch_input})[0]
-            inference_time = time.time() - start_time
-            print(f"バッチ推論が {inference_time:.3f} 秒で完了しました")
-            print(f"画像あたりの平均推論時間: {inference_time/current_batch_size:.3f} 秒")
-            
-            # バッチ内の各画像の結果を処理
-            for idx, (original_image, image_path, output) in enumerate(zip(batch_images, batch_paths, outputs)):
-                try:
-                    # 出力の後処理
-                    output = np.nan_to_num(output, nan=0.0, posinf=100.0, neginf=-100.0)
-                    output = 1 / (1 + np.exp(-output))  # シグモイド関数
-                    
-                    # タグの取得
-                    predictions = get_tags(output, labels, gen_threshold, char_threshold)
-                    
-                    # 出力パスの設定
-                    base_filename = os.path.splitext(os.path.basename(image_path))[0]
-                    if output_mode == "visualization":
-                        prediction_dir = "prediction"
-                        os.makedirs(prediction_dir, exist_ok=True)
-                        output_path = os.path.join(prediction_dir, f"{base_filename}.png")
-                    else:
-                        output_dir = os.path.dirname(image_path)
-                        output_path = os.path.join(output_dir, f"{base_filename}.txt")
-                    
-                    # 結果の保存
-                    if output_mode == "visualization":
-                        original_tags = read_tags_from_file(image_path)
-                        visualize_predictions(
-                            original_image,
-                            original_tags,
-                            predictions,
-                            threshold=gen_threshold,
-                            output_path=output_path
-                        )
-                    else:
-                        save_tags_as_csv(predictions, output_path, threshold=gen_threshold)
-                    
-                    print(f"処理完了 [{batch_start+idx+1}/{total_images}]: {image_path}")
-                    
-                except Exception as e:
-                    print(f"結果の保存でエラー ({image_path}): {e}")
-                    import traceback
-                    print(traceback.format_exc())
-        
+                print(f"使用するプロバイダー: {providers}")
+                session = ort.InferenceSession(model_path, providers=providers)
+                print(f"アクティブなプロバイダー: {session.get_providers()[0]}")
         except Exception as e:
-            print(f"バッチ処理でエラー: {e}")
+            print(f"GPU高速化に失敗しました: {e}")
+            print("CPUにフォールバックします")
+            session = ort.InferenceSession(model_path)
+    else:
+        # CPUのみを使用
+        session = ort.InferenceSession(model_path)
+        print("CPUを使用して推論を実行します")
+    
+    # タグマッピングの読み込み
+    print(f"タグマッピングを読み込み中: {tag_mapping_path}")
+    labels, idx_to_tag, tag_to_category = load_tag_mapping(tag_mapping_path)
+    
+    # 動画のフレームを抽出
+    print(f"動画からフレームを抽出中: {video_path}")
+    frames = extract_frames_from_video(video_path, video_frames)
+    
+    if not frames:
+        print(f"エラー: 動画からフレームを抽出できませんでした: {video_path}")
+        return None, None
+    
+    print(f"{len(frames)}フレームを抽出しました")
+    
+    # 各フレームの予測結果を保存するリスト
+    all_frame_predictions = []
+    
+    # フレームごとの処理
+    for i, frame in enumerate(frames):
+        try:
+            print(f"フレーム {i+1}/{len(frames)} の処理中...")
+            
+            # フレームを一時的にファイルとして保存
+            temp_frame_path = f"temp_frame_{i}.png"
+            frame.save(temp_frame_path)
+            
+            # preprocess_image関数を使用して前処理
+            try:
+                original_frame, input_data = preprocess_image(temp_frame_path)
+                
+                # 入力データ型の調整
+                expected_input_type = session.get_inputs()[0].type
+                if "float16" in expected_input_type:
+                    input_data = input_data.astype(np.float16)
+                else:
+                    input_data = input_data.astype(np.float32)
+                
+                # 推論実行
+                input_name = session.get_inputs()[0].name
+                output_name = session.get_outputs()[0].name
+                
+                # 推論時間の計測
+                start_time = time.time()
+                outputs = session.run([output_name], {input_name: input_data})[0]
+                inference_time = time.time() - start_time
+                print(f"フレーム {i+1} の推論が {inference_time:.3f} 秒で完了しました")
+                
+                # 出力の後処理
+                outputs = np.nan_to_num(outputs[0], nan=0.0, posinf=100.0, neginf=-100.0)
+                
+                # シグモイド関数を適用して確率に変換（数値安定性を考慮）
+                def stable_sigmoid(x):
+                    return np.where(
+                        x >= 0,
+                        1 / (1 + np.exp(-x)),
+                        np.exp(x) / (1 + np.exp(x))
+                    )
+                
+                outputs = stable_sigmoid(outputs)
+                
+                # タグの取得
+                frame_predictions = get_tags(outputs, labels, gen_threshold, char_threshold)
+                all_frame_predictions.append(frame_predictions)
+                
+            finally:
+                # 一時ファイルを削除
+                if os.path.exists(temp_frame_path):
+                    os.remove(temp_frame_path)
+                
+        except Exception as e:
+            print(f"フレーム処理でエラー: {e}")
             import traceback
             print(traceback.format_exc())
     
-    print(f"\nバッチ処理が完了しました。{total_images}個のファイルを処理しました。")
+    if not all_frame_predictions:
+        print(f"エラー: 動画の全フレームの処理に失敗しました: {video_path}")
+        return None, None
+    
+    # 全フレームの予測結果を統合
+    combined_predictions = combine_frame_predictions(all_frame_predictions, gen_threshold, char_threshold)
+    
+    # 結果の表示
+    print("--------")
+    print("レーティング:")
+    for tag, conf in combined_predictions["rating"]:
+        print(f"  {tag}: {conf:.3f}")
+    
+    print("--------")
+    print(f"キャラクタータグ (閾値={char_threshold}):")
+    for tag, conf in combined_predictions["character"]:
+        print(f"  {tag}: {conf:.3f}")
+    
+    print("--------")
+    print(f"著作権タグ (閾値={char_threshold}):")
+    for tag, conf in combined_predictions["copyright"]:
+        print(f"  {tag}: {conf:.3f}")
+    
+    print("--------")
+    print(f"アーティストタグ (閾値={char_threshold}):")
+    for tag, conf in combined_predictions["artist"]:
+        print(f"  {tag}: {conf:.3f}")
+    
+    print("--------")
+    print(f"一般タグ (閾値={gen_threshold}):")
+    for tag, conf in combined_predictions["general"]:
+        print(f"  {tag}: {conf:.3f}")
+    
+    print("--------")
+    print(f"メタタグ (閾値={gen_threshold}):")
+    # 不要なメタタグをフィルタリング
+    filtered_meta = []
+    excluded_meta_patterns = ['id', 'commentary']
+    
+    for tag, conf in combined_predictions["meta"]:
+        if not any(pattern in tag.lower() for pattern in excluded_meta_patterns):
+            print(f"  {tag}: {conf:.3f}")
+            filtered_meta.append((tag, conf))
+        else:
+            print(f"  [FILTERED] {tag}: {conf:.3f}")
+    
+    # 出力パスの設定
+    if output_path is None:
+        base_filename = os.path.splitext(os.path.basename(video_path))[0]
+        prediction_dir = "prediction"
+        os.makedirs(prediction_dir, exist_ok=True)
+        
+        if output_mode == "visualization":
+            output_path = os.path.join(prediction_dir, f"{base_filename}.png")
+        else:
+            output_path = os.path.join(prediction_dir, f"{base_filename}.txt")
+    else:
+        # 出力ディレクトリが指定されている場合は、そのディレクトリが存在することを確認
+        output_dir = os.path.dirname(output_path)
+        if output_dir and not os.path.exists(output_dir):
+            os.makedirs(output_dir)
+    
+    # 結果の保存
+    if output_mode == "visualization":
+        original_tags = read_tags_from_file(video_path)
+        visualize_predictions(
+            frame,  # 動画からの最初のフレーム
+            original_tags,
+            combined_predictions,
+            threshold=gen_threshold,
+            output_path=output_path
+        )
+    else:
+        save_tags_as_csv(combined_predictions, output_path, threshold=gen_threshold)
+    
+    print(f"動画処理完了: {video_path}")
+    return combined_predictions, frame
 
 def main():
     parser = argparse.ArgumentParser(description='ONNXモデルを使用した画像タグ予測')
@@ -977,14 +1491,16 @@ def main():
     # 入力関連の引数
     input_group = parser.add_mutually_exclusive_group(required=True)
     input_group.add_argument('--image', type=str, help='予測する画像のパスまたはURL')
+    input_group.add_argument('--video', type=str, help='予測する動画のパスまたはURL')
     input_group.add_argument('--dirs', type=str, nargs='+', help='予測する画像ディレクトリのパス（複数指定可）')
+    input_group.add_argument('--video_frames', type=int, default=3, help='動画から抽出するフレーム数')
     
     # モデル関連の引数
     parser.add_argument('--model', type=str, required=True, help='ONNXモデルのパス')
     parser.add_argument('--tag_mapping', type=str, required=True, help='タグマッピングJSONファイルのパス')
     
     # 出力関連の引数
-    parser.add_argument('--output', type=str, default=None, help='結果の出力パス（単一画像モードのみ）')
+    parser.add_argument('--output', type=str, default=None, help='結果の出力パス（単一画像/動画モードのみ）')
     parser.add_argument('--output_mode', type=str, choices=['visualization', 'tags'], default='visualization',
                         help='出力モード: visualization=可視化画像, tags=カンマ区切りタグ')
     
@@ -995,13 +1511,12 @@ def main():
     # その他のオプション
     parser.add_argument('--gpu', action='store_true', help='GPUを使用して推論を実行')
     parser.add_argument('--recursive', action='store_true', help='ディレクトリモードでサブディレクトリも処理する')
-    
-    # バッチサイズの引数を追加
     parser.add_argument('--batch_size', type=int, default=1, help='バッチ処理時のバッチサイズ')
     
     args = parser.parse_args()
     
     if args.image:
+        # 画像処理
         predict_with_onnx(
             args.image,
             args.model,
@@ -1012,9 +1527,23 @@ def main():
             use_gpu=args.gpu,
             output_mode=args.output_mode
         )
+    elif args.video:
+        # 動画処理
+        predict_video_with_onnx(
+            args.video,
+            args.model,
+            args.tag_mapping,
+            args.gen_threshold,
+            args.char_threshold,
+            args.output,
+            use_gpu=args.gpu,
+            output_mode=args.output_mode,
+            video_frames=args.video_frames
+        )
     elif args.dirs:
+        # バッチ処理
         batch_predict(
-            args.dirs,  # 複数ディレクトリを渡す
+            args.dirs,
             args.model,
             args.tag_mapping,
             args.gen_threshold,
@@ -1022,7 +1551,8 @@ def main():
             use_gpu=args.gpu,
             output_mode=args.output_mode,
             recursive=args.recursive,
-            batch_size=args.batch_size
+            batch_size=args.batch_size,
+            video_frames=args.video_frames  # 動画フレーム数も渡す
         )
 
 # GPUが利用可能かチェックする関数
