@@ -552,13 +552,44 @@ class EVA02WithModuleLoRA(nn.Module):
         for param in self.backbone.head.parameters():
             param.requires_grad = True
 
-    def freeze_non_head_parameters(self):
-        """ヘッドのパラメータのみ訓練可能に設定する"""
+    # def freeze_non_head_parameters(self):
+    #     """ヘッドのパラメータのみ訓練可能に設定する"""
+    #     for param in self.backbone.parameters():
+    #         param.requires_grad = False
+
+    #     for param in self.backbone.head.parameters():
+    #         param.requires_grad = True
+
+    def freeze_non_new_head_parameters(self):
+        """新しいヘッドのパラメータのみ訓練可能に設定する"""
+        # すべてのパラメータを凍結
         for param in self.backbone.parameters():
             param.requires_grad = False
 
-        for param in self.backbone.head.parameters():
-            param.requires_grad = True
+        # 新規タグのヘッド部分のみを訓練可能に設定
+        if hasattr(self, 'original_num_classes') and hasattr(self.backbone.head, 'weight'):
+            # ヘッドのパラメータを訓練可能に
+            self.backbone.head.weight.requires_grad = True
+            if hasattr(self.backbone.head, 'bias') and self.backbone.head.bias is not None:
+                self.backbone.head.bias.requires_grad = True
+
+            # 古いタグ部分の勾配を0にするためのフックを設定
+            def weight_hook(grad):
+                # 古いタグ部分の勾配を0に設定
+                grad_clone = grad.clone()
+                grad_clone[:self.original_num_classes] = 0
+                return grad_clone
+
+            def bias_hook(grad):
+                # 古いタグ部分の勾配を0に設定
+                grad_clone = grad.clone()
+                grad_clone[:self.original_num_classes] = 0
+                return grad_clone
+
+            # フックを登録
+            self.backbone.head.weight.register_hook(weight_hook)
+            if hasattr(self.backbone.head, 'bias') and self.backbone.head.bias is not None:
+                self.backbone.head.bias.register_hook(bias_hook)
 
     def merge_lora_to_base_model(self, scale=1.0):
         """
@@ -1628,7 +1659,7 @@ def prepare_dataset(
 
 # 非対称損失関数（ASL）の実装
 class AsymmetricLoss(nn.Module):
-    def __init__(self, gamma_neg=4, gamma_pos=1, clip=0.05, eps=1e-6, disable_torch_grad_focal_loss=False, neg_tanh=False):
+    def __init__(self, gamma_neg=4, gamma_pos=1, clip=0.05, eps=1e-6, disable_torch_grad_focal_loss=False):
         super(AsymmetricLoss, self).__init__()
 
         self.gamma_neg = gamma_neg
@@ -1636,7 +1667,6 @@ class AsymmetricLoss(nn.Module):
         self.clip = clip
         self.disable_torch_grad_focal_loss = disable_torch_grad_focal_loss
         self.eps = eps
-        self.neg_tanh = neg_tanh
 
     def forward(self, x, y):
         """"
@@ -1656,8 +1686,7 @@ class AsymmetricLoss(nn.Module):
 
         # Basic CE calculation
         los_pos = y * torch.log(xs_pos.clamp(min=self.eps))
-        los_neg = (1 - y) * torch.log(xs_neg.clamp(min=self.eps)) if not self.neg_tanh \
-            else (1 - y) * torch.tanh(torch.log(xs_neg.clamp(min=self.eps)))
+        los_neg = (1 - y) * torch.log(xs_neg.clamp(min=self.eps))
         loss = los_pos + los_neg
 
         # Asymmetric Focusing
@@ -1894,10 +1923,10 @@ def compute_metrics(outputs, targets):
     
     # 各閾値でのマクロF1スコアを計算（予測にも正解にも陽性があるクラスのみ）
     macro_f1_scores = []
-    for threshold in thresholds:
+    for threshold in tqdm(thresholds, desc="Calculating macro F1 scores", leave=False):
         preds = (outputs_np >= threshold).astype(int)
         class_f1_scores_threshold = []
-        for i in range(num_classes):
+        for i in tqdm(range(num_classes), desc="Calculating class F1 scores", leave=False):
             if np.sum(preds[:, i]) > 0 and np.sum(targets_np[:, i]) > 0:
                 f1 = f1_score(targets_np[:, i], preds[:, i])
                 class_f1_scores_threshold.append(f1)
@@ -1917,7 +1946,7 @@ def compute_metrics(outputs, targets):
     
     # 最適な閾値で、予測と正解に陽性があるクラスのみF1スコアを計算（個別クラスのF1）
     class_f1_scores = []
-    for i in range(num_classes):
+    for i in tqdm(range(num_classes), desc="Calculating class F1 scores", leave=False):
         if np.sum(predictions[:, i]) > 0 and np.sum(targets_np[:, i]) > 0:
             class_f1 = f1_score(targets_np[:, i], predictions[:, i])
             class_f1_scores.append(class_f1)
@@ -1928,7 +1957,7 @@ def compute_metrics(outputs, targets):
     # --- ここから各クラスごとの最適閾値の計算 ---
     class_best_thresholds = []
     # 各クラスごとに、全閾値でのF1スコアを求める
-    for i in range(num_classes):
+    for i in tqdm(range(num_classes), desc="Calculating best thresholds", leave=False):
         best_thresh = None
         best_f1 = 0
         # 正例があるクラスのみ計算
@@ -2312,7 +2341,7 @@ def train_model(
     # トレーニングループの前に以下を追加
     if head_only_train_steps > 0:
         print(f"最初の{head_only_train_steps}ステップではヘッド部分のみを学習します")
-        model.freeze_non_head_parameters()
+        model.freeze_non_new_head_parameters()
 
     # トレーニングループ
     for epoch in range(num_epochs):
@@ -2863,7 +2892,6 @@ def main():
     train_parser.add_argument('--gamma_neg', type=float, default=4, help='ASL: 負例のガンマ値')
     train_parser.add_argument('--gamma_pos', type=float, default=1, help='ASL: 正例のガンマ値')
     train_parser.add_argument('--clip', type=float, default=0.05, help='ASL: クリップ値')
-    train_parser.add_argument('--neg_tanh', default=False, action='store_true', help='ASL: 負例のtanhを使用する')
 
     # その他のオプション
     train_parser.add_argument('--mixed_precision', action='store_true', help='混合精度トレーニングを使用する')
@@ -3136,14 +3164,12 @@ def main():
                 gamma_neg=args.gamma_neg,
                 gamma_pos=args.gamma_pos,
                 clip=args.clip,
-                neg_tanh=args.neg_tanh
             )
         elif args.loss_fn == 'asl_optimized':
             criterion = AsymmetricLossOptimized(
                 gamma_neg=args.gamma_neg,
                 gamma_pos=args.gamma_pos,
                 clip=args.clip,
-                neg_tanh=args.neg_tanh
             )
         else:
             print("損失関数が指定されていません。BCEWithLogitsLossを使用します。")
