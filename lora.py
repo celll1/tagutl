@@ -508,7 +508,8 @@ class EVA02WithModuleLoRA(nn.Module):
         
         # 記録されているLoRA層を元に戻す
         for name, lora_module in list(self.lora_layers.items()):
-            print(f"Removing LoRA from module: {name}")
+            # debug(コメントを消さない)
+            # print(f"Removing LoRA from module: {name}")
             
             # nameが"backbone."で始まる場合、それを取り除く
             if name.startswith("backbone."):
@@ -610,7 +611,7 @@ class EVA02WithModuleLoRA(nn.Module):
             for name, module in self.named_modules():
                 if isinstance(module, LoRALinear):
                     self.lora_layers[name] = module
-                    print(f"Loraレイヤーを検出: {name}")
+                    # print(f"Loraレイヤーを検出: {name}")
         
         if not self.lora_layers:
             print("マージするLoraレイヤーがありません。")
@@ -646,7 +647,7 @@ class EVA02WithModuleLoRA(nn.Module):
                         # A @ B を計算
                         lora_weight = module.lora.lora_A @ module.lora.lora_B
                     else:
-                        tqdm.write(f"  警告: 行列のサイズが一致しません。このモジュールはスキップします。")
+                        # tqdm.write(f"  警告: 行列のサイズが一致しません。このモジュールはスキップします。")
                         continue
                     
                     # スケーリングを適用
@@ -661,14 +662,15 @@ class EVA02WithModuleLoRA(nn.Module):
                         module.base_layer.weight.data += lora_weight.to(module.base_layer.weight.data.device)
                         merged_count += 1
                     else:
-                        tqdm.write(f"  警告: 計算されたLoRA重みのサイズ({lora_weight.shape})がベース重みのサイズ({base_weight_shape})と一致しません。")
+                        # tqdm.write(f"  警告: 計算されたLoRA重みのサイズ({lora_weight.shape})がベース重みのサイズ({base_weight_shape})と一致しません。")
                         # 転置して試してみる
                         if lora_weight.t().shape == base_weight_shape:
-                            tqdm.write(f"  転置後のサイズが一致するため、転置して加算します。")
+                            # tqdm.write(f"  転置後のサイズが一致するため、転置して加算します。")
                             module.base_layer.weight.data += lora_weight.t().to(module.base_layer.weight.data.device)
                             merged_count += 1
                         else:
-                            tqdm.write(f"このモジュールはスキップします。")
+                            # tqdm.write(f"このモジュールはスキップします。")
+                            pass
                 del module
         
         print(f"{merged_count}個のLoraレイヤーをベースモデルにマージしました（スケール: {scale}）")
@@ -1492,7 +1494,9 @@ class TagImageDataset(torch.utils.data.Dataset):
         image_paths, 
         tags_list, 
         tag_to_idx, 
-        transform=None, 
+        transform=None,
+        cache_dir=None,  # キャッシュディレクトリを指定するパラメータ
+        force_recache=False,  # キャッシュを強制的に再作成するフラグ
     ):
         """
         画像とタグのデータセット
@@ -1502,18 +1506,118 @@ class TagImageDataset(torch.utils.data.Dataset):
             tags_list: 各画像に対応するタグのリスト（リストのリスト）
             tag_to_idx: タグから索引へのマッピング辞書
             transform: 画像変換関数
+            cache_dir: キャッシュディレクトリ（Noneの場合はキャッシュを使用しない）
+            force_recache: 既存のキャッシュを無視して再作成するかどうか
         """
         self.image_paths = image_paths
         self.tags_list = tags_list
         self.tag_to_idx = tag_to_idx
         self.transform = transform
+        self.cache_dir = cache_dir
+        self.force_recache = force_recache
         
         print(f"データセットのタグ数: {len(self.tag_to_idx)}")
+        
+        # キャッシュ関連の初期化
+        self.using_cache = cache_dir is not None
+        self.cache_metadata_file = None
+        self.cache_files_exist = False
+        
+        # キャッシュディレクトリが指定されている場合
+        if self.using_cache:
+            os.makedirs(cache_dir, exist_ok=True)
+            self.cache_metadata_file = os.path.join(cache_dir, 'metadata.json')
+            
+            # メタデータファイルが存在するか確認
+            if os.path.exists(self.cache_metadata_file) and not force_recache:
+                with open(self.cache_metadata_file, 'r') as f:
+                    metadata = json.load(f)
+                
+                # キャッシュが有効か確認（データサイズや構成が一致するか）
+                if (metadata.get('dataset_size') == len(self.image_paths) and 
+                    metadata.get('num_classes') == len(self.tag_to_idx)):
+                    self.cache_files_exist = True
+                    print(f"有効なキャッシュメタデータを見つけました: {len(self.image_paths)}個のサンプル")
+                else:
+                    print(f"キャッシュメタデータが一致しません。新しいキャッシュを作成します。")
+                    self.cache_files_exist = False
+            
+            # キャッシュが存在しない場合は作成
+            if not self.cache_files_exist or force_recache:
+                self._create_cache()
+    
+    def _get_cache_path(self, idx):
+        """インデックスからキャッシュファイルのパスを生成"""
+        return os.path.join(self.cache_dir, f"sample_{idx}.pt")
+    
+    def _create_cache(self):
+        """個別のファイルにデータをキャッシュする"""
+        print("データセットのキャッシュを作成中...")
+        
+        # キャッシュ作成のために情報を収集
+        dataset_info = {
+            'dataset_size': len(self.image_paths),
+            'num_classes': len(self.tag_to_idx),
+            'missing_samples': []  # 読み込みに失敗したサンプルのリスト
+        }
+        
+        for idx in tqdm(range(len(self.image_paths)), desc="Caching dataset"):
+            # 画像を読み込み前処理を適用
+            try:
+                img_path = self.image_paths[idx]
+                
+                image = Image.open(img_path)
+                image = pil_ensure_rgb(image)
+                image = pil_pad_square(image)
+                
+                if self.transform:
+                    image = self.transform(image)
+                    # RGB to BGR for EVA02 model
+                    image = image[[2, 1, 0]]
+                
+                # タグをone-hotエンコーディング
+                tags = self.tags_list[idx]
+                num_classes = len(self.tag_to_idx)
+                label = torch.zeros(num_classes)
+                
+                for tag in tags:
+                    if tag in self.tag_to_idx:
+                        label[self.tag_to_idx[tag]] = 1.0
+                
+                # 個別のファイルとしてキャッシュに保存
+                cache_path = self._get_cache_path(idx)
+                torch.save((image, label), cache_path)
+                
+            except (Image.UnidentifiedImageError, OSError, IOError) as e:
+                # 画像が読み込めない場合のエラーをスキップし、メタデータに記録
+                print(f"Warning: キャッシュ作成中に画像の読み込みに失敗しました: {img_path}, エラー: {str(e)}")
+                dataset_info['missing_samples'].append(idx)
+        
+        # メタデータをディスクに保存
+        with open(self.cache_metadata_file, 'w') as f:
+            json.dump(dataset_info, f)
+            
+        print(f"キャッシュの作成が完了しました。{len(self.image_paths)}個のサンプルが処理されました。")
+        print(f"読み込みに失敗したサンプル: {len(dataset_info['missing_samples'])}")
+        
+        # キャッシュが作成されたことを記録
+        self.cache_files_exist = True
 
     def __len__(self):
         return len(self.image_paths)
     
     def __getitem__(self, idx):
+        # キャッシュを使用している場合はキャッシュファイルからデータを取得
+        if self.using_cache and self.cache_files_exist:
+            cache_path = self._get_cache_path(idx)
+            if os.path.exists(cache_path):
+                try:
+                    return torch.load(cache_path)
+                except Exception as e:
+                    print(f"Warning: キャッシュファイルの読み込みに失敗しました: {cache_path}, エラー: {str(e)}")
+                    # キャッシュ読み込み失敗時は通常の処理にフォールバック
+        
+        # キャッシュがない場合や読み込み失敗時は通常通り処理
         # 最大再試行回数
         max_retries = 5
         current_idx = idx
@@ -1541,6 +1645,12 @@ class TagImageDataset(torch.utils.data.Dataset):
                     if tag in self.tag_to_idx:
                         label[self.tag_to_idx[tag]] = 1.0
                 
+                # キャッシュが有効でファイルが存在しない場合は、遅延キャッシュを作成
+                if self.using_cache and self.cache_files_exist:
+                    cache_path = self._get_cache_path(current_idx)
+                    if not os.path.exists(cache_path):
+                        torch.save((image, label), cache_path)
+                
                 return image, label
                 
             except (Image.UnidentifiedImageError, OSError, IOError) as e:
@@ -1553,7 +1663,7 @@ class TagImageDataset(torch.utils.data.Dataset):
         # すべての再試行が失敗した場合、ダミーデータを返す
         print(f"Error: {max_retries}回の再試行後も画像を読み込めませんでした。ダミーデータを返します。")
         dummy_image = torch.zeros(3, 224, 224)  # モデルの入力サイズに合わせて調整
-        dummy_target = torch.zeros(num_classes)
+        dummy_target = torch.zeros(len(self.tag_to_idx))
         
         return dummy_image, dummy_target
 
@@ -1565,7 +1675,8 @@ def prepare_dataset(
     val_split=0.1, 
     min_tag_freq=5, 
     remove_special_prefix="remove",
-    seed=42
+    seed=42,
+    cache_dir=None  # キャッシュディレクトリのパラメータを追加
 ):
     """データセットを準備する関数"""
     print("画像とタグを収集しています...")
@@ -2033,7 +2144,8 @@ def train_model(
     tensorboard=False,
     initial_threshold=0.35,
     dynamic_threshold=True,
-    head_only_train_steps=0,  # 変更: new_head_only_train_steps → head_only_train_steps
+    head_only_train_steps=0,
+    cache_dir=None,  # キャッシュディレクトリのパラメータを追加
 ):
     """モデルをトレーニングする関数"""
     # 出力ディレクトリの作成
@@ -2198,14 +2310,13 @@ def train_model(
             
             # シグモイド関数で確率に変換
             probs = torch.sigmoid(outputs).cpu().numpy()
-            neg_probs = torch.sigmoid(outputs)*(1-targets)
-            neg_probs = neg_probs.cpu().numpy()  # CPUに移動してからNumPy配列に変換
-            pos_probs = torch.sigmoid(outputs)*targets
-            pos_probs = pos_probs.cpu().numpy()  # CPUに移動してからNumPy配列に変換
-            val_preds.append(probs)
-            val_neg_preds.append(neg_probs)
-            val_pos_preds.append(pos_probs)
-            val_targets.append(targets.cpu().numpy())
+            # 最新100件のみを保持
+            val_preds = (val_preds + [probs])[-100:]
+            val_targets = (val_targets + [targets.detach().cpu().numpy()])[-100:]
+            neg_probs = probs*(1-targets.cpu().numpy())
+            pos_probs = probs*targets.cpu().numpy()
+            val_neg_preds = (val_neg_preds + [neg_probs])[-100:]
+            val_pos_preds = (val_pos_preds + [pos_probs])[-100:]
             
             progress_bar.set_postfix({"loss": f"{loss.item():.4f}"})
 
@@ -2276,19 +2387,19 @@ def train_model(
     pos_stats = calculate_group_stats(val_pos_preds)
     neg_stats = calculate_group_stats(val_neg_preds)
     
-    # 上位と下位の統計情報を表示
-    tag_indices = list(range(len(neg_stats['means'])))
-    sorted_by_mean = sorted(tag_indices, key=lambda i: neg_stats['means'][i], reverse=True)
+    # # 上位と下位の統計情報を表示
+    # tag_indices = list(range(len(neg_stats['means'])))
+    # sorted_by_mean = sorted(tag_indices, key=lambda i: neg_stats['means'][i], reverse=True)
     
-    print("\n陰性群の予測値が高いタグ（誤検出リスクが高い）:")
-    for i in sorted_by_mean[:10]:
-        tag_name = idx_to_tag[i] if i in idx_to_tag else f"Unknown({i})"
-        print(f"  {tag_name}: 平均={neg_stats['means'][i]:.4f}, 分散={neg_stats['variance'][i]:.4f}, サンプル数={int(neg_stats['counts'][i])}")
+    # print("\n陰性群の予測値が高いタグ（誤検出リスクが高い）:")
+    # for i in sorted_by_mean[:10]:
+    #     tag_name = idx_to_tag[i] if i in idx_to_tag else f"Unknown({i})"
+    #     print(f"  {tag_name}: 平均={neg_stats['means'][i]:.4f}, 分散={neg_stats['variance'][i]:.4f}, サンプル数={int(neg_stats['counts'][i])}")
     
-    print("\n陰性群の予測値が低いタグ（誤検出リスクが低い）:")
-    for i in sorted_by_mean[-10:]:
-        tag_name = idx_to_tag[i] if i in idx_to_tag else f"Unknown({i})"
-        print(f"  {tag_name}: 平均={neg_stats['means'][i]:.4f}, 分散={neg_stats['variance'][i]:.4f}, サンプル数={int(neg_stats['counts'][i])}")
+    # print("\n陰性群の予測値が低いタグ（誤検出リスクが低い）:")
+    # for i in sorted_by_mean[-10:]:
+    #     tag_name = idx_to_tag[i] if i in idx_to_tag else f"Unknown({i})"
+    #     print(f"  {tag_name}: 平均={neg_stats['means'][i]:.4f}, 分散={neg_stats['variance'][i]:.4f}, サンプル数={int(neg_stats['counts'][i])}")
     
     # リストに変換して結合
     val_preds_list = []
@@ -2303,6 +2414,7 @@ def train_model(
     # 最後にnumpy配列に変換
     val_preds = np.array(val_preds_list)
     val_targets = np.array(val_targets_list)
+    del val_preds_list, val_targets_list
     
     val_metrics = compute_metrics(val_preds, val_targets)
     
@@ -2328,6 +2440,7 @@ def train_model(
             if old_tags_count > 0 and len(model.tag_to_idx) > old_tags_count:
                 writer.add_scalar('Metrics/val/F1_existing', existing_val_metrics['f1'], 0)
                 writer.add_scalar('Metrics/val/F1_new', new_val_metrics['f1'], 0)
+        del existing_val_metrics, new_val_metrics
     else:
         print(f"初期検証結果 - F1: {val_metrics['f1']:.4f}")
         if tensorboard:
@@ -2336,6 +2449,7 @@ def train_model(
             writer.add_scalar('Metrics/val/Threshold', threshold, 0)
             writer.add_image('Metrics/val/F1_vs_Threshold', val_metrics['f1_vs_threshold_plot'], 0)
 
+    del val_preds, val_targets, val_neg_preds, val_pos_preds
 
     global_step = 0
     # トレーニングループの前に以下を追加
@@ -2381,8 +2495,9 @@ def train_model(
             
             # シグモイド関数で確率に変換
             probs = torch.sigmoid(outputs).detach().cpu().numpy()
-            train_preds.append(probs)
-            train_targets.append(targets.detach().cpu().numpy())
+            # 最新100件のみを保持
+            train_preds = (train_preds + [probs])[-100:]
+            train_targets = (train_targets + [targets.detach().cpu().numpy()])[-100:]
             
             progress_bar.set_postfix({"loss": f"{loss.item():.4f}"})
 
@@ -2430,6 +2545,7 @@ def train_model(
         # 最後にnumpy配列に変換
         train_preds = np.array(train_preds_list)
         train_targets = np.array(train_targets_list)
+        del train_preds_list, train_targets_list
              
         train_metrics = compute_metrics(train_preds,train_targets)
 
@@ -2454,6 +2570,7 @@ def train_model(
                 writer.add_scalar('Metrics/Train/F1_all', train_metrics['f1'], epoch+1)
                 writer.add_scalar('Metrics/Train/Threshold', threshold, epoch+1)
                 writer.add_image('Metrics/Train/F1_vs_Threshold', train_metrics['f1_vs_threshold_plot'], epoch+1)
+        del train_preds, train_targets
 
         # 検証フェーズ
         model.eval()
@@ -2482,14 +2599,13 @@ def train_model(
                 
                 # シグモイド関数で確率に変換
                 probs = torch.sigmoid(outputs).cpu().numpy()
-                neg_probs = torch.sigmoid(outputs)*(1-targets)  
-                neg_probs = neg_probs.cpu().numpy()  # CPUに移動してからNumPy配列に変換
-                pos_probs = torch.sigmoid(outputs)*targets
-                pos_probs = pos_probs.cpu().numpy()  # CPUに移動してからNumPy配列に変換
-                val_preds.append(probs) 
-                val_neg_preds.append(neg_probs)
-                val_pos_preds.append(pos_probs)
-                val_targets.append(targets.cpu().numpy())
+                # 最新100件のみを保持
+                val_preds = (val_preds + [probs])[-100:]
+                val_targets = (val_targets + [targets.detach().cpu().numpy()])[-100:]
+                neg_probs = probs*(1-targets.cpu().numpy())
+                pos_probs = probs*targets.cpu().numpy()
+                val_neg_preds = (val_neg_preds + [neg_probs])[-100:]
+                val_pos_preds = (val_pos_preds + [pos_probs])[-100:]
                 
                 progress_bar.set_postfix({"loss": f"{loss.item():.4f}"})
 
@@ -2517,41 +2633,60 @@ def train_model(
 
         # 検証メトリクスの計算
         val_loss /= len(val_loader)
-        val_preds = np.concatenate(val_preds)
-        val_targets = np.concatenate(val_targets)
+
+        # リストに変換して結合
+        val_preds_list = []
+        val_targets_list = []
+
+        # ランダムに100のindicesを選択
+        random_indices = np.random.choice(len(val_preds), min(100, len(val_preds)), replace=False)
+        for i in tqdm(random_indices, desc="Picking validation data", leave=False):
+            val_preds_list.extend(val_preds[i])
+            val_targets_list.extend(val_targets[i])
+            
+        # 最後にnumpy配列に変換
+        val_preds = np.array(val_preds_list)
+        val_targets = np.array(val_targets_list)
+        del val_preds_list, val_targets_list
         
         val_metrics = compute_metrics(val_preds, val_targets)
-        
-        # 既存タグと新規タグに分けてメトリクスを計算
-        if old_tags_count > 0 and len(model.tag_to_idx) > old_tags_count:
-            existing_val_metrics = compute_metrics(
-                val_preds[:, :old_tags_count], 
-                val_targets[:, :old_tags_count]
-            )
-            new_val_metrics = compute_metrics(
-                val_preds[:, old_tags_count:], 
-                val_targets[:, old_tags_count:]
-            )
         
         # 結果の表示
         print(f"Train Loss: {train_loss:.4f}, Train F1: {train_metrics['f1']:.4f}, "
               f"Val Loss: {val_loss:.4f}, Val F1: {val_metrics['f1']:.4f}")
-        
+         
+        # 既存タグと新規タグに分けてメトリクスを計算
         if old_tags_count > 0 and len(model.tag_to_idx) > old_tags_count:
-            print(f"既存タグ - Train F1: {existing_train_metrics['f1']:.4f}, Val F1: {existing_val_metrics['f1']:.4f}")
-            print(f"新規タグ - Train F1: {new_train_metrics['f1']:.4f}, Val F1: {new_val_metrics['f1']:.4f}")
-        
-        # TensorBoardにメトリクスを記録
-        if tensorboard:
-            writer.add_scalar('Metrics/val/Loss', val_loss, epoch+1)
-            writer.add_scalar('Metrics/val/F1', val_metrics['f1'], epoch+1)
-            writer.add_scalar('Metrics/val/PR-AUC', val_metrics['pr_auc'], epoch+1)
-            writer.add_scalar('Metrics/val/Threshold', threshold, epoch+1)
-            writer.add_image('Metrics/val/F1_vs_Threshold', val_metrics['f1_vs_threshold_plot'], epoch+1)
+            existing_val_metrics = compute_metrics(
+                val_preds[:, :old_tags_count],
+                val_targets[:, :old_tags_count]
+            )
+            new_val_metrics = compute_metrics(
+                val_preds[:, old_tags_count:],
+                val_targets[:, old_tags_count:]
+            )
             
-            if old_tags_count > 0 and len(model.tag_to_idx) > old_tags_count:
-                writer.add_scalar('Metrics/val/F1_existing', existing_val_metrics['f1'], epoch+1)
-                writer.add_scalar('Metrics/val/F1_new', new_val_metrics['f1'], epoch+1)
+            print(f"epoch {epoch+1} 検証結果 - 既存タグ F1: {existing_val_metrics['f1']:.4f}, 新規タグ F1: {new_val_metrics['f1']:.4f}")
+
+            if tensorboard:
+                writer.add_scalar('Metrics/val/F1', val_metrics['f1'], 0)
+                writer.add_scalar('Metrics/val/PR-AUC', val_metrics['pr_auc'], 0)
+                writer.add_scalar('Metrics/val/Threshold', threshold, 0)
+                writer.add_image('Metrics/val/F1_vs_Threshold', val_metrics['f1_vs_threshold_plot'], 0)
+
+                if old_tags_count > 0 and len(model.tag_to_idx) > old_tags_count:
+                    writer.add_scalar('Metrics/val/F1_existing', existing_val_metrics['f1'], 0)
+                    writer.add_scalar('Metrics/val/F1_new', new_val_metrics['f1'], 0)
+            del existing_val_metrics, new_val_metrics
+        else:
+            print(f"epoch {epoch+1} 検証結果 - F1: {val_metrics['f1']:.4f}")
+            if tensorboard:
+                writer.add_scalar('Metrics/val/F1', val_metrics['f1'], 0)
+                writer.add_scalar('Metrics/val/PR-AUC', val_metrics['pr_auc'], 0)
+                writer.add_scalar('Metrics/val/Threshold', threshold, 0)
+                writer.add_image('Metrics/val/F1_vs_Threshold', val_metrics['f1_vs_threshold_plot'], 0)
+
+        del val_preds, val_targets, val_neg_preds, val_pos_preds
         
         # 最良のモデルを保存
         save_model_flag = False
@@ -2598,165 +2733,7 @@ def train_model(
     if tensorboard:
         writer.close()
     
-    return val_metrics
-
-# def debug_model():
-#     """
-#     extend_head 前後の重みコピーおよび出力差分を比較するデバッグ関数
-#     """
-#     import copy
-    
-#     # デバイスの設定
-#     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    
-#     print("【検証1】extend_head 前のモデル（baseline）の読み込み")
-#     model_baseline = EVA02WithModuleLoRA(
-#         num_classes=None,  # 既存ヘッドのみ（pre-trained 状態）
-#         lora_rank=4,
-#         lora_alpha=1.0,
-#         lora_dropout=0.0,
-#         target_modules=None,
-#         pretrained=True
-#     )
-#     model_baseline = model_baseline.to(device)
-#     model_baseline.eval()
-    
-#     # baselineヘッドの重みを保持
-#     baseline_head_weights = model_baseline.backbone.head.weight.data.clone()
-#     baseline_head_bias = None
-#     if model_baseline.backbone.head.bias is not None:
-#         baseline_head_bias = model_baseline.backbone.head.bias.data.clone()
-    
-#     print("Baseline existing head weight stats: mean = {:.6f}, std = {:.6f}".format(
-#          baseline_head_weights.mean().item(), baseline_head_weights.std().item()))
-    
-#     # 既存タグ数はモデル内部に保持されている (pre-trained ヘッドの out_features)
-#     original_num = model_baseline.original_num_classes
-#     # ここではシミュレーションとして新規タグ461件を追加する
-#     total_classes = original_num + 461
-#     print(f"【検証2】ヘッド拡張: {original_num} -> {total_classes} (新規タグ数: 461)")
-    
-#     # baselineモデルをコピーして、ヘッド拡張を実施
-#     model_extended = copy.deepcopy(model_baseline)
-#     model_extended.extend_head(num_classes=total_classes)
-#     model_extended = model_extended.to(device)
-#     model_extended.eval()
-    
-#     ext_head_weights = model_extended.backbone.head.weight.data.clone()
-#     ext_head_bias = None
-#     if model_extended.backbone.head.bias is not None:
-#         ext_head_bias = model_extended.backbone.head.bias.data.clone()
-    
-#     # baselineの既存ヘッド部分と、extend後の既存ヘッド部分の差分を確認
-#     diff_weights = ext_head_weights[:original_num] - baseline_head_weights
-#     print("After extending head, difference stats for existing head portion:")
-#     print("  - Difference weight: mean = {:.6f}, std = {:.6f}".format(
-#          diff_weights.mean().item(), diff_weights.std().item()))
-    
-#     # ダミー入力を用意 (事前にモデルの期待する画像サイズを取得)
-#     img_size = model_extended.img_size  # (height, width) 例：(448, 448)
-#     dummy_input = torch.randn(1, 3, img_size[0], img_size[1]).to(device)
-    
-#     with torch.no_grad():
-#         baseline_output = model_baseline(dummy_input)
-#         extended_output = model_extended(dummy_input)
-    
-#     # 既存タグに該当する部分の出力を比較
-#     baseline_existing = baseline_output[:, :original_num]
-#     extended_existing = extended_output[:, :original_num]
-    
-#     diff_output = extended_existing - baseline_existing
-#     print("Existing head output difference (after extend):")
-#     print("  - Mean = {:.6f}, Std = {:.6f}".format(diff_output.mean().item(), diff_output.std().item()))
-    
-#     # 全体出力の統計も表示
-#     print("Extended model overall output stats: mean = {:.6f}, std = {:.6f}".format(
-#          extended_output.mean().item(), extended_output.std().item()))
-
-#     print("\n【デバッグ検証終了】")
-
-# def debug_id_mapping():
-#     """
-#     トレーニング時に用いられる tag_to_idx / idx_to_tag のマッピングが正しく構築されているかを確認するためのデバッグ関数
-#     ＊ 特に、既存タグ（load_labels_hfで得られる）と、新規タグが正しく追加されているかを確認する
-#     """
-#     # 事前にload_labels_hfで得た既存のラベルリスト（pre-trainedで使われている順序）の取得
-#     labels = load_labels_hf(repo_id=MODEL_REPO)
-#     existing_tags = labels.names
-#     num_existing = len(existing_tags)
-#     print(f"pre-trainedから取得した既存タグ数: {num_existing}")
-    
-#     # ダミーの画像ディレクトリ（またはテスト用のタグリスト）を用意する
-#     # ここでは既存タグに含まれていないタグを新規タグと仮定
-#     # 例として、既存タグの一部だけ＆新規タグを含む簡易テストケースを作成します
-#     image_paths = ["b.jpg", "f.jpg", "a.jpg"]
-#     tags_list = [
-#         # この画像は既存タグのみを含む
-#         existing_tags[:10],
-#         # この画像は既存タグと、新規タグ "new_tag_A", "new_tag_B" を含む
-#         existing_tags[5:15] + ["new_tag_A", "new_tag_B"],
-#         # この画像は新規タグのみ
-#         ["new_tag_A", "new_tag_B", "new_tag_C"]
-#     ]
-    
-#     # prepare_dataset 内部ではファイル入出力がありますので、ここではその一部処理のみ、つまり
-#     # タグの頻度計算、フィルタリング、既存／新規タグの分離、そしてマッピングの構築部のみをシミュレーションします
-#     tag_freq = {}
-#     for tags in tags_list:
-#         for tag in tags:
-#             tag_freq[tag] = tag_freq.get(tag, 0) + 1
-#     # min_tag_freq を1として全てのタグを採用（テスト目的）
-#     filtered_tags = {tag for tag, freq in tag_freq.items() if freq >= 1}
-    
-#     # 既存タグと新規タグの分離
-#     existing_filtered_tags = set(existing_tags) & filtered_tags
-#     new_filtered_tags = filtered_tags - set(existing_tags)
-    
-#     print(f"フィルタリング後の既存タグ数: {len(existing_filtered_tags)}")
-#     print(f"フィルタリング後の新規タグ数: {len(new_filtered_tags)}")
-    
-#     # マッピング作成
-#     # 既存タグはそのままの順序で
-#     tag_to_idx = {tag: i for i, tag in enumerate(existing_tags)}
-    
-#     next_idx = num_existing
-#     for tag in sorted(new_filtered_tags):
-#         tag_to_idx[tag] = next_idx
-#         next_idx += 1
-#     idx_to_tag = {i: tag for tag, i in tag_to_idx.items()}
-    
-#     total_tags = len(tag_to_idx)
-#     print(f"最終的に使用されるタグの総数: {total_tags}")
-    
-#     # マッピングの先頭部分（既存タグ側）と後半部分（新規タグ側）を確認
-#     print("\n【既存タグマッピング（一部表示）】")
-#     for i in range(min(10, num_existing)):
-#         print(f"Index: {i} → {idx_to_tag[i]}")
-        
-#     print("\n【新規タグマッピング】")
-#     for i in range(num_existing, total_tags):
-#         print(f"Index: {i} → {idx_to_tag[i]}")
-    
-#     # 次に、シンプルな TagImageDataset を用いて、実際のターゲット生成結果を確認する
-#     # 前処理に remove_special_prefix が有効の場合と無効の場合で確認可能
-#     from torchvision import transforms
-#     transform = transforms.Compose([
-#         transforms.ToTensor()
-#     ])
-    
-#     dataset = TagImageDataset(
-#         image_paths=image_paths,
-#         tags_list=tags_list,
-#         tag_to_idx=tag_to_idx,
-#         transform=transform,
-#     )
-    
-#     print("\n【各サンプルのターゲットベクトル（nonzero indices）】")
-#     for idx in range(len(dataset)):
-#         image_tensor, target = dataset[idx]
-#         nz = target.nonzero(as_tuple=False).squeeze().tolist()
-#         print(f"Sample {idx}: ターゲットindices = {nz}")
-    
+    return val_metrics    
 
 def load_tag_categories():
     """
@@ -2862,6 +2839,8 @@ def main():
     # train_parser.add_argument('--image_size', type=int, default=224, help='画像サイズ')
     train_parser.add_argument('--batch_size', type=int, default=4, help='バッチサイズ')
     train_parser.add_argument('--num_workers', type=int, default=4, help='データローダーのワーカー数')
+    train_parser.add_argument('--cache_dir', type=str, default=None, help='キャッシュディレクトリのパス')
+    train_parser.add_argument('--force_recache', action='store_true', help='キャッシュを強制的に再作成する')
     
     # モデル関連の引数
     train_parser.add_argument('--lora_rank', type=int, default=32, help='LoRAのランク')
@@ -3130,6 +3109,8 @@ def main():
             tags_list=train_tags_list,
             tag_to_idx=model.tag_to_idx,
             transform=model.transform,
+            cache_dir=None if args.cache_dir is None else os.path.join(args.cache_dir, 'train'),  # トレーニング用キャッシュディレクトリ
+            force_recache=False,  # キャッシュを強制的に再作成するフラグ
         )
         
         val_dataset = TagImageDataset(
@@ -3137,6 +3118,8 @@ def main():
             tags_list=val_tags_list,
             tag_to_idx=model.tag_to_idx,
             transform=model.transform,
+            cache_dir=None if args.cache_dir is None else os.path.join(args.cache_dir, 'val'),  # 検証用キャッシュディレクトリ
+            force_recache=False,  # キャッシュを強制的に再作成するフラグ
         )
         
         # データローダーの作成
@@ -3222,6 +3205,7 @@ def main():
             initial_threshold=args.initial_threshold,
             dynamic_threshold=args.dynamic_threshold,
             head_only_train_steps=args.head_only_train_steps,  # 変更: new_head_only_train_steps → head_only_train_steps
+            cache_dir=None  # キャッシュディレクトリのパラメータを追加
         )
         
         print("トレーニングが完了しました！")
