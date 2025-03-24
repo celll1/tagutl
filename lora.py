@@ -1671,48 +1671,91 @@ class TagImageDataset(torch.utils.data.Dataset):
 # データセットの準備関数
 def prepare_dataset(
     model: EVA02WithModuleLoRA,
-    image_dirs, 
+    image_dirs,  # メインの学習データディレクトリ
+    reg_image_dirs=None,  # 正則化用データディレクトリ（オプション）
     val_split=0.1, 
     min_tag_freq=5, 
     remove_special_prefix="remove",
     seed=42,
     cache_dir=None  # キャッシュディレクトリのパラメータを追加
 ):
-    """データセットを準備する関数"""
+    """
+    データセットを準備し、必要に応じてモデルのヘッドを拡張します。
+    メインデータセットと正則化データセットを別々に処理し、
+    タグの統合と拡張は一度だけ行います。
+    
+    Returns:
+        train_image_paths: 訓練用画像パスのリスト
+        train_tags_list: 訓練用タグのリスト
+        val_image_paths: 検証用画像パスのリスト
+        val_tags_list: 検証用タグのリスト
+        reg_image_paths: 正則化用画像パスのリスト
+        reg_tags_list: 正則化用タグのリスト
+        num_existing_tags: 既存タグの数
+        num_new_tags: 新規追加タグの数
+    """
+    import random
+    
+    # シャッフルのためのシードを設定
+    random.seed(seed)
+    np.random.seed(seed)
+    
     print("画像とタグを収集しています...")
     
-    # 画像とタグを収集
-    image_paths = []
-    tags_list = []
+    # メインデータセットから画像とタグを収集
+    main_image_paths = []
+    main_tags_list = []
     
-    for image_dir in tqdm(image_dirs, desc="画像ディレクトリを処理中"):
+    for image_dir in tqdm(image_dirs, desc="メインディレクトリを処理中"):
         for root, _, files in os.walk(image_dir):
             for file in files:
                 if file.lower().endswith(('.jpg', '.jpeg', '.png', '.webp')):
                     image_path = os.path.join(root, file)
-                    
-                    # タグファイルのパスを取得
-                    tag_file = os.path.splitext(image_path)[0] + '.txt'
-                    
-                    # タグファイルが存在する場合のみ処理
-                    if os.path.exists(tag_file):
-                        tags = read_tags_from_file(tag_file, remove_special_prefix=remove_special_prefix)
-                        if tags:
-                            image_paths.append(image_path)
-                            tags_list.append(tags)
+                    try:
+                        tags = read_tags_from_file(image_path, remove_special_prefix)
+                        if tags:  # タグが存在する場合のみ追加
+                            main_image_paths.append(image_path)
+                            main_tags_list.append(tags)
+                    except Exception as e:
+                        print(f"画像 {image_path} の処理中にエラーが発生: {e}")
     
-    print(f"収集された画像数: {len(image_paths)}")
-
+    print(f"メインデータセットの画像数: {len(main_image_paths)}")
+    
+    # 正則化データセットから画像とタグを収集（指定がある場合）
+    reg_image_paths = []
+    reg_tags_list = []
+    
+    if reg_image_dirs:
+        for image_dir in tqdm(reg_image_dirs, desc="正則化ディレクトリを処理中"):
+            for root, _, files in os.walk(image_dir):
+                for file in files:
+                    if file.lower().endswith(('.jpg', '.jpeg', '.png', '.webp')):
+                        image_path = os.path.join(root, file)
+                        try:
+                            tags = read_tags_from_file(image_path, remove_special_prefix)
+                            if tags:  # タグが存在する場合のみ追加
+                                reg_image_paths.append(image_path)
+                                reg_tags_list.append(tags)
+                        except Exception as e:
+                            print(f"画像 {image_path} の処理中にエラーが発生: {e}")
+        
+        print(f"正則化データセットの画像数: {len(reg_image_paths)}")
+    
+    # 全てのタグを収集してモデルを拡張
+    all_tags = []
+    all_tags.extend([tag for tags in main_tags_list for tag in tags])
+    if reg_tags_list:
+        all_tags.extend([tag for tags in reg_tags_list for tag in tags])
+    
     # タグの頻度を計算
     tag_freq = {}
-    for tags in tags_list:
-        for tag in tags:
-            tag_freq[tag] = tag_freq.get(tag, 0) + 1
+    for tag in all_tags:
+        tag_freq[tag] = tag_freq.get(tag, 0) + 1
     
     # 最小頻度以上のタグを抽出
     filtered_tags = {tag for tag, freq in tag_freq.items() if freq >= min_tag_freq}
-
-    # a@, p@など英字1文字＋@から始まるタグを除外
+    
+    # 特殊プレフィックスを持つタグを除外
     if remove_special_prefix:
         filtered_tags = {tag for tag in filtered_tags if not re.match(r'^[a-zA-Z]@', tag)}
     
@@ -1721,53 +1764,57 @@ def prepare_dataset(
     
     print(f"既存タグ数: {len(existing_tags)}")
     print(f"最小頻度以上の新規タグ数: {len(new_filtered_tags)}")
-
+    
     # idx_to_tagとtag_to_idxのlenが念のため同じかどうかを確認
     if not len(model.idx_to_tag) == len(model.tag_to_idx):
         raise ValueError("idx_to_tagとtag_to_idxのlenが異なります。")
-
+    
     if not len(new_filtered_tags) == 0:
         # 新規タグのインデックスを追加
         next_idx = len(model.idx_to_tag)
         for tag in sorted(new_filtered_tags):  # ソートして順序を一定に
             model.tag_to_idx[tag] = next_idx
             next_idx += 1
-    
+        
         # インデックスからタグへのマッピングを作成
         model.idx_to_tag = {i: tag for tag, i in model.tag_to_idx.items()}
-    
+        
         print(f"使用されるタグの総数: {len(model.tag_to_idx)}")   
-
+        
         print(f"モデルの拡張を行います")
         num_classes = len(model.idx_to_tag)
         model.extend_head(num_classes)
-
+    
     # idx-to-tag の最初の10件を表示
     print(f"idx-to-tag の最初の10件: {list(model.idx_to_tag.items())[:10]}")
     # new tagsのidx-to-tagを表示
-    print(f"new tagsのidx-to-tag: {list(model.idx_to_tag.items())[len(model.idx_to_tag):len(model.idx_to_tag)+10]}")
-
-    # データセットを分割
-    indices = list(range(len(image_paths)))
-    np.random.seed(seed)
-    np.random.shuffle(indices)
+    print(f"new tagsのidx-to-tag: {list(model.idx_to_tag.items())[len(existing_tags):len(existing_tags)+min(10, len(new_filtered_tags))]}")
     
-    val_size = int(len(indices) * val_split)
-    train_indices = indices[val_size:]
-    val_indices = indices[:val_size]
+    # メインデータセットを訓練用と検証用に分割
+    main_indices = list(range(len(main_image_paths)))
+    random.shuffle(main_indices)
     
-    train_image_paths = [image_paths[i] for i in train_indices]
-    train_tags_list = [tags_list[i] for i in train_indices]
+    val_size = int(len(main_indices) * val_split)
+    train_indices = main_indices[val_size:]
+    val_indices = main_indices[:val_size]
     
-    val_image_paths = [image_paths[i] for i in val_indices]
-    val_tags_list = [tags_list[i] for i in val_indices]
+    train_image_paths = [main_image_paths[i] for i in train_indices]
+    train_tags_list = [main_tags_list[i] for i in train_indices]
     
-    print(f"訓練データ数: {len(train_image_paths)}")
-    print(f"検証データ数: {len(val_image_paths)}")
+    val_image_paths = [main_image_paths[i] for i in val_indices]
+    val_tags_list = [main_tags_list[i] for i in val_indices]
     
-    return train_image_paths, train_tags_list, val_image_paths, val_tags_list, len(existing_tags), len(new_filtered_tags)
-
-
+    print(f"訓練用画像: {len(train_image_paths)}")
+    print(f"検証用画像: {len(val_image_paths)}")
+    if reg_image_paths:
+        print(f"正則化用画像: {len(reg_image_paths)}")
+    
+    # 元の関数の戻り値の形式に合わせる
+    if reg_image_dirs:
+        return train_image_paths, train_tags_list, val_image_paths, val_tags_list, reg_image_paths, reg_tags_list, len(existing_tags), len(new_filtered_tags)
+    else:
+        return train_image_paths, train_tags_list, val_image_paths, val_tags_list, None, None, len(existing_tags), len(new_filtered_tags)
+    
 # 非対称損失関数（ASL）の実装
 class AsymmetricLoss(nn.Module):
     def __init__(self, gamma_neg=4, gamma_pos=1, clip=0.05, eps=1e-6, disable_torch_grad_focal_loss=False):
@@ -1877,8 +1924,133 @@ class AsymmetricLossOptimized(nn.Module):
         # バッチ単位で平均を取る（サンプル数で割る）
         return -self.loss.mean()
 
+def compute_metrics(outputs, targets):
+    """
+    評価指標を計算する関数（リファクタリング済み・高速化版）
 
-# # 評価指標の計算関数
+    Args:
+        outputs: モデルの出力（シグモイド適用済み）
+        targets: 正解ラベル
+
+    Returns:
+        metrics: 評価指標の辞書。さらに各クラスごとの最適な閾値も追加される。
+    """
+    import matplotlib.pyplot as plt
+    from PIL import Image as PILImage
+    import io
+    from torchvision import transforms
+    from sklearn.metrics import precision_recall_curve, auc
+    from tqdm import tqdm
+    import numpy as np
+    import torch
+
+    # 閾値（0.1～0.85, 0.05刻み）
+    thresholds = np.arange(0.1, 0.9, 0.05)
+
+    # torch.Tensorの場合はNumPy配列へ変換
+    if isinstance(outputs, torch.Tensor):
+        outputs_np = outputs.cpu().numpy()
+    else:
+        outputs_np = outputs
+
+    if isinstance(targets, torch.Tensor):
+        targets_np = targets.cpu().numpy()
+    else:
+        targets_np = targets
+
+    num_classes = targets_np.shape[1]
+
+    # --- PR-AUC の計算 ---
+    pr_auc_scores = []
+    for i in tqdm(range(num_classes), desc="Calculating PR-AUC", leave=False):
+        if targets_np[:, i].sum() > 0:
+            precision, recall, _ = precision_recall_curve(targets_np[:, i], outputs_np[:, i])
+            pr_auc_scores.append(auc(recall, precision))
+    macro_pr_auc = np.mean(pr_auc_scores) if pr_auc_scores else 0
+
+    # --- 閾値毎のマクロF1スコアの計算（ベクトル演算） ---
+    # 全閾値に対し、全サンプル・全クラスでの予測を一括計算
+    preds_all = (outputs_np[None, :, :] >= thresholds[:, None, None]).astype(int)  # shape: (n_thresholds, n_samples, num_classes)
+    TP_all = (preds_all * targets_np[None, :, :]).sum(axis=1)  # 各閾値・各クラスのTP
+    pred_sum_all = preds_all.sum(axis=1)                        # 各閾値・各クラスの予測陽性数
+    true_sum = targets_np.sum(axis=0)                           # 各クラスの正解陽性数
+
+    # 各閾値・各クラスで、予測と正解両方に陽性がある場合のF1を計算（それ以外は nan とする）
+    with np.errstate(divide='ignore', invalid='ignore'):
+        f1_all = np.where((pred_sum_all > 0) & (true_sum[None, :] > 0),
+                          2 * TP_all / (pred_sum_all + true_sum[None, :]),
+                          np.nan)
+    # 各閾値で、有効なクラスのみのF1の平均を算出
+    macro_f1_scores = np.array([np.nanmean(row) if np.any(~np.isnan(row)) else 0 for row in f1_all])
+    best_threshold_idx = np.argmax(macro_f1_scores)
+    best_threshold = thresholds[best_threshold_idx]
+    best_macro_f1 = macro_f1_scores[best_threshold_idx]
+
+    # --- 全体の予測（グローバル最適閾値） ---
+    predictions = (outputs_np >= best_threshold).astype(int)
+
+    # --- 最適閾値での各クラスF1スコア計算（有効なクラスのみ対象） ---
+    pred_sum_best = predictions.sum(axis=0)
+    TP_best = (predictions * targets_np).sum(axis=0)
+    true_sum_best = targets_np.sum(axis=0)
+    valid = (pred_sum_best > 0) & (true_sum_best > 0)
+    f1_scores = np.zeros(num_classes, dtype=float)
+    f1_scores[valid] = 2 * TP_best[valid] / (pred_sum_best[valid] + true_sum_best[valid])
+    # validなクラスのみ抽出（元のコードと同様、条件を満たさないクラスは除外）
+    class_f1_scores = [f1_scores[i] for i in range(num_classes) if valid[i]]
+    macro_f1 = np.mean(class_f1_scores) if class_f1_scores else 0
+
+    # --- 各クラスごとの最適閾値の計算（ベクトル演算） ---
+    # 無効な閾値では f1 を -1 に設定しておく
+    valid_mask = (pred_sum_all > 0) & (true_sum[None, :] > 0)
+    f1_all_thresh = np.full_like(pred_sum_all, -1, dtype=float)
+    denom = pred_sum_all + true_sum[None, :]
+    with np.errstate(divide='ignore', invalid='ignore'):
+        f1_all_thresh[valid_mask] = 2 * TP_all[valid_mask] / denom[valid_mask]
+
+    class_best_thresholds = []
+    for i in range(num_classes):
+        if true_sum[i] > 0:
+            max_f1 = np.max(f1_all_thresh[:, i])
+            # 元のコードと同様、最大F1が0以下なら None を設定
+            if max_f1 > 0:
+                best_idx = np.argmax(f1_all_thresh[:, i])
+                class_best_thresholds.append(thresholds[best_idx])
+            else:
+                class_best_thresholds.append(None)
+        else:
+            # 正例が存在しないクラスはグローバル最適閾値を適用
+            class_best_thresholds.append(best_threshold)
+
+    # --- F1スコアと閾値の関係プロット ---
+    fig, ax = plt.subplots(figsize=(10, 6))
+    ax.plot(range(len(thresholds)), macro_f1_scores, 'bo-', label="Macro F1 Score")
+    ax.plot(best_threshold_idx, best_macro_f1, 'ro', markersize=10, label="Best Threshold")
+    ax.set_xticks(range(len(thresholds)))
+    ax.set_xticklabels([f"{t:.2f}" for t in thresholds], rotation=45)
+    ax.set_xlabel('Threshold')
+    ax.set_ylabel('Macro F1 Score')
+    ax.set_title(f'Macro F1 Score vs Threshold (Optimal Value: {best_threshold:.2f})')
+    ax.grid(True)
+    ax.legend()
+
+    buf = io.BytesIO()
+    fig.tight_layout()
+    plt.savefig(buf, format='png')
+    plt.close(fig)
+    buf.seek(0)
+    plot_image = transforms.ToTensor()(PILImage.open(buf))
+
+    metrics = {
+        'pr_auc': macro_pr_auc,
+        'f1': macro_f1,
+        'threshold': best_threshold,
+        'class_f1s': class_f1_scores,
+        'f1_vs_threshold_plot': plot_image,
+        'class_best_thresholds': class_best_thresholds  # 各クラスごとの最適閾値リスト
+    }
+    return metrics
+
 # def compute_metrics(outputs, targets):
 #     """
 #     評価指標を計算する関数
@@ -1886,20 +2058,23 @@ class AsymmetricLossOptimized(nn.Module):
 #     Args:
 #         outputs: モデルの出力（シグモイド適用済み）
 #         targets: 正解ラベル
-#         thresholds: 閾値のリスト（Noneの場合は0.1から0.9まで0.05刻み）
     
 #     Returns:
-#         metrics: 評価指標の辞書
+#         metrics: 評価指標の辞書。さらに各クラスごとの最適な閾値も追加される。
 #     """
 #     import matplotlib.pyplot as plt
 #     from PIL import Image as PILImage
 #     import io
 #     from torchvision import transforms
 #     from sklearn.metrics import precision_recall_curve, auc, f1_score
-       
+#     from tqdm import tqdm
+#     import numpy as np
+#     import torch
+    
+#     # 閾値の設定（0.1～0.85まで0.05刻み）
 #     thresholds = np.arange(0.1, 0.9, 0.05)
     
-#     # CPU上のnumpy配列に変換
+#     # テンソルの場合はNumPy配列に変換
 #     if isinstance(outputs, torch.Tensor):
 #         outputs_np = outputs.cpu().numpy()
 #     else:
@@ -1911,61 +2086,85 @@ class AsymmetricLossOptimized(nn.Module):
 #         targets_np = targets
     
 #     num_classes = targets_np.shape[1]
-#     f1_scores = np.zeros((len(thresholds), num_classes))
 #     pr_auc_scores = []
     
-#     # 各クラスごとのPR曲線とF1スコアを計算
+#     # 各クラスごとにPR曲線とAUCを計算
 #     for i in tqdm(range(num_classes), desc="Calculating PR-AUC and F1 scores", leave=False):
-#         # クラスiのデータが十分にある場合のみ計算
 #         if np.sum(targets_np[:, i]) > 0:
 #             precision, recall, _ = precision_recall_curve(targets_np[:, i], outputs_np[:, i])
 #             pr_auc = auc(recall, precision)
 #             pr_auc_scores.append(pr_auc)
-            
-#             # 各閾値でのF1スコアを計算
-#             for t_idx, threshold in enumerate(thresholds):
-#                 preds = (outputs_np[:, i] >= threshold).astype(int)
-#                 if np.sum(preds) > 0:  # 予測に陽性がある場合のみ
-#                     f1 = f1_score(targets_np[:, i], preds)
-#                     f1_scores[t_idx, i] = f1
     
 #     # 平均PR-AUC
 #     macro_pr_auc = np.mean(pr_auc_scores) if pr_auc_scores else 0
     
-#     # 各閾値でのマクロF1スコア（クラス平均）
-#     macro_f1_scores = np.mean(f1_scores, axis=1)
+#     # 各閾値でのマクロF1スコアを計算（予測にも正解にも陽性があるクラスのみ）
+#     macro_f1_scores = []
+#     for threshold in tqdm(thresholds, desc="Calculating macro F1 scores", leave=False):
+#         preds = (outputs_np >= threshold).astype(int)
+#         class_f1_scores_threshold = []
+#         for i in tqdm(range(num_classes), desc="Calculating class F1 scores", leave=False):
+#             if np.sum(preds[:, i]) > 0 and np.sum(targets_np[:, i]) > 0:
+#                 f1 = f1_score(targets_np[:, i], preds[:, i])
+#                 class_f1_scores_threshold.append(f1)
+#         if class_f1_scores_threshold:
+#             macro_f1_scores.append(np.mean(class_f1_scores_threshold))
+#         else:
+#             macro_f1_scores.append(0)
+#     macro_f1_scores = np.array(macro_f1_scores)
     
-#     # 最適な閾値を選択（マクロF1スコアが最大となる閾値）
+#     # 最適な閾値（全体のマクロF1スコアが最大となる閾値）の選択
 #     best_threshold_idx = np.argmax(macro_f1_scores)
 #     best_threshold = thresholds[best_threshold_idx]
 #     best_macro_f1 = macro_f1_scores[best_threshold_idx]
     
-#     # 最適な閾値での予測を作成
+#     # 最適な閾値での予測作成
 #     predictions = (outputs_np >= best_threshold).astype(int)
     
-#     # クラスごとのF1スコア
+#     # 最適な閾値で、予測と正解に陽性があるクラスのみF1スコアを計算（個別クラスのF1）
 #     class_f1_scores = []
-#     for i in range(num_classes):
+#     for i in tqdm(range(num_classes), desc="Calculating class F1 scores", leave=False):
 #         if np.sum(predictions[:, i]) > 0 and np.sum(targets_np[:, i]) > 0:
 #             class_f1 = f1_score(targets_np[:, i], predictions[:, i])
 #             class_f1_scores.append(class_f1)
     
-#     # マクロF1スコア（クラス平均）
+#     # 最終的なマクロF1スコア（フィルタリング付き）
 #     macro_f1 = np.mean(class_f1_scores) if class_f1_scores else 0
     
-#     # F1スコア vs 閾値のプロット生成
+#     # --- ここから各クラスごとの最適閾値の計算 ---
+#     class_best_thresholds = []
+#     # 各クラスごとに、全閾値でのF1スコアを求める
+#     for i in tqdm(range(num_classes), desc="Calculating best thresholds", leave=False):
+#         best_thresh = None
+#         best_f1 = 0
+#         # 正例があるクラスのみ計算
+#         if np.sum(targets_np[:, i]) > 0:
+#             for threshold in thresholds:
+#                 preds = (outputs_np[:, i] >= threshold).astype(int)
+#                 # 予測と正解両方に陽性がある場合のみF1を計算
+#                 if np.sum(preds) > 0 and np.sum(targets_np[:, i]) > 0:
+#                     f1 = f1_score(targets_np[:, i], preds)
+#                     if f1 > best_f1:
+#                         best_f1 = f1
+#                         best_thresh = threshold
+#         else:
+#             best_thresh = best_threshold
+#         class_best_thresholds.append(best_thresh)
+#     # --- ここまで各クラスごとの最適閾値の計算 ---
+    
+#     # F1スコアと閾値の関係のプロット生成
 #     fig, ax = plt.subplots(figsize=(10, 6))
-#     for t_idx, threshold in enumerate(thresholds):
-#         ax.plot(t_idx, macro_f1_scores[t_idx], 'bo')
-#     ax.plot(best_threshold_idx, best_macro_f1, 'ro', markersize=10)
+#     ax.plot(range(len(thresholds)), macro_f1_scores, 'bo-', label="Macro F1 Score")
+#     ax.plot(best_threshold_idx, best_macro_f1, 'ro', markersize=10, label="Best Threshold")
 #     ax.set_xticks(range(len(thresholds)))
 #     ax.set_xticklabels([f"{t:.2f}" for t in thresholds], rotation=45)
 #     ax.set_xlabel('Threshold')
 #     ax.set_ylabel('Macro F1 Score')
 #     ax.set_title(f'Macro F1 Score vs Threshold (Optimal Value: {best_threshold:.2f})')
 #     ax.grid(True)
+#     ax.legend()
     
-#     # プロットをバイトストリームに変換
+#     # プロット画像をバイトストリームに変換
 #     buf = io.BytesIO()
 #     fig.tight_layout()
 #     plt.savefig(buf, format='png')
@@ -1980,144 +2179,11 @@ class AsymmetricLossOptimized(nn.Module):
 #         'f1': macro_f1,
 #         'threshold': best_threshold,
 #         'class_f1s': class_f1_scores,
-#         'f1_vs_threshold_plot': plot_image
+#         'f1_vs_threshold_plot': plot_image,
+#         'class_best_thresholds': class_best_thresholds  # 追加：各クラスごとの最適な閾値リスト
 #     }
     
 #     return metrics
-
-def compute_metrics(outputs, targets):
-    """
-    評価指標を計算する関数
-    
-    Args:
-        outputs: モデルの出力（シグモイド適用済み）
-        targets: 正解ラベル
-    
-    Returns:
-        metrics: 評価指標の辞書。さらに各クラスごとの最適な閾値も追加される。
-    """
-    import matplotlib.pyplot as plt
-    from PIL import Image as PILImage
-    import io
-    from torchvision import transforms
-    from sklearn.metrics import precision_recall_curve, auc, f1_score
-    from tqdm import tqdm
-    import numpy as np
-    import torch
-    
-    # 閾値の設定（0.1～0.85まで0.05刻み）
-    thresholds = np.arange(0.1, 0.9, 0.05)
-    
-    # テンソルの場合はNumPy配列に変換
-    if isinstance(outputs, torch.Tensor):
-        outputs_np = outputs.cpu().numpy()
-    else:
-        outputs_np = outputs
-
-    if isinstance(targets, torch.Tensor):
-        targets_np = targets.cpu().numpy()
-    else:
-        targets_np = targets
-    
-    num_classes = targets_np.shape[1]
-    pr_auc_scores = []
-    
-    # 各クラスごとにPR曲線とAUCを計算
-    for i in tqdm(range(num_classes), desc="Calculating PR-AUC and F1 scores", leave=False):
-        if np.sum(targets_np[:, i]) > 0:
-            precision, recall, _ = precision_recall_curve(targets_np[:, i], outputs_np[:, i])
-            pr_auc = auc(recall, precision)
-            pr_auc_scores.append(pr_auc)
-    
-    # 平均PR-AUC
-    macro_pr_auc = np.mean(pr_auc_scores) if pr_auc_scores else 0
-    
-    # 各閾値でのマクロF1スコアを計算（予測にも正解にも陽性があるクラスのみ）
-    macro_f1_scores = []
-    for threshold in tqdm(thresholds, desc="Calculating macro F1 scores", leave=False):
-        preds = (outputs_np >= threshold).astype(int)
-        class_f1_scores_threshold = []
-        for i in tqdm(range(num_classes), desc="Calculating class F1 scores", leave=False):
-            if np.sum(preds[:, i]) > 0 and np.sum(targets_np[:, i]) > 0:
-                f1 = f1_score(targets_np[:, i], preds[:, i])
-                class_f1_scores_threshold.append(f1)
-        if class_f1_scores_threshold:
-            macro_f1_scores.append(np.mean(class_f1_scores_threshold))
-        else:
-            macro_f1_scores.append(0)
-    macro_f1_scores = np.array(macro_f1_scores)
-    
-    # 最適な閾値（全体のマクロF1スコアが最大となる閾値）の選択
-    best_threshold_idx = np.argmax(macro_f1_scores)
-    best_threshold = thresholds[best_threshold_idx]
-    best_macro_f1 = macro_f1_scores[best_threshold_idx]
-    
-    # 最適な閾値での予測作成
-    predictions = (outputs_np >= best_threshold).astype(int)
-    
-    # 最適な閾値で、予測と正解に陽性があるクラスのみF1スコアを計算（個別クラスのF1）
-    class_f1_scores = []
-    for i in tqdm(range(num_classes), desc="Calculating class F1 scores", leave=False):
-        if np.sum(predictions[:, i]) > 0 and np.sum(targets_np[:, i]) > 0:
-            class_f1 = f1_score(targets_np[:, i], predictions[:, i])
-            class_f1_scores.append(class_f1)
-    
-    # 最終的なマクロF1スコア（フィルタリング付き）
-    macro_f1 = np.mean(class_f1_scores) if class_f1_scores else 0
-    
-    # --- ここから各クラスごとの最適閾値の計算 ---
-    class_best_thresholds = []
-    # 各クラスごとに、全閾値でのF1スコアを求める
-    for i in tqdm(range(num_classes), desc="Calculating best thresholds", leave=False):
-        best_thresh = None
-        best_f1 = 0
-        # 正例があるクラスのみ計算
-        if np.sum(targets_np[:, i]) > 0:
-            for threshold in thresholds:
-                preds = (outputs_np[:, i] >= threshold).astype(int)
-                # 予測と正解両方に陽性がある場合のみF1を計算
-                if np.sum(preds) > 0 and np.sum(targets_np[:, i]) > 0:
-                    f1 = f1_score(targets_np[:, i], preds)
-                    if f1 > best_f1:
-                        best_f1 = f1
-                        best_thresh = threshold
-        else:
-            best_thresh = best_threshold
-        class_best_thresholds.append(best_thresh)
-    # --- ここまで各クラスごとの最適閾値の計算 ---
-    
-    # F1スコアと閾値の関係のプロット生成
-    fig, ax = plt.subplots(figsize=(10, 6))
-    ax.plot(range(len(thresholds)), macro_f1_scores, 'bo-', label="Macro F1 Score")
-    ax.plot(best_threshold_idx, best_macro_f1, 'ro', markersize=10, label="Best Threshold")
-    ax.set_xticks(range(len(thresholds)))
-    ax.set_xticklabels([f"{t:.2f}" for t in thresholds], rotation=45)
-    ax.set_xlabel('Threshold')
-    ax.set_ylabel('Macro F1 Score')
-    ax.set_title(f'Macro F1 Score vs Threshold (Optimal Value: {best_threshold:.2f})')
-    ax.grid(True)
-    ax.legend()
-    
-    # プロット画像をバイトストリームに変換
-    buf = io.BytesIO()
-    fig.tight_layout()
-    plt.savefig(buf, format='png')
-    plt.close(fig)
-    buf.seek(0)
-    
-    # 画像をテンソルに変換
-    plot_image = transforms.ToTensor()(PILImage.open(buf))
-    
-    metrics = {
-        'pr_auc': macro_pr_auc,
-        'f1': macro_f1,
-        'threshold': best_threshold,
-        'class_f1s': class_f1_scores,
-        'f1_vs_threshold_plot': plot_image,
-        'class_best_thresholds': class_best_thresholds  # 追加：各クラスごとの最適な閾値リスト
-    }
-    
-    return metrics
 
 # トレーニング関数
 def train_model(
@@ -2125,6 +2191,7 @@ def train_model(
     base_model,
     train_loader, 
     val_loader, 
+    reg_loader,
     tag_to_idx,
     idx_to_tag,
     tag_to_category,
@@ -2327,9 +2394,6 @@ def train_model(
                 # if tensorboard:
                 #     writer.add_image(f'predictions/val_{i}', img_grid, 0)
     
-    # 検証メトリクスの計算
-    val_loss /= len(val_loader)
-    
     def calculate_group_stats(preds_list):
         """
         予測値の平均と分散を計算する関数
@@ -2384,38 +2448,16 @@ def train_model(
         }
 
     # 陽性群と陰性群の統計を計算
-    pos_stats = calculate_group_stats(val_pos_preds)
+    # pos_stats = calculate_group_stats(val_pos_preds)
     neg_stats = calculate_group_stats(val_neg_preds)
     
-    # # 上位と下位の統計情報を表示
-    # tag_indices = list(range(len(neg_stats['means'])))
-    # sorted_by_mean = sorted(tag_indices, key=lambda i: neg_stats['means'][i], reverse=True)
-    
-    # print("\n陰性群の予測値が高いタグ（誤検出リスクが高い）:")
-    # for i in sorted_by_mean[:10]:
-    #     tag_name = idx_to_tag[i] if i in idx_to_tag else f"Unknown({i})"
-    #     print(f"  {tag_name}: 平均={neg_stats['means'][i]:.4f}, 分散={neg_stats['variance'][i]:.4f}, サンプル数={int(neg_stats['counts'][i])}")
-    
-    # print("\n陰性群の予測値が低いタグ（誤検出リスクが低い）:")
-    # for i in sorted_by_mean[-10:]:
-    #     tag_name = idx_to_tag[i] if i in idx_to_tag else f"Unknown({i})"
-    #     print(f"  {tag_name}: 平均={neg_stats['means'][i]:.4f}, 分散={neg_stats['variance'][i]:.4f}, サンプル数={int(neg_stats['counts'][i])}")
-    
-    # リストに変換して結合
-    val_preds_list = []
-    val_targets_list = []
+    val_preds = [pred for batch in val_preds for pred in batch]
+    val_targets = [target for batch in val_targets for target in batch]
+    val_preds = np.array(val_preds)
+    val_targets = np.array(val_targets)
 
-    # ランダムに100のindicesを選択
-    random_indices = np.random.choice(len(val_preds), min(100, len(val_preds)), replace=False)
-    for i in tqdm(random_indices, desc="Picking validation data", leave=False):
-        val_preds_list.extend(val_preds[i])
-        val_targets_list.extend(val_targets[i])
-        
-    # 最後にnumpy配列に変換
-    val_preds = np.array(val_preds_list)
-    val_targets = np.array(val_targets_list)
-    del val_preds_list, val_targets_list
-    
+    # 検証メトリクスの計算
+    val_loss /= len(val_loader)
     val_metrics = compute_metrics(val_preds, val_targets)
     
     # 既存タグと新規タグに分けてメトリクスを計算
@@ -2473,7 +2515,7 @@ def train_model(
             images = images.to(device)
             targets = targets.to(device)
             
-            # 混合精度トレーニング
+            # 通常のデータでの学習
             if mixed_precision:
                 with torch.amp.autocast('cuda'):
                     outputs = model(images)
@@ -2490,6 +2532,36 @@ def train_model(
                 loss.backward()
                 optimizer.step()
                 optimizer.zero_grad()
+
+            # 正則化データセットでの学習
+            if reg_loader is not None:
+                try:
+                    reg_images, reg_targets = next(reg_iter)
+                except (StopIteration, NameError):
+                    reg_iter = iter(reg_loader)
+                    reg_images, reg_targets = next(reg_iter)
+
+                reg_images = reg_images.to(device)
+                reg_targets = reg_targets.to(device)
+
+                if mixed_precision:
+                    with torch.amp.autocast('cuda'):
+                        reg_outputs = model(reg_images)
+                        reg_loss = criterion(reg_outputs, reg_targets)
+                    
+                    scaler.scale(reg_loss).backward()
+                    scaler.step(optimizer)
+                    scaler.update()
+                    optimizer.zero_grad()
+                else:
+                    reg_outputs = model(reg_images)
+                    reg_loss = criterion(reg_outputs, reg_targets)
+                    
+                    reg_loss.backward()
+                    optimizer.step()
+                    optimizer.zero_grad()
+
+                loss = (loss + reg_loss) / 2
             
             train_loss += loss.item()
             
@@ -2530,23 +2602,13 @@ def train_model(
             writer.add_scalar('Learning_Rate', optimizer.param_groups[0]['lr'], epoch)
         
         # トレーニングメトリクスの計算
-        train_loss /= len(train_loader)
+        train_loss /= len(train_loader)         
         
-        # リストに変換して結合
-        train_preds_list = []
-        train_targets_list = []
+        train_preds = [pred for batch in train_preds for pred in batch]
+        train_targets = [target for batch in train_targets for target in batch]
+        train_preds = np.array(train_preds)
+        train_targets = np.array(train_targets)
 
-        # ランダムに100のindicesを選択
-        random_indices = np.random.choice(len(train_preds), min(100, len(train_preds)), replace=False)
-        for i in tqdm(random_indices, desc="Picking training data", leave=False):
-            train_preds_list.extend(train_preds[i])
-            train_targets_list.extend(train_targets[i])
-            
-        # 最後にnumpy配列に変換
-        train_preds = np.array(train_preds_list)
-        train_targets = np.array(train_targets_list)
-        del train_preds_list, train_targets_list
-             
         train_metrics = compute_metrics(train_preds,train_targets)
 
         if dynamic_threshold:
@@ -2628,27 +2690,17 @@ def train_model(
 
 
         # 陽性群と陰性群の統計を計算
-        pos_stats = calculate_group_stats(val_pos_preds)
+        # pos_stats = calculate_group_stats(val_pos_preds)
         neg_stats = calculate_group_stats(val_neg_preds)
 
         # 検証メトリクスの計算
         val_loss /= len(val_loader)
 
-        # リストに変換して結合
-        val_preds_list = []
-        val_targets_list = []
+        val_preds = [pred for batch in val_preds for pred in batch]
+        val_targets = [target for batch in val_targets for target in batch]
+        val_preds = np.array(val_preds)
+        val_targets = np.array(val_targets)
 
-        # ランダムに100のindicesを選択
-        random_indices = np.random.choice(len(val_preds), min(100, len(val_preds)), replace=False)
-        for i in tqdm(random_indices, desc="Picking validation data", leave=False):
-            val_preds_list.extend(val_preds[i])
-            val_targets_list.extend(val_targets[i])
-            
-        # 最後にnumpy配列に変換
-        val_preds = np.array(val_preds_list)
-        val_targets = np.array(val_targets_list)
-        del val_preds_list, val_targets_list
-        
         val_metrics = compute_metrics(val_preds, val_targets)
         
         # 結果の表示
@@ -2716,6 +2768,7 @@ def train_model(
 
         if merge_every_n_epochs is not None and (epoch + 1) % merge_every_n_epochs == 0:
             model.merge_lora_to_base_model()
+            model.to(device)
             # optimizer, schedulerをリセット
             optimizer = setup_optimizer(model, learning_rate, weight_decay, use_8bit_optimizer)
             # schedulerは通常、warmupをやり直すが、ここでは未実装
@@ -2834,7 +2887,8 @@ def main():
     # データセット関連の引数
     train_parser.add_argument('--image_dirs', type=str, nargs='+', required=True, help='トレーニング画像のディレクトリ（複数指定可）')
     train_parser.add_argument('--val_split', type=float, default=0.1, help='検証データの割合')
-    train_parser.add_argument('--min_tag_freq', type=int, default=5, help='タグの最小出現頻度')
+    train_parser.add_argument('--reg_image_dirs', type=str, nargs='+', default=None, help='正則化画像のディレクトリ（複数指定可）')
+    train_parser.add_argument('--min_tag_freq', type=int, default=10, help='タグの最小出現頻度')
     train_parser.add_argument('--remove_special_prefix', default="omit", choices=["remove", "omit"], help='特殊プレフィックス（例：a@、g@など）を除去する')
     # train_parser.add_argument('--image_size', type=int, default=224, help='画像サイズ')
     train_parser.add_argument('--batch_size', type=int, default=4, help='バッチサイズ')
@@ -3072,14 +3126,15 @@ def main():
         
         # 2. データセットの準備（新規タグが検出される）,ヘッド拡張もこの中で行われる
         print("データセットを準備しています...")
-        train_image_paths, train_tags_list, val_image_paths, val_tags_list, old_tags_count, _ = prepare_dataset(
+        train_image_paths, train_tags_list, val_image_paths, val_tags_list, reg_image_paths, reg_tags_list, old_tags_count, _ = prepare_dataset(
             model=model,
             image_dirs=args.image_dirs,
+            reg_image_dirs=args.reg_image_dirs,
             val_split=args.val_split,
             min_tag_freq=args.min_tag_freq,
             remove_special_prefix=args.remove_special_prefix,
             seed=args.seed
-        )        
+        )
 
         # トレーニング前にLoRAをマージ（指定された場合）
         if args.merge_before_train is not None:
@@ -3118,6 +3173,16 @@ def main():
             cache_dir=None if args.cache_dir is None else os.path.join(args.cache_dir, 'val'),  # 検証用キャッシュディレクトリ
             force_recache=False,  # キャッシュを強制的に再作成するフラグ
         )
+
+        if args.reg_image_dirs:
+            reg_dataset = TagImageDataset(
+                image_paths=reg_image_paths,
+                tags_list=reg_tags_list,
+                tag_to_idx=model.tag_to_idx,
+                transform=model.transform,
+                cache_dir=None if args.cache_dir is None else os.path.join(args.cache_dir, 'reg'),  # 正則化用キャッシュディレクトリ
+                force_recache=False,  # キャッシュを強制的に再作成するフラグ
+            )
         
         # データローダーの作成
         train_loader = torch.utils.data.DataLoader(
@@ -3135,6 +3200,15 @@ def main():
             num_workers=args.num_workers,
             pin_memory=True
         )
+
+        if args.reg_image_dirs:
+            reg_loader = torch.utils.data.DataLoader(
+                reg_dataset,
+                batch_size=args.batch_size,
+                shuffle=True,
+                num_workers=args.num_workers,
+                pin_memory=True
+            )
         
         # 損失関数の設定
         if args.loss_fn == 'bce':
@@ -3182,6 +3256,7 @@ def main():
             base_model=args.base_model,
             train_loader=train_loader,
             val_loader=val_loader,
+            reg_loader=reg_loader,
             tag_to_idx=model.tag_to_idx,
             idx_to_tag=model.idx_to_tag,
             tag_to_category=tag_to_category,
