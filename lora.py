@@ -3099,9 +3099,6 @@ def main():
             model.apply_lora_to_modules()
         
         model = model.to(device)
-
-        # データ変換の設定
-        from timm.data import create_transform
         
         # データセットの作成
         train_dataset = TagImageDataset(
