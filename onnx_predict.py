@@ -63,6 +63,23 @@ def normalize_tag(tag):
     # タグの正規化
     tag = tag.lower().strip()
     tag = tag.replace("_", " ")
+    # 括弧をエスケープするケースも正規化
+    tag = tag.replace('\\(', '(').replace('\\)', ')')
+    return tag
+
+def standardize_tag_format(tag):
+    """
+    タグ形式を標準化する (エクスポート用)
+    aaaa bbbb (cccc) → aaaa_bbbb_(cccc)
+    
+    Args:
+        tag: 変換前のタグ
+    Returns:
+        変換後のタグ
+    """
+    # 括弧はそのまま保持
+    # スペースをアンダースコアに変換
+    tag = tag.replace(' ', '_')
     return tag
 
 def read_tags_from_file(image_path, remove_special_prefix="remove"):
@@ -80,7 +97,7 @@ def read_tags_from_file(image_path, remove_special_prefix="remove"):
             response = requests.get(txt_url, timeout=5)
             if response.status_code == 200:
                 for line in response.text.splitlines():
-                    tags.extend(line.split(","))
+                    tags.extend([t.strip() for t in line.split(",")])
             else:
                 print(f"Warning: Tag file not found at {txt_url}")
                 return []
@@ -91,7 +108,7 @@ def read_tags_from_file(image_path, remove_special_prefix="remove"):
     elif os.path.exists(txt_path):
         with open(txt_path, "r", encoding="utf-8") as f:
             for line in f:
-                tags.extend(line.split(","))
+                tags.extend([t.strip() for t in line.split(",")])
     else:
         return []
     
@@ -511,7 +528,7 @@ def convert_tag_format(tag: str) -> str:
     
     return tag
 
-def save_tags_as_csv(predictions, output_path, threshold=0.45):
+def save_tags_as_csv(predictions, output_path, threshold=0.45, mode="overwrite"):
     """
     予測されたタグをカンマ区切りのテキストファイルとして保存する
     
@@ -519,13 +536,14 @@ def save_tags_as_csv(predictions, output_path, threshold=0.45):
         predictions: 予測結果の辞書
         output_path: 出力ファイルパス
         threshold: タグの閾値
+        mode: 保存モード ("overwrite"=上書き, "add"=既存タグに追加)
     """
     # すべてのタグを収集
-    all_tags = []
+    new_tags = []
     
     # レーティングタグ（最も確率の高いもののみ）
     if predictions["rating"]:
-        all_tags.append(convert_tag_format(predictions["rating"][0][0]))
+        new_tags.append(predictions["rating"][0][0])
     
     # 他のカテゴリのタグを追加
     for category in ["character", "copyright", "artist", "general", "meta"]:
@@ -533,14 +551,47 @@ def save_tags_as_csv(predictions, output_path, threshold=0.45):
             # メタタグの中でidやcommentaryを含むものは除外
             if category == "meta" and any(pattern in tag.lower() for pattern in ['id', 'commentary']):
                 continue
-            all_tags.append(convert_tag_format(tag))
+            new_tags.append(tag)
+    
+    # 既存のタグを読み込む (addモードの場合)
+    existing_tags = []
+    if mode == "add" and os.path.exists(output_path):
+        try:
+            with open(output_path, 'r', encoding='utf-8') as f:
+                for line in f:
+                    existing_tags.extend([t.strip() for t in line.split(",")])
+            
+            # 既存タグを正規化して重複判定に使用するセットを作成
+            normalized_existing_tags = {normalize_tag(tag) for tag in existing_tags if tag.strip()}
+            print(f"既存のタグ: {len(normalized_existing_tags)}個")
+            
+            # 新しいタグのうち、正規化形式で既存タグと重複しないものだけを追加
+            unique_new_tags = []
+            for tag in new_tags:
+                normalized_tag = normalize_tag(tag)
+                if normalized_tag not in normalized_existing_tags:
+                    unique_new_tags.append(tag)
+                    normalized_existing_tags.add(normalized_tag)  # 重複チェック用セットにも追加
+            
+            # 既存のタグに新しいタグを追加
+            all_tags = existing_tags + unique_new_tags
+            print(f"追加された新しいタグ: {len(unique_new_tags)}個")
+        except Exception as e:
+            print(f"既存タグの読み込みエラー: {e}。新しいタグのみで上書きします。")
+            all_tags = new_tags
+    else:
+        # 上書きモードまたはファイルが存在しない場合は新しいタグのみ
+        all_tags = new_tags
+    
+    # 出力前に全タグを標準形式にフォーマット
+    formatted_tags = [standardize_tag_format(tag) for tag in all_tags]
     
     # カンマ区切りで保存（カンマの後にスペースを入れる）
     with open(output_path, 'w', encoding='utf-8') as f:
-        f.write(", ".join(all_tags))
+        f.write(", ".join(formatted_tags))
     
-    print(f"タグをカンマ区切りで保存しました: {output_path}")
-    return all_tags
+    print(f"タグをカンマ区切りで保存しました: {output_path} (モード: {mode})")
+    return formatted_tags
 
 def extract_frames_from_video(video_path, num_frames):
     """
@@ -591,7 +642,7 @@ def extract_frames_from_video(video_path, num_frames):
     cap.release()
     return frames
 
-def predict_with_onnx(image_path, model_path, tag_mapping_path, gen_threshold=0.45, char_threshold=0.45, output_path=None, use_gpu=False, output_mode="visualization"):
+def predict_with_onnx(image_path, model_path, tag_mapping_path, gen_threshold=0.45, char_threshold=0.45, output_path=None, use_gpu=False, output_mode="visualization", tag_mode="add"):
     # ONNXモデルでの予測
     print(f"Loading model: {model_path}")
     
@@ -803,7 +854,7 @@ def predict_with_onnx(image_path, model_path, tag_mapping_path, gen_threshold=0.
             output_path=viz_output_path
         )
     else:
-        save_tags_as_csv(predictions, tag_output_path, threshold=gen_threshold)
+        save_tags_as_csv(predictions, tag_output_path, threshold=gen_threshold, mode=tag_mode)
     
     return predictions, output_path
 
@@ -851,7 +902,7 @@ def debug_preprocessing(image_path):
     print("前処理のデバッグ画像を保存しました: preprocessing_debug.png")
 
 def batch_predict(dirs, model_path, tag_mapping_path, gen_threshold=0.45, char_threshold=0.45, video_frames=3,
-                 use_gpu=False, output_mode="visualization", recursive=False, batch_size=1):
+                 use_gpu=False, output_mode="visualization", recursive=False, batch_size=1, tag_mode="add"):
     """
     複数のディレクトリ内の画像に対してバッチ推論を実行する
     
@@ -1043,7 +1094,7 @@ def batch_predict(dirs, model_path, tag_mapping_path, gen_threshold=0.45, char_t
                                 output_path=output_path
                             )
                         else:
-                            save_tags_as_csv(predictions, output_path, threshold=gen_threshold)
+                            save_tags_as_csv(predictions, output_path, threshold=gen_threshold, mode=tag_mode)
                         
                         print(f"処理完了 [{batch_start+idx+1}/{total_images}]: {image_path}")
                         
@@ -1163,7 +1214,7 @@ def batch_predict(dirs, model_path, tag_mapping_path, gen_threshold=0.45, char_t
                         output_path=output_path
                     )
                 else:
-                    save_tags_as_csv(combined_predictions, output_path, threshold=gen_threshold)
+                    save_tags_as_csv(combined_predictions, output_path, threshold=gen_threshold, mode=tag_mode)
                 
                 print(f"動画処理完了: {video_path}")
             
@@ -1253,7 +1304,7 @@ def combine_frame_predictions(frame_predictions, gen_threshold=0.45, char_thresh
     return result
 
 def predict_video_with_onnx(video_path, model_path, tag_mapping_path, gen_threshold=0.45, char_threshold=0.45, 
-                           output_path=None, use_gpu=False, output_mode="visualization", video_frames=3):
+                           output_path=None, use_gpu=False, output_mode="visualization", video_frames=3, tag_mode="add"):
     """
     単一の動画ファイルに対して推論を実行する
     
@@ -1480,7 +1531,7 @@ def predict_video_with_onnx(video_path, model_path, tag_mapping_path, gen_thresh
             output_path=output_path
         )
     else:
-        save_tags_as_csv(combined_predictions, output_path, threshold=gen_threshold)
+        save_tags_as_csv(combined_predictions, output_path, threshold=gen_threshold, mode=tag_mode)
     
     print(f"動画処理完了: {video_path}")
     return combined_predictions, frame
@@ -1513,6 +1564,10 @@ def main():
     parser.add_argument('--recursive', action='store_true', help='ディレクトリモードでサブディレクトリも処理する')
     parser.add_argument('--batch_size', type=int, default=1, help='バッチ処理時のバッチサイズ')
     
+    # タグ保存モードの引数を追加
+    parser.add_argument('--tag_mode', type=str, choices=['overwrite', 'add'], default='add',
+                        help='タグ保存モード: overwrite=上書き, add=既存タグに追加')
+    
     args = parser.parse_args()
     
     if args.image:
@@ -1525,7 +1580,8 @@ def main():
             args.char_threshold,
             args.output,
             use_gpu=args.gpu,
-            output_mode=args.output_mode
+            output_mode=args.output_mode,
+            tag_mode=args.tag_mode
         )
     elif args.video:
         # 動画処理
@@ -1538,7 +1594,8 @@ def main():
             args.output,
             use_gpu=args.gpu,
             output_mode=args.output_mode,
-            video_frames=args.video_frames
+            video_frames=args.video_frames,
+            tag_mode=args.tag_mode
         )
     elif args.dirs:
         # バッチ処理
@@ -1552,7 +1609,8 @@ def main():
             output_mode=args.output_mode,
             recursive=args.recursive,
             batch_size=args.batch_size,
-            video_frames=args.video_frames  # 動画フレーム数も渡す
+            video_frames=args.video_frames,
+            tag_mode=args.tag_mode
         )
 
 # GPUが利用可能かチェックする関数

@@ -3209,6 +3209,8 @@ def main():
                 num_workers=args.num_workers,
                 pin_memory=True
             )
+        else:
+            reg_loader = None
         
         # 損失関数の設定
         if args.loss_fn == 'bce':
@@ -3251,6 +3253,7 @@ def main():
 
         # トレーニングの実行
         print("トレーニングを開始します...")
+        
         train_model(
             model=model,
             base_model=args.base_model,
@@ -3276,10 +3279,9 @@ def main():
             tensorboard=True,
             initial_threshold=args.initial_threshold,
             dynamic_threshold=args.dynamic_threshold,
-            head_only_train_steps=args.head_only_train_steps,  # 変更: new_head_only_train_steps → head_only_train_steps
-            cache_dir=None  # キャッシュディレクトリのパラメータを追加
+            head_only_train_steps=args.head_only_train_steps,
+            cache_dir=None
         )
-        
         print("トレーニングが完了しました！")
         
         # TensorBoardプロセスの終了
