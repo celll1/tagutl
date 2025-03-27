@@ -77,8 +77,9 @@ def standardize_tag_format(tag):
     Returns:
         変換後のタグ
     """
-    # 括弧はそのまま保持
     # スペースをアンダースコアに変換
+    # エスケープされた括弧を通常の括弧に変換
+    tag = tag.replace('\\(', '(').replace('\\)', ')')
     tag = tag.replace(' ', '_')
     return tag
 
@@ -187,7 +188,7 @@ def visualize_predictions(image, tags, predictions, threshold=0.45, output_path=
     
     # Filter out unwanted meta tags
     filtered_meta = []
-    excluded_meta_patterns = ['id', 'commentary']
+    excluded_meta_patterns = ['id', 'commentary', 'request']
     
     for tag, prob in predictions["meta"]:
         # Skip tags containing 'id' or 'commentary'
@@ -528,7 +529,7 @@ def convert_tag_format(tag: str) -> str:
     
     return tag
 
-def save_tags_as_csv(predictions, output_path, threshold=0.45, mode="overwrite"):
+def save_tags_as_csv(predictions, output_path, threshold=0.45, mode="overwrite", remove_threshold=None):
     """
     予測されたタグをカンマ区切りのテキストファイルとして保存する
     
@@ -537,13 +538,17 @@ def save_tags_as_csv(predictions, output_path, threshold=0.45, mode="overwrite")
         output_path: 出力ファイルパス
         threshold: タグの閾値
         mode: 保存モード ("overwrite"=上書き, "add"=既存タグに追加)
+        remove_threshold: 既存タグを除去する閾値（Noneの場合は除去しない）
     """
     # すべてのタグを収集
     new_tags = []
+    new_tags_probs = {}  # タグと確率のマッピング
     
     # レーティングタグ（最も確率の高いもののみ）
     if predictions["rating"]:
-        new_tags.append(predictions["rating"][0][0])
+        tag, prob = predictions["rating"][0]
+        new_tags.append(tag)
+        new_tags_probs[normalize_tag(tag)] = prob
     
     # 他のカテゴリのタグを追加
     for category in ["character", "copyright", "artist", "general", "meta"]:
@@ -552,6 +557,7 @@ def save_tags_as_csv(predictions, output_path, threshold=0.45, mode="overwrite")
             if category == "meta" and any(pattern in tag.lower() for pattern in ['id', 'commentary']):
                 continue
             new_tags.append(tag)
+            new_tags_probs[normalize_tag(tag)] = prob
     
     # 既存のタグを読み込む (addモードの場合)
     existing_tags = []
@@ -565,13 +571,38 @@ def save_tags_as_csv(predictions, output_path, threshold=0.45, mode="overwrite")
             normalized_existing_tags = {normalize_tag(tag) for tag in existing_tags if tag.strip()}
             print(f"既存のタグ: {len(normalized_existing_tags)}個")
             
+            # remove_thresholdが設定されている場合、低確率タグを除去
+            if remove_threshold is not None:
+                filtered_existing_tags = []
+                removed_tags = []
+                for tag in existing_tags:
+                    normalized_tag = normalize_tag(tag)
+                    # 新しい予測に含まれるタグの場合
+                    if normalized_tag in new_tags_probs:
+                        if new_tags_probs[normalized_tag] >= remove_threshold:
+                            filtered_existing_tags.append(tag)
+                        else:
+                            removed_tags.append(tag)
+                    else:
+                        # 予測に含まれないタグは保持
+                        filtered_existing_tags.append(tag)
+                
+                if removed_tags:
+                    print(f"除去されたタグ（閾値{remove_threshold}未満）: {len(removed_tags)}個")
+                    for tag in removed_tags:
+                        prob = new_tags_probs.get(normalize_tag(tag), 0.0)
+                        print(f"  {tag}: {prob:.3f}")
+                
+                existing_tags = filtered_existing_tags
+                normalized_existing_tags = {normalize_tag(tag) for tag in existing_tags if tag.strip()}
+            
             # 新しいタグのうち、正規化形式で既存タグと重複しないものだけを追加
             unique_new_tags = []
             for tag in new_tags:
                 normalized_tag = normalize_tag(tag)
                 if normalized_tag not in normalized_existing_tags:
                     unique_new_tags.append(tag)
-                    normalized_existing_tags.add(normalized_tag)  # 重複チェック用セットにも追加
+                    normalized_existing_tags.add(normalized_tag)
             
             # 既存のタグに新しいタグを追加
             all_tags = existing_tags + unique_new_tags
@@ -642,7 +673,7 @@ def extract_frames_from_video(video_path, num_frames):
     cap.release()
     return frames
 
-def predict_with_onnx(image_path, model_path, tag_mapping_path, gen_threshold=0.45, char_threshold=0.45, output_path=None, use_gpu=False, output_mode="visualization", tag_mode="add"):
+def predict_with_onnx(image_path, model_path, tag_mapping_path, gen_threshold=0.45, char_threshold=0.45, output_path=None, use_gpu=False, output_mode="visualization", tag_mode="add", remove_threshold=None):
     # ONNXモデルでの予測
     print(f"Loading model: {model_path}")
     
@@ -854,7 +885,7 @@ def predict_with_onnx(image_path, model_path, tag_mapping_path, gen_threshold=0.
             output_path=viz_output_path
         )
     else:
-        save_tags_as_csv(predictions, tag_output_path, threshold=gen_threshold, mode=tag_mode)
+        save_tags_as_csv(predictions, tag_output_path, threshold=gen_threshold, mode=tag_mode, remove_threshold=remove_threshold)
     
     return predictions, output_path
 
@@ -902,7 +933,8 @@ def debug_preprocessing(image_path):
     print("前処理のデバッグ画像を保存しました: preprocessing_debug.png")
 
 def batch_predict(dirs, model_path, tag_mapping_path, gen_threshold=0.45, char_threshold=0.45, video_frames=3,
-                 use_gpu=False, output_mode="visualization", recursive=False, batch_size=1, tag_mode="add"):
+                 use_gpu=False, output_mode="visualization", recursive=False, batch_size=1, tag_mode="add", 
+                 remove_threshold=None):  # remove_thresholdパラメータを追加
     """
     複数のディレクトリ内の画像に対してバッチ推論を実行する
     
@@ -917,6 +949,8 @@ def batch_predict(dirs, model_path, tag_mapping_path, gen_threshold=0.45, char_t
         output_mode: 出力モード
         recursive: サブディレクトリも処理するかどうか
         batch_size: バッチサイズ（デフォルト: 1）
+        tag_mode: タグ保存モード ("overwrite"=上書き, "add"=既存タグに追加)
+        remove_threshold: 既存タグを除去する閾値（Noneの場合は除去しない）
     """
     print(f"モデルを読み込み中: {model_path}")
     
@@ -1094,7 +1128,8 @@ def batch_predict(dirs, model_path, tag_mapping_path, gen_threshold=0.45, char_t
                                 output_path=output_path
                             )
                         else:
-                            save_tags_as_csv(predictions, output_path, threshold=gen_threshold, mode=tag_mode)
+                            save_tags_as_csv(predictions, output_path, threshold=gen_threshold, 
+                                             mode=tag_mode, remove_threshold=remove_threshold)
                         
                         print(f"処理完了 [{batch_start+idx+1}/{total_images}]: {image_path}")
                         
@@ -1214,7 +1249,8 @@ def batch_predict(dirs, model_path, tag_mapping_path, gen_threshold=0.45, char_t
                         output_path=output_path
                     )
                 else:
-                    save_tags_as_csv(combined_predictions, output_path, threshold=gen_threshold, mode=tag_mode)
+                    save_tags_as_csv(combined_predictions, output_path, threshold=gen_threshold, 
+                                     mode=tag_mode, remove_threshold=remove_threshold)
                 
                 print(f"動画処理完了: {video_path}")
             
@@ -1304,7 +1340,7 @@ def combine_frame_predictions(frame_predictions, gen_threshold=0.45, char_thresh
     return result
 
 def predict_video_with_onnx(video_path, model_path, tag_mapping_path, gen_threshold=0.45, char_threshold=0.45, 
-                           output_path=None, use_gpu=False, output_mode="visualization", video_frames=3, tag_mode="add"):
+                           output_path=None, use_gpu=False, output_mode="visualization", video_frames=3, tag_mode="add", remove_threshold=None):
     """
     単一の動画ファイルに対して推論を実行する
     
@@ -1531,7 +1567,7 @@ def predict_video_with_onnx(video_path, model_path, tag_mapping_path, gen_thresh
             output_path=output_path
         )
     else:
-        save_tags_as_csv(combined_predictions, output_path, threshold=gen_threshold, mode=tag_mode)
+        save_tags_as_csv(combined_predictions, output_path, threshold=gen_threshold, mode=tag_mode, remove_threshold=remove_threshold)
     
     print(f"動画処理完了: {video_path}")
     return combined_predictions, frame
@@ -1567,6 +1603,8 @@ def main():
     # タグ保存モードの引数を追加
     parser.add_argument('--tag_mode', type=str, choices=['overwrite', 'add'], default='add',
                         help='タグ保存モード: overwrite=上書き, add=既存タグに追加')
+    parser.add_argument('--remove_threshold', default=None, type=float,
+                        help='既存タグを除去する確率の閾値（addモードでのみ有効）')
     
     args = parser.parse_args()
     
@@ -1581,7 +1619,8 @@ def main():
             args.output,
             use_gpu=args.gpu,
             output_mode=args.output_mode,
-            tag_mode=args.tag_mode
+            tag_mode=args.tag_mode,
+            remove_threshold=args.remove_threshold
         )
     elif args.video:
         # 動画処理
@@ -1595,7 +1634,8 @@ def main():
             use_gpu=args.gpu,
             output_mode=args.output_mode,
             video_frames=args.video_frames,
-            tag_mode=args.tag_mode
+            tag_mode=args.tag_mode,
+            remove_threshold=args.remove_threshold
         )
     elif args.dirs:
         # バッチ処理
@@ -1610,7 +1650,8 @@ def main():
             recursive=args.recursive,
             batch_size=args.batch_size,
             video_frames=args.video_frames,
-            tag_mode=args.tag_mode
+            tag_mode=args.tag_mode,
+            remove_threshold=args.remove_threshold
         )
 
 # GPUが利用可能かチェックする関数

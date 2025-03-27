@@ -384,6 +384,7 @@ class EVA02WithModuleLoRA(nn.Module):
         self.transform = create_transform(**resolve_data_config(self.pretrained_cfg, model=self.backbone))
 
         print(f"モデルの期待する画像サイズ: {self.img_size}")
+        print(f"モデルの前処理設定：{self.pretrained_cfg}")
         
         # 特徴量の次元を取得
         self.feature_dim = self.backbone.head.in_features
@@ -2612,7 +2613,7 @@ def train_model(
         train_metrics = compute_metrics(train_preds,train_targets)
 
         if dynamic_threshold:
-            threshold = round(train_metrics['threshold'], 2)
+            threshold = round(train_metrics['threshold'], 2) - 0.1
         
         # 既存タグと新規タグに分けてメトリクスを計算
         if old_tags_count > 0 and len(model.tag_to_idx) > old_tags_count:
