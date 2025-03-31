@@ -593,6 +593,74 @@ class EVA02WithModuleLoRA(nn.Module):
             if hasattr(self.backbone.head, 'bias') and self.backbone.head.bias is not None:
                 self.backbone.head.bias.register_hook(bias_hook)
 
+    def remove_tags(self, tags_to_remove: list[str]):
+        """
+        モデルから指定されたタグを削除し、マッピングを更新する
+        
+        Args:
+            tags_to_remove (list[str]): 削除するタグのリスト
+        """
+        print(f"\n削除対象のタグ数: {len(tags_to_remove)}")
+        
+        # 削除対象のインデックスを取得
+        indices_to_remove = [
+            self.tag_to_idx[tag] 
+            for tag in tags_to_remove 
+            if tag in self.tag_to_idx
+        ]
+        
+        print(f"実際に削除可能なタグ数: {len(indices_to_remove)}")
+        if len(indices_to_remove) < len(tags_to_remove):
+            not_found = [tag for tag in tags_to_remove if tag not in self.tag_to_idx]
+            print("見つからなかったタグ:")
+            for tag in not_found[:10]:  # 最初の10個だけ表示
+                print(f"  - {tag}")
+            if len(not_found) > 10:
+                print(f"  ... 他 {len(not_found) - 10} 個")
+        
+        if not indices_to_remove:
+            print("削除可能なタグが見つかりませんでした。")
+            return
+
+        # 保持するインデックスのマスクを作成
+        num_tags = len(self.idx_to_tag)
+        keep_mask = torch.ones(num_tags, dtype=torch.bool)
+        keep_mask[indices_to_remove] = False
+
+        # headの重みと偏りを更新
+        print("\nモデルの重みを更新中...")
+        original_size = self.backbone.head.weight.size(0)
+        self.backbone.head.weight = nn.Parameter(self.backbone.head.weight[keep_mask])
+        if hasattr(self.backbone.head, 'bias') and self.backbone.head.bias is not None:
+            self.backbone.head.bias = nn.Parameter(self.backbone.head.bias[keep_mask])
+        new_size = self.backbone.head.weight.size(0)
+        print(f"重みの次元を更新: {original_size} → {new_size}")
+        
+        # マッピングの更新
+        print("\nタグマッピングを更新中...")
+        new_idx_to_tag = {}
+        new_tag_to_idx = {}
+        new_tag_to_category = {}
+        
+        new_idx = 0
+        for old_idx in range(num_tags):
+            if old_idx not in indices_to_remove:
+                tag = self.idx_to_tag[old_idx]
+                new_idx_to_tag[new_idx] = tag
+                new_tag_to_idx[tag] = new_idx
+                if tag in self.tag_to_category:
+                    new_tag_to_category[tag] = self.tag_to_category[tag]
+                new_idx += 1
+
+        # クラス変数を更新
+        self.idx_to_tag = new_idx_to_tag
+        self.tag_to_idx = new_tag_to_idx
+        self.tag_to_category = new_tag_to_category
+        
+        print(f"\n処理完了:")
+        print(f"- 削除されたタグ数: {len(indices_to_remove)}")
+        print(f"- 残りのタグ数: {len(self.idx_to_tag)}")
+
     def merge_lora_to_base_model(self, scale=1.0):
         """
         LoRAの重みをベースモデルにマージする
@@ -2943,7 +3011,7 @@ def main():
     merge_parser.add_argument('--metadata_path', type=str, default=None, help='モデルのメタデータファイルのパス（指定しない場合は_metadata.jsonを使用）')
     merge_parser.add_argument('--base_model', type=str, default='SmilingWolf/wd-eva02-large-tagger-v3', help='使用するベースモデルのリポジトリ')
     merge_parser.add_argument('--output_dir', type=str, default='merged_model', help='出力ディレクトリ')
-
+    merge_parser.add_argument('--remove_tags', type=str, default=None, help='削除するタグのファイルパス')
     merge_parser.add_argument('--scale', type=float, default=1.0, help='マージ時のスケーリング係数（デフォルト: 1.0）')
     merge_parser.add_argument('--save_format', type=str, default='safetensors', choices=['safetensors', 'pytorch', 'onnx'], help='モデルの保存形式')
     merge_parser.add_argument('--fp16', action='store_true', help='FP16モデルを保存する')
@@ -3476,6 +3544,13 @@ def main():
             model.lora_dropout = None
 
             model.merge_lora_to_base_model(scale=args.scale)
+
+            if args.remove_tags:
+                # タグファイルを読み込み
+                tags_to_remove = read_tags_from_file(args.remove_tags)
+                
+                # タグの削除
+                model.remove_tags(tags_to_remove)
             
             # LoRA層を削除
             model._remove_lora_from_modules()

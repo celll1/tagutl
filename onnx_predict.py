@@ -487,7 +487,7 @@ def preprocess_image(image_path, target_size=(448, 448)):
     image = pil_pad_square(image)
     
     # リサイズ
-    image_resized = image.resize(target_size, Image.LANCZOS)
+    image_resized = image.resize(target_size, Image.BICUBIC)
     
     # NumPy配列に変換 - float32型を明示的に指定
     img_array = np.array(image_resized, dtype=np.float32) / 255.0
