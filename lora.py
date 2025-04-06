@@ -37,11 +37,9 @@ from tqdm.auto import tqdm
 try:
     from zclip import ZClip
     zclip_available = True
-    print("zclip.pyが見つかりました。ZClipが利用可能です。")
 except ImportError:
-    ZClip = None # インポート失敗時はNoneを設定
+    ZClip = None
     zclip_available = False
-    print("zclip.pyが見つかりません。ZClipは利用できません。")
 
 # デバイスの設定
 torch_device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -433,34 +431,41 @@ class EVA02WithModuleLoRA(nn.Module):
         Args:
             num_classes: 新しい総クラス数（既存タグ + 新規タグ）
         """
-        # 新規タグの数を計算
-        self.num_new_classes = num_classes - self.original_num_classes
-        
+        current_num_classes = self.backbone.head.out_features # ★★★ 現在の実際のクラス数を取得 ★★★
+        self.num_new_classes = num_classes - current_num_classes # ★★★ 現在のクラス数と比較 ★★★
+
         if self.num_new_classes <= 0:
-            print(f"新規タグがないか、既存タグ数より少ないため、ヘッドの拡張は行いません。(現在: {self.original_num_classes}, 要求: {num_classes})")
+            # ★★★ メッセージのクラス数を修正 ★★★
+            print(f"新規タグがないか、要求クラス数({num_classes})が現在のクラス数({current_num_classes})以下であるため、ヘッドの拡張は行いません。")
+            # 拡張しない場合でも、original_num_classesは現在の状態に合わせておく
+            self.original_num_classes = current_num_classes
             return
-        
+
+        print(f"ヘッドを拡張します: {current_num_classes} → {num_classes} クラス ({self.num_new_classes} 個の新規タグ)")
+
         # 元のヘッドの重みとバイアスを取得
         original_weight = self.backbone.head.weight.data
         original_bias = self.backbone.head.bias.data if self.backbone.head.bias is not None else None
-        
+        original_in_features = self.backbone.head.in_features # 入力特徴量を取得
+
         # 新しいヘッドを作成
-        new_head = nn.Linear(self.feature_dim, num_classes)
-                
+        new_head = nn.Linear(original_in_features, num_classes) # 入力特徴量を指定
+
         # 新規タグの重みを初期化
-        nn.init.zeros_(new_head.weight.data[self.original_num_classes:])
+        nn.init.zeros_(new_head.weight.data[current_num_classes:]) # ★★★ current_num_classes を使用 ★★★
         if new_head.bias is not None:
-            nn.init.zeros_(new_head.bias.data[self.original_num_classes:])
+            nn.init.zeros_(new_head.bias.data[current_num_classes:]) # ★★★ current_num_classes を使用 ★★★
 
         # 既存タグの重みとバイアスを新しいヘッドに上書きする
-        new_head.weight.data[:self.original_num_classes] = original_weight
-        if original_bias is not None:
-            new_head.bias.data[:self.original_num_classes] = original_bias
-        
+        new_head.weight.data[:current_num_classes] = original_weight # ★★★ current_num_classes を使用 ★★★
+        if original_bias is not None and new_head.bias is not None: # ★★★ new_head.bias もチェック ★★★
+            new_head.bias.data[:current_num_classes] = original_bias # ★★★ current_num_classes を使用 ★★★
+
         # バックボーンのヘッドを新しいヘッドに置き換え
         self.backbone.head = new_head
-        
-        print(f"ヘッドを拡張しました: {self.original_num_classes} → {num_classes} クラス")
+        self.original_num_classes = num_classes # ★★★ 拡張後のクラス数に更新 ★★★
+
+        print(f"ヘッドの拡張が完了しました。新しいクラス数: {num_classes}")
     
     def extend_head(self, num_classes):
         """
@@ -614,10 +619,9 @@ class EVA02WithModuleLoRA(nn.Module):
         """
         print(f"\n削除対象のタグ数: {len(tags_to_remove)}")
         
-        # 削除対象のインデックスを取得
         indices_to_remove = [
-            self.tag_to_idx[tag] 
-            for tag in tags_to_remove 
+            self.tag_to_idx[tag]
+            for tag in tags_to_remove
             if tag in self.tag_to_idx
         ]
         
@@ -634,41 +638,69 @@ class EVA02WithModuleLoRA(nn.Module):
             print("削除可能なタグが見つかりませんでした。")
             return
 
-        # 保持するインデックスのマスクを作成
-        num_tags = len(self.idx_to_tag)
-        keep_mask = torch.ones(num_tags, dtype=torch.bool)
+        original_head = self.backbone.head
+        original_size = original_head.out_features
+        in_features = original_head.in_features # 入力次元を取得
+        original_device = original_head.weight.device # 元のデバイスを取得
+
+        keep_mask = torch.ones(original_size, dtype=torch.bool, device=original_device) # デバイスを合わせる
         keep_mask[indices_to_remove] = False
 
-        # headの重みと偏りを更新
-        print("\nモデルの重みを更新中...")
-        original_size = self.backbone.head.weight.size(0)
-        self.backbone.head.weight = nn.Parameter(self.backbone.head.weight[keep_mask])
-        if hasattr(self.backbone.head, 'bias') and self.backbone.head.bias is not None:
-            self.backbone.head.bias = nn.Parameter(self.backbone.head.bias[keep_mask])
-        new_size = self.backbone.head.weight.size(0)
-        print(f"重みの次元を更新: {original_size} → {new_size}")
-        
+        # 保持する重みとバイアスを抽出
+        new_weight = original_head.weight.data[keep_mask]
+        new_bias_data = None
+        has_bias = original_head.bias is not None
+        if has_bias:
+            new_bias_data = original_head.bias.data[keep_mask]
+
+        new_size = new_weight.size(0)
+        print(f"\nモデルのヘッドを再構築中...")
+        print(f"ヘッドの次元を更新: {original_size} → {new_size}")
+
+        # 新しい nn.Linear モジュールを作成
+        new_head = nn.Linear(in_features, new_size, bias=has_bias, device=original_device) # デバイスを指定
+        new_head.weight = nn.Parameter(new_weight)
+        if has_bias:
+            new_head.bias = nn.Parameter(new_bias_data)
+
+        # バックボーンのヘッドを新しいヘッドに置き換え
+        self.backbone.head = new_head
+        print("モデルのヘッド再構築完了。")
+
         # マッピングの更新
         print("\nタグマッピングを更新中...")
         new_idx_to_tag = {}
         new_tag_to_idx = {}
-        new_tag_to_category = {}
-        
+        new_tag_to_category = {} # カテゴリ情報も更新
+
         new_idx = 0
-        for old_idx in range(num_tags):
+        # 元のマッピング情報を保持 (remove_tagsが複数回呼ばれる可能性も考慮)
+        original_idx_to_tag_copy = copy.deepcopy(self.idx_to_tag)
+        original_tag_to_category_copy = copy.deepcopy(self.tag_to_category) if hasattr(self, 'tag_to_category') and self.tag_to_category else {}
+
+        # 削除前のインデックスでループ
+        num_tags_before_removal = original_size
+        for old_idx in range(num_tags_before_removal):
             if old_idx not in indices_to_remove:
-                tag = self.idx_to_tag[old_idx]
-                new_idx_to_tag[new_idx] = tag
-                new_tag_to_idx[tag] = new_idx
-                if tag in self.tag_to_category:
-                    new_tag_to_category[tag] = self.tag_to_category[tag]
-                new_idx += 1
+                # コピーした元のマッピングからタグを取得
+                if old_idx in original_idx_to_tag_copy:
+                    tag = original_idx_to_tag_copy[old_idx]
+                    new_idx_to_tag[new_idx] = tag
+                    new_tag_to_idx[tag] = new_idx
+                    # カテゴリ情報も引き継ぐ
+                    if tag in original_tag_to_category_copy:
+                        new_tag_to_category[tag] = original_tag_to_category_copy[tag]
+                    new_idx += 1
+                else:
+                    # print(f"Warning: old_idx {old_idx} not found in original_idx_to_tag during mapping update.")
+                    pass # 元のマッピングにないインデックスはスキップ (発生しないはずだが念のため)
 
         # クラス変数を更新
         self.idx_to_tag = new_idx_to_tag
         self.tag_to_idx = new_tag_to_idx
         self.tag_to_category = new_tag_to_category
-        
+        self.original_num_classes = new_size # 削除後のクラス数を反映
+
         print(f"\n処理完了:")
         print(f"- 削除されたタグ数: {len(indices_to_remove)}")
         print(f"- 残りのタグ数: {len(self.idx_to_tag)}")
