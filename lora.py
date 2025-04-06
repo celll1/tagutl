@@ -31,6 +31,18 @@ import bitsandbytes as bnb
 from io import BytesIO
 from tqdm.auto import tqdm
 
+# ZClipのインポートを試みる
+# Apache 2.0 License
+# https://github.com/bluorion-com/ZClip
+try:
+    from zclip import ZClip
+    zclip_available = True
+    print("zclip.pyが見つかりました。ZClipが利用可能です。")
+except ImportError:
+    ZClip = None # インポート失敗時はNoneを設定
+    zclip_available = False
+    print("zclip.pyが見つかりません。ZClipは利用できません。")
+
 # デバイスの設定
 torch_device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 Image.MAX_IMAGE_PIXELS = None
@@ -500,7 +512,7 @@ class EVA02WithModuleLoRA(nn.Module):
 
         self.freeze_non_lora_parameters()
         
-        print(f"Applied LoRA to {len(self.lora_layers)} modules")
+        print(f"Applied LoRA to {len(self.lora_layers)} modules, rank: {self.lora_rank}, alpha: {self.lora_alpha}, dropout: {self.lora_dropout}")
 
     def _remove_lora_from_modules(self):
         """モデルからすべてのLoRA層を削除するメソッド"""
@@ -661,7 +673,7 @@ class EVA02WithModuleLoRA(nn.Module):
         print(f"- 削除されたタグ数: {len(indices_to_remove)}")
         print(f"- 残りのタグ数: {len(self.idx_to_tag)}")
 
-    def merge_lora_to_base_model(self, scale=1.0):
+    def merge_lora_to_base_model(self, scale=1.0, new_lora_rank=None, new_lora_alpha=None, new_lora_dropout=None):
         """
         LoRAの重みをベースモデルにマージする
         
@@ -749,6 +761,13 @@ class EVA02WithModuleLoRA(nn.Module):
         
         gc.collect()
         torch.cuda.empty_cache()
+
+        if new_lora_rank is not None:
+            self.lora_rank = new_lora_rank
+            if new_lora_alpha is not None:
+                self.lora_alpha = new_lora_alpha
+            if new_lora_dropout is not None:
+                self.lora_dropout = new_lora_dropout
 
         if self.lora_rank is not None and self.lora_rank > 0:   
             # LoRAを再適用（空のLoRAを適用）
@@ -1742,17 +1761,21 @@ def prepare_dataset(
     model: EVA02WithModuleLoRA,
     image_dirs,  # メインの学習データディレクトリ
     reg_image_dirs=None,  # 正則化用データディレクトリ（オプション）
-    val_split=0.1, 
-    min_tag_freq=5, 
+    val_split=0.1,
+    min_tag_freq=5,
     remove_special_prefix="remove",
     seed=42,
-    cache_dir=None  # キャッシュディレクトリのパラメータを追加
+    cache_dir=None,  # キャッシュディレクトリのパラメータを追加
+    tags_to_remove=None # 削除対象のタグリストを追加
 ):
     """
     データセットを準備し、必要に応じてモデルのヘッドを拡張します。
     メインデータセットと正則化データセットを別々に処理し、
     タグの統合と拡張は一度だけ行います。
-    
+
+    Args:
+        tags_to_remove: データセットとモデルから削除するタグのリスト
+
     Returns:
         train_image_paths: 訓練用画像パスのリスト
         train_tags_list: 訓練用タグのリスト
@@ -1760,21 +1783,26 @@ def prepare_dataset(
         val_tags_list: 検証用タグのリスト
         reg_image_paths: 正則化用画像パスのリスト
         reg_tags_list: 正則化用タグのリスト
-        num_existing_tags: 既存タグの数
+        num_existing_tags: 既存タグの数（タグ削除後）
         num_new_tags: 新規追加タグの数
     """
     import random
-    
+    import re # re をインポート
+
     # シャッフルのためのシードを設定
     random.seed(seed)
     np.random.seed(seed)
-    
+
     print("画像とタグを収集しています...")
-    
+    tags_to_remove_set = set()
+    if tags_to_remove:
+        print(f"データセットから {len(tags_to_remove)} 個のタグを削除します。")
+        tags_to_remove_set = set(tags_to_remove) # 高速な検索のためセットに変換
+
     # メインデータセットから画像とタグを収集
     main_image_paths = []
     main_tags_list = []
-    
+
     for image_dir in tqdm(image_dirs, desc="メインディレクトリを処理中"):
         for root, _, files in os.walk(image_dir):
             for file in files:
@@ -1782,18 +1810,22 @@ def prepare_dataset(
                     image_path = os.path.join(root, file)
                     try:
                         tags = read_tags_from_file(image_path, remove_special_prefix)
+                        if tags_to_remove_set:
+                            # 削除対象タグを除外
+                            tags = [tag for tag in tags if tag not in tags_to_remove_set]
+
                         if tags:  # タグが存在する場合のみ追加
                             main_image_paths.append(image_path)
                             main_tags_list.append(tags)
                     except Exception as e:
                         print(f"画像 {image_path} の処理中にエラーが発生: {e}")
-    
+
     print(f"メインデータセットの画像数: {len(main_image_paths)}")
-    
+
     # 正則化データセットから画像とタグを収集（指定がある場合）
     reg_image_paths = []
     reg_tags_list = []
-    
+
     if reg_image_dirs:
         for image_dir in tqdm(reg_image_dirs, desc="正則化ディレクトリを処理中"):
             for root, _, files in os.walk(image_dir):
@@ -1802,88 +1834,107 @@ def prepare_dataset(
                         image_path = os.path.join(root, file)
                         try:
                             tags = read_tags_from_file(image_path, remove_special_prefix)
+                            if tags_to_remove_set:
+                                # 削除対象タグを除外
+                                tags = [tag for tag in tags if tag not in tags_to_remove_set]
+
                             if tags:  # タグが存在する場合のみ追加
                                 reg_image_paths.append(image_path)
                                 reg_tags_list.append(tags)
                         except Exception as e:
                             print(f"画像 {image_path} の処理中にエラーが発生: {e}")
-        
+
         print(f"正則化データセットの画像数: {len(reg_image_paths)}")
-    
-    # 全てのタグを収集してモデルを拡張
+
+    # 全てのタグを収集してモデルを拡張 (タグ削除後のデータから収集)
     all_tags = []
     all_tags.extend([tag for tags in main_tags_list for tag in tags])
     if reg_tags_list:
         all_tags.extend([tag for tags in reg_tags_list for tag in tags])
-    
+
     # タグの頻度を計算
     tag_freq = {}
     for tag in all_tags:
         tag_freq[tag] = tag_freq.get(tag, 0) + 1
-    
+
     # 最小頻度以上のタグを抽出
     filtered_tags = {tag for tag, freq in tag_freq.items() if freq >= min_tag_freq}
-    
-    # 特殊プレフィックスを持つタグを除外
-    if remove_special_prefix:
-        filtered_tags = {tag for tag in filtered_tags if not re.match(r'^[a-zA-Z]@', tag)}
-    
+
+    # 特殊プレフィックスを持つタグを除外 (read_tags_from_fileで処理される想定だが念のため)
+    if remove_special_prefix == "omit":
+         filtered_tags = {tag for tag in filtered_tags if not re.match(r'^[a-zA-Z]@', tag)}
+
+
+    # モデルに現在存在するタグを取得 (model.remove_tags 実行後の状態)
     existing_tags = list(model.idx_to_tag.values())
+    # データセットに存在するタグのうち、モデルにまだない新規タグを特定
     new_filtered_tags = filtered_tags - set(existing_tags)
-    
-    print(f"既存タグ数: {len(existing_tags)}")
-    print(f"最小頻度以上の新規タグ数: {len(new_filtered_tags)}")
-    
+
+    print(f"既存タグ数 (モデル側・削除後): {len(existing_tags)}")
+    print(f"最小頻度以上の新規タグ数 (データセット側・削除後): {len(new_filtered_tags)}")
+
     # idx_to_tagとtag_to_idxのlenが念のため同じかどうかを確認
     if not len(model.idx_to_tag) == len(model.tag_to_idx):
         raise ValueError("idx_to_tagとtag_to_idxのlenが異なります。")
-    
+
+    num_existing_tags_before_extend = len(model.idx_to_tag) # 拡張前の既存タグ数
+
     if not len(new_filtered_tags) == 0:
+        print(f"モデルに {len(new_filtered_tags)} 個の新規タグを追加します。")
         # 新規タグのインデックスを追加
         next_idx = len(model.idx_to_tag)
         for tag in sorted(new_filtered_tags):  # ソートして順序を一定に
             model.tag_to_idx[tag] = next_idx
+            model.idx_to_tag[next_idx] = tag # idx_to_tagも更新
+            # カテゴリ情報も追加 (デフォルトはGeneral)
+            if not hasattr(model, 'tag_to_category') or model.tag_to_category is None:
+                 model.tag_to_category = {} # tag_to_category がなければ初期化
+            model.tag_to_category[tag] = 'General' # 新規タグはGeneralに分類
             next_idx += 1
-        
-        # インデックスからタグへのマッピングを作成
-        model.idx_to_tag = {i: tag for tag, i in model.tag_to_idx.items()}
-        
-        print(f"使用されるタグの総数: {len(model.tag_to_idx)}")   
-        
-        print(f"モデルの拡張を行います")
+
+        print(f"使用されるタグの総数: {len(model.tag_to_idx)}")
+
+        print(f"モデルのヘッドを拡張します。")
         num_classes = len(model.idx_to_tag)
-        model.extend_head(num_classes)
-    
+        model.extend_head(num_classes) # extend_head は内部で original_num_classes を使うので、拡張前に呼ぶ
+    else:
+        print("データセットに新規タグはありませんでした。ヘッドの拡張は行いません。")
+
+
     # idx-to-tag の最初の10件を表示
     print(f"idx-to-tag の最初の10件: {list(model.idx_to_tag.items())[:10]}")
     # new tagsのidx-to-tagを表示
-    print(f"new tagsのidx-to-tag: {list(model.idx_to_tag.items())[len(existing_tags):len(existing_tags)+min(10, len(new_filtered_tags))]}")
-    
+    if len(new_filtered_tags) > 0:
+        print(f"追加された新規タグのidx-to-tag: {list(model.idx_to_tag.items())[num_existing_tags_before_extend:num_existing_tags_before_extend+min(10, len(new_filtered_tags))]}")
+
     # メインデータセットを訓練用と検証用に分割
     main_indices = list(range(len(main_image_paths)))
     random.shuffle(main_indices)
-    
+
     val_size = int(len(main_indices) * val_split)
     train_indices = main_indices[val_size:]
     val_indices = main_indices[:val_size]
-    
+
     train_image_paths = [main_image_paths[i] for i in train_indices]
     train_tags_list = [main_tags_list[i] for i in train_indices]
-    
+
     val_image_paths = [main_image_paths[i] for i in val_indices]
     val_tags_list = [main_tags_list[i] for i in val_indices]
-    
+
     print(f"訓練用画像: {len(train_image_paths)}")
     print(f"検証用画像: {len(val_image_paths)}")
     if reg_image_paths:
         print(f"正則化用画像: {len(reg_image_paths)}")
-    
+
     # 元の関数の戻り値の形式に合わせる
+    num_existing_tags_after_removal = len(existing_tags) # remove_tags 後の既存タグ数
+    num_new_tags_added = len(new_filtered_tags)         # 今回追加された新規タグ数
+
     if reg_image_dirs:
-        return train_image_paths, train_tags_list, val_image_paths, val_tags_list, reg_image_paths, reg_tags_list, len(existing_tags), len(new_filtered_tags)
+        return train_image_paths, train_tags_list, val_image_paths, val_tags_list, reg_image_paths, reg_tags_list, num_existing_tags_after_removal, num_new_tags_added
     else:
-        return train_image_paths, train_tags_list, val_image_paths, val_tags_list, None, None, len(existing_tags), len(new_filtered_tags)
-    
+        return train_image_paths, train_tags_list, val_image_paths, val_tags_list, None, None, num_existing_tags_after_removal, num_new_tags_added
+
 # 非対称損失関数（ASL）の実装
 class AsymmetricLoss(nn.Module):
     def __init__(self, gamma_neg=4, gamma_pos=1, clip=0.05, eps=1e-6, disable_torch_grad_focal_loss=False):
@@ -2282,6 +2333,7 @@ def train_model(
     dynamic_threshold=True,
     head_only_train_steps=0,
     cache_dir=None,  # キャッシュディレクトリのパラメータを追加
+    use_zclip=False # zclipを使用するかどうかのフラグを追加
 ):
     """モデルをトレーニングする関数"""
     # 出力ディレクトリの作成
@@ -2568,6 +2620,15 @@ def train_model(
         print(f"最初の{head_only_train_steps}ステップではヘッド部分のみを学習します")
         model.freeze_non_new_head_parameters()
 
+    # ZClipの初期化 (use_zclipがTrueの場合)
+    zclip = None
+    if use_zclip:
+        if zclip_available:
+            zclip = ZClip(mode="zscore", alpha=0.97, z_thresh=2.5, clip_option="adaptive_scaling", max_grad_norm=1.0, clip_factor=1.0)
+            print("ZClipによる勾配クリッピングを有効化しました。")
+        else:
+            print("警告: --use_zclipが指定されましたが、zclip.pyが見つからないためZClipは使用されません。")
+
     # トレーニングループ
     for epoch in range(num_epochs):
         print(f"Epoch {epoch+1}/{num_epochs}")
@@ -2589,16 +2650,20 @@ def train_model(
                 with torch.amp.autocast('cuda'):
                     outputs = model(images)
                     loss = criterion(outputs, targets)
-                
+
                 scaler.scale(loss).backward()
+                if zclip:
+                    zclip.step(model) # 勾配クリッピングを適用
                 scaler.step(optimizer)
                 scaler.update()
                 optimizer.zero_grad()
             else:
                 outputs = model(images)
                 loss = criterion(outputs, targets)
-                
+
                 loss.backward()
+                if zclip:
+                    zclip.step(model) # 勾配クリッピングを適用
                 optimizer.step()
                 optimizer.zero_grad()
 
@@ -2617,42 +2682,46 @@ def train_model(
                     with torch.amp.autocast('cuda'):
                         reg_outputs = model(reg_images)
                         reg_loss = criterion(reg_outputs, reg_targets)
-                    
+
                     scaler.scale(reg_loss).backward()
+                    if zclip:
+                        zclip.step(model) # 勾配クリッピングを適用
                     scaler.step(optimizer)
                     scaler.update()
                     optimizer.zero_grad()
                 else:
                     reg_outputs = model(reg_images)
                     reg_loss = criterion(reg_outputs, reg_targets)
-                    
+
                     reg_loss.backward()
+                    if zclip:
+                        zclip.step(model) # 勾配クリッピングを適用
                     optimizer.step()
                     optimizer.zero_grad()
 
                 loss = (loss + reg_loss) / 2
-            
+
             train_loss += loss.item()
-            
+
             # シグモイド関数で確率に変換
             probs = torch.sigmoid(outputs).detach().cpu().numpy()
             # 最新100件のみを保持
             train_preds = (train_preds + [probs])[-100:]
             train_targets = (train_targets + [targets.detach().cpu().numpy()])[-100:]
-            
+
             progress_bar.set_postfix({"loss": f"{loss.item():.4f}"})
 
             # 定期的にTensorBoardに予測結果を記録
             if tensorboard:
                 # stepごとのlossを記録
                 writer.add_scalar('Train/Step_Loss', loss.item(), epoch * len(train_loader) + i)
-                
+
                 if i % 100 == 0:
                     img_grid = visualize_predictions_for_tensorboard(
-                        images[0], 
-                        probs[0], 
-                        idx_to_tag, 
-                        threshold=threshold, 
+                        images[0],
+                        probs[0],
+                        idx_to_tag,
+                        threshold=threshold,
                         original_tags=targets[0],
                         tag_to_category=tag_to_category,
                         neg_means=neg_stats['means'],  # 陰性群の平均値を追加
@@ -2671,8 +2740,8 @@ def train_model(
             writer.add_scalar('Learning_Rate', optimizer.param_groups[0]['lr'], epoch)
         
         # トレーニングメトリクスの計算
-        train_loss /= len(train_loader)         
-        
+        train_loss /= len(train_loader)
+
         train_preds = [pred for batch in train_preds for pred in batch]
         train_targets = [target for batch in train_targets for target in batch]
         train_preds = np.array(train_preds)
@@ -2790,22 +2859,22 @@ def train_model(
             print(f"epoch {epoch+1} 検証結果 - 既存タグ F1: {existing_val_metrics['f1']:.4f}, 新規タグ F1: {new_val_metrics['f1']:.4f}")
 
             if tensorboard:
-                writer.add_scalar('Metrics/val/F1', val_metrics['f1'], 0)
-                writer.add_scalar('Metrics/val/PR-AUC', val_metrics['pr_auc'], 0)
-                writer.add_scalar('Metrics/val/Threshold', threshold, 0)
-                writer.add_image('Metrics/val/F1_vs_Threshold', val_metrics['f1_vs_threshold_plot'], 0)
+                writer.add_scalar('Metrics/val/F1', val_metrics['f1'], epoch+1)
+                writer.add_scalar('Metrics/val/PR-AUC', val_metrics['pr_auc'], epoch+1)
+                writer.add_scalar('Metrics/val/Threshold', threshold, epoch+1)
+                writer.add_image('Metrics/val/F1_vs_Threshold', val_metrics['f1_vs_threshold_plot'], epoch+1)
 
                 if old_tags_count > 0 and len(model.tag_to_idx) > old_tags_count:
-                    writer.add_scalar('Metrics/val/F1_existing', existing_val_metrics['f1'], 0)
-                    writer.add_scalar('Metrics/val/F1_new', new_val_metrics['f1'], 0)
+                    writer.add_scalar('Metrics/val/F1_existing', existing_val_metrics['f1'], epoch+1)
+                    writer.add_scalar('Metrics/val/F1_new', new_val_metrics['f1'], epoch+1)
             del existing_val_metrics, new_val_metrics
         else:
             print(f"epoch {epoch+1} 検証結果 - F1: {val_metrics['f1']:.4f}")
             if tensorboard:
-                writer.add_scalar('Metrics/val/F1', val_metrics['f1'], 0)
-                writer.add_scalar('Metrics/val/PR-AUC', val_metrics['pr_auc'], 0)
-                writer.add_scalar('Metrics/val/Threshold', threshold, 0)
-                writer.add_image('Metrics/val/F1_vs_Threshold', val_metrics['f1_vs_threshold_plot'], 0)
+                writer.add_scalar('Metrics/val/F1', val_metrics['f1'], epoch+1)
+                writer.add_scalar('Metrics/val/PR-AUC', val_metrics['pr_auc'], epoch+1)
+                writer.add_scalar('Metrics/val/Threshold', threshold, epoch+1)
+                writer.add_image('Metrics/val/F1_vs_Threshold', val_metrics['f1_vs_threshold_plot'], epoch+1)
 
         del val_preds, val_targets, val_neg_preds, val_pos_preds
         
@@ -2836,7 +2905,12 @@ def train_model(
             print(f"Checkpoint saved at epoch {epoch+1}")
 
         if merge_every_n_epochs is not None and (epoch + 1) % merge_every_n_epochs == 0:
-            model.merge_lora_to_base_model()
+            model.merge_lora_to_base_model(
+                scale=1.0,
+                new_lora_rank=None,
+                new_lora_alpha=None,
+                new_lora_dropout=None
+            )
             model.to(device)
             # optimizer, schedulerをリセット
             optimizer = setup_optimizer(model, learning_rate, weight_decay, use_8bit_optimizer)
@@ -2976,6 +3050,9 @@ def main():
     train_parser.add_argument('--learning_rate', type=float, default=1e-4, help='学習率')
     train_parser.add_argument('--weight_decay', type=float, default=0.01, help='重み減衰')
     train_parser.add_argument('--use_8bit_optimizer', action='store_true', help='8-bitオプティマイザを使用する')
+    train_parser.add_argument('--use_zclip', action='store_true', help='ZClipによる勾配クリッピングを使用する') # ZClip引数を追加
+
+    train_parser.add_argument('--tags_to_remove', type=str, default=None, help='削除するタグのファイルパス')
 
     train_parser.add_argument('--head_only_train_steps', type=int, default=0,
                       help='最初のN回のステップでヘッド部分のみを学習し、他のパラメータをフリーズします')
@@ -2997,7 +3074,7 @@ def main():
 
     # その他のオプション
     train_parser.add_argument('--mixed_precision', action='store_true', help='混合精度トレーニングを使用する')
-    train_parser.add_argument('--tensorboard', action='store_true', help='TensorBoardを使用する')
+    train_parser.add_argument('--tensorboard', default=True, action='store_true', help='TensorBoardを使用する')
     train_parser.add_argument('--tensorboard_port', type=int, default=6006, help='TensorBoardのポート番号')
     train_parser.add_argument('--bind_all', action='store_true', help='TensorBoardをすべてのネットワークインターフェースにバインドする')
     train_parser.add_argument('--seed', type=int, default=42, help='乱数シード')
@@ -3182,17 +3259,37 @@ def main():
         print(f"モデルを読み込んでいます...")
         model, labels = load_model(args.model_path, args.metadata_path, base_model=args.base_model, lora_rank=args.lora_rank, lora_alpha=args.lora_alpha, lora_dropout=args.lora_dropout, device=device, use_xformers=args.xformers)
         
+        # --- ここから tags_to_remove の処理を追加 ---
+        tags_to_remove_list = None
+        if args.tags_to_remove: # 引数が指定されているかチェック
+            print(f"--tags_to_remove が指定されました。タグファイル {args.tags_to_remove} を読み込みます。")
+            if os.path.exists(args.tags_to_remove):
+                # read_tags_from_file を使用してタグリストを取得
+                # 特殊プレフィックスは削除するように指定 (remove_special_prefix="remove")
+                tags_to_remove_list = read_tags_from_file(args.tags_to_remove, remove_special_prefix="remove")
+                if tags_to_remove_list:
+                    print(f"{len(tags_to_remove_list)} 個のタグをモデルから削除します...")
+                    model.remove_tags(tags_to_remove_list) # モデルからタグを削除
+                    print("モデルからのタグ削除が完了しました。")
+                else:
+                    print(f"警告: タグファイル {args.tags_to_remove} は空または読み込めませんでした。タグ削除は行われません。")
+                    tags_to_remove_list = None # 念のためNoneに戻す
+            else:
+                print(f"警告: タグファイル {args.tags_to_remove} が見つかりません。タグ削除は行われません。")
+                tags_to_remove_list = None # 念のためNoneに戻す
+        # --- tags_to_remove の処理ここまで ---
+
         # ターゲットモジュールの読み込み
         target_modules = None
         if args.target_modules_file:
             with open(args.target_modules_file, 'r') as f:
                 target_modules = [line.strip() for line in f.readlines() if line.strip()]
             print(f"LoRAを適用するモジュール数: {len(target_modules)}")
-        
+
         # モデルの期待する画像サイズを取得
         img_size = model.img_size
         print(f"モデルの期待する画像サイズを使用します: {img_size}")
-        
+
         # 2. データセットの準備（新規タグが検出される）,ヘッド拡張もこの中で行われる
         print("データセットを準備しています...")
         train_image_paths, train_tags_list, val_image_paths, val_tags_list, reg_image_paths, reg_tags_list, old_tags_count, _ = prepare_dataset(
@@ -3202,28 +3299,38 @@ def main():
             val_split=args.val_split,
             min_tag_freq=args.min_tag_freq,
             remove_special_prefix=args.remove_special_prefix,
-            seed=args.seed
+            seed=args.seed,
+            tags_to_remove=tags_to_remove_list # 読み込んだリストを渡す
         )
 
         # トレーニング前にLoRAをマージ（指定された場合）
         if args.merge_before_train is not None:
             # モデルがLoRAを持っているか確認（ベースモデルから始める場合は何もしない）
-            if hasattr(model, 'lora_layers'):
+            if hasattr(model, 'lora_layers') and model.lora_layers: # lora_layersが存在し、空でないことを確認
                 print(f"トレーニング前にLoRAをベースモデルにマージします（スケール: {args.merge_before_train}）...")
-                model.merge_lora_to_base_model(scale=args.merge_before_train)
+                model.merge_lora_to_base_model(scale=1.0, new_lora_rank=args.lora_rank, new_lora_alpha=args.lora_alpha, new_lora_dropout=args.lora_dropout)
             else:
-                print("マージするLoraレイヤーがありません。ベースモデルからトレーニングを開始します。")
+                print("マージするLoraレイヤーがありません。ベースモデルまたは既存の状態でトレーニングを開始します。")
 
         # modelにまだLoRAが適用されていない場合は適用する
-        if model.lora_rank is None:
-            print(f"LoRAを適用します（lora_rank: {args.lora_rank}, lora_alpha: {args.lora_alpha}, lora_dropout: {args.lora_dropout})")
-            model.lora_rank = args.lora_rank
-            model.lora_alpha = args.lora_alpha
-            model.lora_dropout = args.lora_dropout
-            model.apply_lora_to_modules()
-        
+        if not hasattr(model, 'lora_layers') or not model.lora_layers: # lora_layersが存在しないか空の場合
+            if args.lora_rank is not None and args.lora_rank > 0:
+                print(f"LoRAを適用します（lora_rank: {args.lora_rank}, lora_alpha: {args.lora_alpha}, lora_dropout: {args.lora_dropout})")
+                model.lora_rank = args.lora_rank
+                model.lora_alpha = args.lora_alpha
+                model.lora_dropout = args.lora_dropout
+                # ターゲットモジュールが指定されていればそれを使用
+                if target_modules:
+                    model.target_modules = target_modules
+                model.apply_lora_to_modules()
+            else:
+                 print("LoRAランクが指定されていないか0以下であるため、LoRAは適用されません。")
+        else:
+             print("LoRAがすでに適用されています。")
+
+
         model = model.to(device)
-        
+
         # データセットの作成
         train_dataset = TagImageDataset(
             image_paths=train_image_paths,
@@ -3233,7 +3340,7 @@ def main():
             cache_dir=None if args.cache_dir is None else os.path.join(args.cache_dir, 'train'),  # トレーニング用キャッシュディレクトリ
             force_recache=False,  # キャッシュを強制的に再作成するフラグ
         )
-        
+
         val_dataset = TagImageDataset(
             image_paths=val_image_paths,
             tags_list=val_tags_list,
@@ -3312,17 +3419,24 @@ def main():
                 print(f"TensorBoardの起動に失敗しました: {e}")
 
         tag_to_category = load_tag_categories()
-        tag_to_category = {tag: category for tag, category in tag_to_category.items() 
+        # model.tag_to_idx に存在するタグのみを tag_to_category に含める
+        valid_tag_to_category = {tag: category for tag, category in tag_to_category.items()
                           if tag in model.tag_to_idx}
-        # tag_to_categori に 'general': 'Rating', 'sensitive': 'Rating', 'questionable': 'Rating', 'explicit': 'Rating'を追加あるいは上書きしておく
-        tag_to_category['general'] = 'Rating'
-        tag_to_category['sensitive'] = 'Rating'
-        tag_to_category['questionable'] = 'Rating'
-        tag_to_category['explicit'] = 'Rating'
+        # 不足しているタグがあればGeneralとして追加
+        for tag_idx, tag in model.idx_to_tag.items():
+            if tag not in valid_tag_to_category:
+                 valid_tag_to_category[tag] = 'General'
+        # Ratingタグを強制的に上書き
+        for rating_tag in ['general', 'sensitive', 'questionable', 'explicit']:
+             if rating_tag in model.tag_to_idx: # モデルに存在する場合のみ上書き
+                 valid_tag_to_category[rating_tag] = 'Rating'
+        # model の tag_to_category を更新
+        model.tag_to_category = valid_tag_to_category
+
 
         # トレーニングの実行
         print("トレーニングを開始します...")
-        
+
         train_model(
             model=model,
             base_model=args.base_model,
@@ -3331,8 +3445,8 @@ def main():
             reg_loader=reg_loader,
             tag_to_idx=model.tag_to_idx,
             idx_to_tag=model.idx_to_tag,
-            tag_to_category=tag_to_category,
-            old_tags_count=old_tags_count,
+            tag_to_category=model.tag_to_category,
+            old_tags_count=old_tags_count, # prepare_datasetから返された削除後の既存タグ数を渡す
             learning_rate=args.learning_rate,
             weight_decay=args.weight_decay,
             use_8bit_optimizer=args.use_8bit_optimizer,
@@ -3345,17 +3459,19 @@ def main():
             checkpoint_interval=args.checkpoint_interval,
             merge_every_n_epochs=args.merge_every_n_epochs,
             mixed_precision=args.mixed_precision,
-            tensorboard=True,
+            tensorboard=args.tensorboard, # args.tensorboard を渡す
             initial_threshold=args.initial_threshold,
             dynamic_threshold=args.dynamic_threshold,
             head_only_train_steps=args.head_only_train_steps,
-            cache_dir=None
+            cache_dir=False, # args.cache_dir を渡す
+            use_zclip=args.use_zclip
         )
         print("トレーニングが完了しました！")
-        
+
         # TensorBoardプロセスの終了
         if args.tensorboard and 'tensorboard_process' in locals():
             tensorboard_process.terminate()
+            print("TensorBoardプロセスを終了しました。")
 
     elif args.command == 'merge':
 
@@ -3372,13 +3488,13 @@ def main():
                 'threshold': threshold,
                 'val_loss': val_loss,
                 'val_f1': val_f1,
-                'lora_rank': model.lora_rank,
-                'lora_alpha': model.lora_alpha,
-                'lora_dropout': model.lora_dropout,
-                'target_modules': model.target_modules,
-                'tag_to_idx': tag_to_idx,
-                'idx_to_tag': idx_to_tag,
-                'tag_to_category': tag_to_category,
+                'lora_rank': model.lora_rank if hasattr(model, 'lora_rank') else None, # マージ後はNoneになる可能性
+                'lora_alpha': model.lora_alpha if hasattr(model, 'lora_alpha') else None,
+                'lora_dropout': model.lora_dropout if hasattr(model, 'lora_dropout') else None,
+                'target_modules': model.target_modules if hasattr(model, 'target_modules') else None,
+                'tag_to_idx': str(tag_to_idx), # JSON互換のため文字列化
+                'idx_to_tag': str(idx_to_tag),
+                'tag_to_category': str(tag_to_category),
             }
             
             # 完全なチェックポイント

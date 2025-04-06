@@ -8,6 +8,7 @@ prediction/
 predictions/
 venv/
 cache/
+cl_*/
 
 # 一般的な Python の無視ファイル
 __pycache__/
@@ -37,6 +38,9 @@ wheels/
 # 分析結果
 model_analysis*.json
 lora_target_layers.txt
+
+# 外部コンポーネント
+zclip.py
 
 # 出力ファイル
 *.png
