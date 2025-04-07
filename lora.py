@@ -2078,7 +2078,7 @@ class AsymmetricLossOptimized(nn.Module):
 
 def compute_metrics(outputs, targets):
     """
-    評価指標を計算する関数（リファクタリング済み・高速化版）
+    評価指標を計算する関数（リファクタリング済み・高速化版・閾値選択ロジック変更）
 
     Args:
         outputs: モデルの出力（シグモイド適用済み）
@@ -2112,15 +2112,17 @@ def compute_metrics(outputs, targets):
 
     num_classes = targets_np.shape[1]
 
-    # --- PR-AUC の計算 ---
+    # --- PR-AUC の計算 --- (変更なし)
     pr_auc_scores = []
     for i in tqdm(range(num_classes), desc="Calculating PR-AUC", leave=False):
         if targets_np[:, i].sum() > 0:
             precision, recall, _ = precision_recall_curve(targets_np[:, i], outputs_np[:, i])
-            pr_auc_scores.append(auc(recall, precision))
+            # AUC計算時にNaNが発生しないようにチェック
+            if not (np.isnan(recall).any() or np.isnan(precision).any()):
+                pr_auc_scores.append(auc(recall, precision))
     macro_pr_auc = np.mean(pr_auc_scores) if pr_auc_scores else 0
 
-    # --- 閾値毎のマクロF1スコアの計算（ベクトル演算） ---
+    # --- 閾値毎のマクロF1スコアの計算（ベクトル演算） --- (変更なし)
     # 全閾値に対し、全サンプル・全クラスでの予測を一括計算
     preds_all = (outputs_np[None, :, :] >= thresholds[:, None, None]).astype(int)  # shape: (n_thresholds, n_samples, num_classes)
     TP_all = (preds_all * targets_np[None, :, :]).sum(axis=1)  # 各閾値・各クラスのTP
@@ -2134,25 +2136,61 @@ def compute_metrics(outputs, targets):
                           np.nan)
     # 各閾値で、有効なクラスのみのF1の平均を算出
     macro_f1_scores = np.array([np.nanmean(row) if np.any(~np.isnan(row)) else 0 for row in f1_all])
-    best_threshold_idx = np.argmax(macro_f1_scores)
-    best_threshold = thresholds[best_threshold_idx]
-    best_macro_f1 = macro_f1_scores[best_threshold_idx]
 
-    # --- 全体の予測（グローバル最適閾値） ---
+    # --- ★★★ 新しい閾値選択ロジック ★★★ ---
+    best_threshold_idx = 0 # デフォルト初期化
+    best_threshold = thresholds[0]
+    best_macro_f1 = 0.0
+
+    if len(macro_f1_scores) > 0 and macro_f1_scores.max() > 0: # F1スコアが計算できているか確認
+        max_f1_idx_orig = np.argmax(macro_f1_scores)
+        max_f1_score = macro_f1_scores[max_f1_idx_orig]
+
+        # 目標F1スコアを設定 (最大F1の95%以上、かつ最低でも0.75以上とする)
+        # これらの値 (0.95, 0.75) は調整可能です
+        target_f1 = max(max_f1_score * 0.95, 0.70)
+
+        # 目標F1スコア以上となる最初の閾値のインデックスを探す
+        candidate_indices = np.where(macro_f1_scores >= target_f1)[0]
+
+        if len(candidate_indices) > 0:
+            # 候補の中で最もインデックスが小さい（=閾値が低い）ものを選ぶ
+            best_threshold_idx = candidate_indices[0]
+            best_threshold = thresholds[best_threshold_idx]
+            print(f"閾値選択: 目標F1({target_f1:.4f})以上となる最小閾値({best_threshold:.2f})を選択 (MaxF1: {max_f1_score:.4f} @ {thresholds[max_f1_idx_orig]:.2f})")
+        else:
+            # 適切な候補が見つからなかった場合は、元の最大値を選ぶ
+            best_threshold_idx = max_f1_idx_orig
+            best_threshold = thresholds[best_threshold_idx]
+            print(f"閾値選択: 目標F1({target_f1:.4f})以上となる閾値が見つからず、元の最大F1閾値({best_threshold:.2f})を選択 (MaxF1: {max_f1_score:.4f})")
+
+        best_macro_f1 = macro_f1_scores[best_threshold_idx] # 選択された閾値でのF1
+
+    else:
+        # F1スコアが計算できなかった場合
+        print("警告: マクロF1スコアが計算できませんでした。デフォルト閾値を使用します。")
+        # macro_f1_scoresが空の場合や最大値が0の場合のargmaxは0を返すため、それでよい
+        best_threshold_idx = np.argmax(macro_f1_scores) if len(macro_f1_scores) > 0 else 0
+        best_threshold = thresholds[best_threshold_idx]
+        best_macro_f1 = macro_f1_scores[best_threshold_idx] if len(macro_f1_scores) > 0 else 0.0
+
+
+    # --- 全体の予測（選択された閾値） --- (変更なし)
     predictions = (outputs_np >= best_threshold).astype(int)
 
-    # --- 最適閾値での各クラスF1スコア計算（有効なクラスのみ対象） ---
+    # --- 最適閾値での各クラスF1スコア計算（有効なクラスのみ対象） --- (変更なし)
     pred_sum_best = predictions.sum(axis=0)
     TP_best = (predictions * targets_np).sum(axis=0)
     true_sum_best = targets_np.sum(axis=0)
     valid = (pred_sum_best > 0) & (true_sum_best > 0)
     f1_scores = np.zeros(num_classes, dtype=float)
-    f1_scores[valid] = 2 * TP_best[valid] / (pred_sum_best[valid] + true_sum_best[valid])
+    with np.errstate(divide='ignore', invalid='ignore'): # ゼロ除算警告を抑制
+        f1_scores[valid] = 2 * TP_best[valid] / (pred_sum_best[valid] + true_sum_best[valid])
     # validなクラスのみ抽出（元のコードと同様、条件を満たさないクラスは除外）
     class_f1_scores = [f1_scores[i] for i in range(num_classes) if valid[i]]
-    macro_f1 = np.mean(class_f1_scores) if class_f1_scores else 0
+    # macro_f1 = np.mean(class_f1_scores) if class_f1_scores else 0 # best_macro_f1 を使うので不要
 
-    # --- 各クラスごとの最適閾値の計算（ベクトル演算） ---
+    # --- 各クラスごとの最適閾値の計算（ベクトル演算） --- (変更なし)
     # 無効な閾値では f1 を -1 に設定しておく
     valid_mask = (pred_sum_all > 0) & (true_sum[None, :] > 0)
     f1_all_thresh = np.full_like(pred_sum_all, -1, dtype=float)
@@ -2163,26 +2201,28 @@ def compute_metrics(outputs, targets):
     class_best_thresholds = []
     for i in range(num_classes):
         if true_sum[i] > 0:
-            max_f1 = np.max(f1_all_thresh[:, i])
+            max_f1_class = np.max(f1_all_thresh[:, i])
             # 元のコードと同様、最大F1が0以下なら None を設定
-            if max_f1 > 0:
-                best_idx = np.argmax(f1_all_thresh[:, i])
-                class_best_thresholds.append(thresholds[best_idx])
+            if max_f1_class > 0:
+                best_idx_class = np.argmax(f1_all_thresh[:, i])
+                class_best_thresholds.append(thresholds[best_idx_class])
             else:
-                class_best_thresholds.append(None)
+                class_best_thresholds.append(None) # 該当クラスで良い閾値が見つからない
         else:
-            # 正例が存在しないクラスはグローバル最適閾値を適用
+            # 正例が存在しないクラスはグローバル最適閾値を適用 (Noneでも良いかもしれない)
             class_best_thresholds.append(best_threshold)
 
-    # --- F1スコアと閾値の関係プロット ---
+    # --- F1スコアと閾値の関係プロット --- (変更なし)
     fig, ax = plt.subplots(figsize=(10, 6))
-    ax.plot(range(len(thresholds)), macro_f1_scores, 'bo-', label="Macro F1 Score")
-    ax.plot(best_threshold_idx, best_macro_f1, 'ro', markersize=10, label="Best Threshold")
-    ax.set_xticks(range(len(thresholds)))
-    ax.set_xticklabels([f"{t:.2f}" for t in thresholds], rotation=45)
+    # x軸をインデックスではなく閾値の値にする
+    ax.plot(thresholds, macro_f1_scores, 'bo-', label="Macro F1 Score")
+    # 選択された閾値にマーク
+    ax.plot(best_threshold, best_macro_f1, 'ro', markersize=10, label="Selected Threshold")
+    # ax.set_xticks(range(len(thresholds))) # 不要
+    # ax.set_xticklabels([f"{t:.2f}" for t in thresholds], rotation=45) # 不要
     ax.set_xlabel('Threshold')
     ax.set_ylabel('Macro F1 Score')
-    ax.set_title(f'Macro F1 Score vs Threshold (Optimal Value: {best_threshold:.2f})')
+    ax.set_title(f'Macro F1 Score vs Threshold (Selected Value: {best_threshold:.2f})') # タイトルを修正
     ax.grid(True)
     ax.legend()
 
@@ -2195,147 +2235,13 @@ def compute_metrics(outputs, targets):
 
     metrics = {
         'pr_auc': macro_pr_auc,
-        'f1': macro_f1,
+        'f1': best_macro_f1, # 選択された閾値でのF1を返す
         'threshold': best_threshold,
         'class_f1s': class_f1_scores,
         'f1_vs_threshold_plot': plot_image,
         'class_best_thresholds': class_best_thresholds  # 各クラスごとの最適閾値リスト
     }
     return metrics
-
-# def compute_metrics(outputs, targets):
-#     """
-#     評価指標を計算する関数
-    
-#     Args:
-#         outputs: モデルの出力（シグモイド適用済み）
-#         targets: 正解ラベル
-    
-#     Returns:
-#         metrics: 評価指標の辞書。さらに各クラスごとの最適な閾値も追加される。
-#     """
-#     import matplotlib.pyplot as plt
-#     from PIL import Image as PILImage
-#     import io
-#     from torchvision import transforms
-#     from sklearn.metrics import precision_recall_curve, auc, f1_score
-#     from tqdm import tqdm
-#     import numpy as np
-#     import torch
-    
-#     # 閾値の設定（0.1～0.85まで0.05刻み）
-#     thresholds = np.arange(0.1, 0.9, 0.05)
-    
-#     # テンソルの場合はNumPy配列に変換
-#     if isinstance(outputs, torch.Tensor):
-#         outputs_np = outputs.cpu().numpy()
-#     else:
-#         outputs_np = outputs
-
-#     if isinstance(targets, torch.Tensor):
-#         targets_np = targets.cpu().numpy()
-#     else:
-#         targets_np = targets
-    
-#     num_classes = targets_np.shape[1]
-#     pr_auc_scores = []
-    
-#     # 各クラスごとにPR曲線とAUCを計算
-#     for i in tqdm(range(num_classes), desc="Calculating PR-AUC and F1 scores", leave=False):
-#         if np.sum(targets_np[:, i]) > 0:
-#             precision, recall, _ = precision_recall_curve(targets_np[:, i], outputs_np[:, i])
-#             pr_auc = auc(recall, precision)
-#             pr_auc_scores.append(pr_auc)
-    
-#     # 平均PR-AUC
-#     macro_pr_auc = np.mean(pr_auc_scores) if pr_auc_scores else 0
-    
-#     # 各閾値でのマクロF1スコアを計算（予測にも正解にも陽性があるクラスのみ）
-#     macro_f1_scores = []
-#     for threshold in tqdm(thresholds, desc="Calculating macro F1 scores", leave=False):
-#         preds = (outputs_np >= threshold).astype(int)
-#         class_f1_scores_threshold = []
-#         for i in tqdm(range(num_classes), desc="Calculating class F1 scores", leave=False):
-#             if np.sum(preds[:, i]) > 0 and np.sum(targets_np[:, i]) > 0:
-#                 f1 = f1_score(targets_np[:, i], preds[:, i])
-#                 class_f1_scores_threshold.append(f1)
-#         if class_f1_scores_threshold:
-#             macro_f1_scores.append(np.mean(class_f1_scores_threshold))
-#         else:
-#             macro_f1_scores.append(0)
-#     macro_f1_scores = np.array(macro_f1_scores)
-    
-#     # 最適な閾値（全体のマクロF1スコアが最大となる閾値）の選択
-#     best_threshold_idx = np.argmax(macro_f1_scores)
-#     best_threshold = thresholds[best_threshold_idx]
-#     best_macro_f1 = macro_f1_scores[best_threshold_idx]
-    
-#     # 最適な閾値での予測作成
-#     predictions = (outputs_np >= best_threshold).astype(int)
-    
-#     # 最適な閾値で、予測と正解に陽性があるクラスのみF1スコアを計算（個別クラスのF1）
-#     class_f1_scores = []
-#     for i in tqdm(range(num_classes), desc="Calculating class F1 scores", leave=False):
-#         if np.sum(predictions[:, i]) > 0 and np.sum(targets_np[:, i]) > 0:
-#             class_f1 = f1_score(targets_np[:, i], predictions[:, i])
-#             class_f1_scores.append(class_f1)
-    
-#     # 最終的なマクロF1スコア（フィルタリング付き）
-#     macro_f1 = np.mean(class_f1_scores) if class_f1_scores else 0
-    
-#     # --- ここから各クラスごとの最適閾値の計算 ---
-#     class_best_thresholds = []
-#     # 各クラスごとに、全閾値でのF1スコアを求める
-#     for i in tqdm(range(num_classes), desc="Calculating best thresholds", leave=False):
-#         best_thresh = None
-#         best_f1 = 0
-#         # 正例があるクラスのみ計算
-#         if np.sum(targets_np[:, i]) > 0:
-#             for threshold in thresholds:
-#                 preds = (outputs_np[:, i] >= threshold).astype(int)
-#                 # 予測と正解両方に陽性がある場合のみF1を計算
-#                 if np.sum(preds) > 0 and np.sum(targets_np[:, i]) > 0:
-#                     f1 = f1_score(targets_np[:, i], preds)
-#                     if f1 > best_f1:
-#                         best_f1 = f1
-#                         best_thresh = threshold
-#         else:
-#             best_thresh = best_threshold
-#         class_best_thresholds.append(best_thresh)
-#     # --- ここまで各クラスごとの最適閾値の計算 ---
-    
-#     # F1スコアと閾値の関係のプロット生成
-#     fig, ax = plt.subplots(figsize=(10, 6))
-#     ax.plot(range(len(thresholds)), macro_f1_scores, 'bo-', label="Macro F1 Score")
-#     ax.plot(best_threshold_idx, best_macro_f1, 'ro', markersize=10, label="Best Threshold")
-#     ax.set_xticks(range(len(thresholds)))
-#     ax.set_xticklabels([f"{t:.2f}" for t in thresholds], rotation=45)
-#     ax.set_xlabel('Threshold')
-#     ax.set_ylabel('Macro F1 Score')
-#     ax.set_title(f'Macro F1 Score vs Threshold (Optimal Value: {best_threshold:.2f})')
-#     ax.grid(True)
-#     ax.legend()
-    
-#     # プロット画像をバイトストリームに変換
-#     buf = io.BytesIO()
-#     fig.tight_layout()
-#     plt.savefig(buf, format='png')
-#     plt.close(fig)
-#     buf.seek(0)
-    
-#     # 画像をテンソルに変換
-#     plot_image = transforms.ToTensor()(PILImage.open(buf))
-    
-#     metrics = {
-#         'pr_auc': macro_pr_auc,
-#         'f1': macro_f1,
-#         'threshold': best_threshold,
-#         'class_f1s': class_f1_scores,
-#         'f1_vs_threshold_plot': plot_image,
-#         'class_best_thresholds': class_best_thresholds  # 追加：各クラスごとの最適な閾値リスト
-#     }
-    
-#     return metrics
 
 # トレーニング関数
 def train_model(
