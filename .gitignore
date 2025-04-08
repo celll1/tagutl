@@ -41,6 +41,7 @@ lora_target_layers.txt
 
 # 外部コンポーネント
 zclip.py
+SageAttention/
 
 # 出力ファイル
 *.png

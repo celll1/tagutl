@@ -41,6 +41,18 @@ except ImportError:
     ZClip = None
     zclip_available = False
 
+# SageAttentionのインポートを試みる
+# Apache 2.0 License
+# https://github.com/thu-ml/SageAttention
+try:
+    import sageattention
+    # print("sageattentionが正常にインポートされました")
+    sageattention_available = True
+except ImportError:
+    print("sageattentionをインポートできませんでした。pip install sageattention==1.0.6 またはソースからビルドしてください")
+    sageattention = None
+    sageattention_available = False
+
 # デバイスの設定
 torch_device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 Image.MAX_IMAGE_PIXELS = None
@@ -171,6 +183,128 @@ def replace_timm_attn_with_xformers(model, use_xformers=False):
                 print(f"xformers対応に置き換え: {name}")
 
     print(f"モデルのattentionをxformersのメモリ効率の良いバージョンに置き換えました（{replaced_count}層）")
+    return model
+
+def replace_timm_attn_with_sageattention(model, use_sageattention=False):
+    """
+    EVA02モデルのattentionをSageAttentionに置き換えます。
+
+    Args:
+        model: EVA02モデル
+        use_sageattention: SageAttentionを使用するかどうか
+    """
+    if not use_sageattention:
+        return model
+
+    if not sageattention_available:
+        print("sageattentionが利用できないため、標準のattentionを使用します")
+        return model
+
+    print("sageattentionが正常にインポートされました")
+
+    from timm.models.eva import EvaAttention, apply_rot_embed_cat
+
+    class SageEvaAttention(nn.Module):
+        def __init__(self, original_module):
+            super().__init__()
+            # 属性のコピー
+            self.num_heads = original_module.num_heads
+            self.scale = original_module.scale
+            self.num_prefix_tokens = original_module.num_prefix_tokens
+            # SageAttentionにはfused_attnやattn_dropに相当する直接的な引数はない
+            # self.fused_attn = False # 不要
+            # self.attn_drop = original_module.attn_drop # SageAttention内部では扱わない
+            self.qkv_bias_separate = getattr(original_module, 'qkv_bias_separate', False)
+
+            # 層のコピー
+            self.qkv = original_module.qkv
+            self.q_proj = original_module.q_proj
+            self.k_proj = original_module.k_proj
+            self.v_proj = original_module.v_proj
+            self.q_bias = original_module.q_bias
+            self.k_bias = original_module.k_bias
+            self.v_bias = original_module.v_bias
+
+            self.norm = original_module.norm
+            self.proj = original_module.proj
+            self.proj_drop = original_module.proj_drop # Attention後のDropoutは維持
+
+        def forward(self, x, rope=None, attn_mask=None):
+            B, N, C = x.shape
+
+            # q, k, v計算（連続性のためcontiguous()を呼ぶ）
+            if self.qkv is not None:
+                if self.q_bias is None:
+                    qkv = self.qkv(x)
+                else:
+                    qkv_bias = torch.cat((self.q_bias, self.k_bias, self.v_bias))
+                    if self.qkv_bias_separate:
+                        qkv = self.qkv(x)
+                        qkv += qkv_bias
+                    else:
+                        qkv = F.linear(x, weight=self.qkv.weight, bias=qkv_bias)
+                qkv = qkv.reshape(B, N, 3, self.num_heads, -1).permute(2, 0, 3, 1, 4).contiguous()
+                q, k, v = qkv.unbind(0)  # 各テンソル shape: (B, num_heads, N, head_dim)
+            else:
+                q = self.q_proj(x).reshape(B, N, self.num_heads, -1).transpose(1, 2).contiguous()
+                k = self.k_proj(x).reshape(B, N, self.num_heads, -1).transpose(1, 2).contiguous()
+                v = self.v_proj(x).reshape(B, N, self.num_heads, -1).transpose(1, 2).contiguous()
+
+            # ropeの適用（rotary embedding）
+            if rope is not None:
+                npt = self.num_prefix_tokens
+                q = torch.cat([q[:, :, :npt, :], apply_rot_embed_cat(q[:, :, npt:, :], rope)], dim=2).type_as(v)
+                k = torch.cat([k[:, :, :npt, :], apply_rot_embed_cat(k[:, :, npt:, :], rope)], dim=2).type_as(v)
+
+            # SageAttention呼び出し
+            # attn_mask は is_causal で代替。現状のEVAではattn_mask未使用前提。
+            # scale は SageAttention に渡す引数がないため、適用しない。
+            # ドロップアウトもSageAttentionには引数がない。
+            # データ型は FP16/BF16 が期待される。mixed_precision=True での実行を想定。
+            try:
+                # is_causal は元の EvaAttention にはないため、False固定とする
+                # 必要であれば、モデルの使い方に応じて変更する
+                is_causal = False
+                x_out = sageattention.sageattn(
+                    q, k, v,
+                    tensor_layout="HND",
+                    is_causal=is_causal,
+                    # scale=self.scale # sageattnにscale引数はない
+                    # attn_bias=None # attn_maskはis_causalで代替
+                    # p=self.attn_drop.p # sageattnにdropout引数はない
+                )
+            except Exception as e:
+                print(f"SageAttentionの呼び出しでエラーが発生しました: {e}")
+                print("標準のattentionにフォールバックします（性能に影響が出る可能性があります）")
+                # フォールバックとして元の計算を模倣（ただし非効率）
+                q = q * self.scale
+                attn = (q @ k.transpose(-2, -1))
+                attn = attn.softmax(dim=-1)
+                # attn = self.attn_drop(attn) # ドロップアウトは適用できない
+                x_out = attn @ v
+
+
+            # 元の形状に戻し、正規化・投影処理
+            x_out = x_out.transpose(1, 2).reshape(B, N, -1)
+            x_out = self.norm(x_out)
+            x_out = self.proj(x_out)
+            x_out = self.proj_drop(x_out) # Attention後のdropoutは適用
+            return x_out
+
+    # モデル内の EvaAttention モジュールを置換
+    replaced_count = 0
+    for name, module in model.named_modules():
+        if isinstance(module, EvaAttention):
+            parent_name = '.'.join(name.split('.')[:-1])
+            child_name = name.split('.')[-1]
+            if parent_name:
+                parent = model.get_submodule(parent_name)
+                new_attn = SageEvaAttention(module)
+                setattr(parent, child_name, new_attn)
+                replaced_count += 1
+                # print(f"SageAttention対応に置き換え: {name}") # tqdmとかぶるのでコメントアウト推奨
+
+    print(f"モデルのattentionをSageAttentionに置き換えました（{replaced_count}層）")
     return model
 
 # Loraレイヤーの定義
@@ -816,18 +950,29 @@ class EVA02WithModuleLoRA(nn.Module):
         self.backbone.to(device)
         return self
 
-def load_model(model_path=None, 
-               metadata_path=None, 
+def load_model(model_path=None,
+               metadata_path=None,
                base_model='SmilingWolf/wd-eva02-large-tagger-v3',
                lora_rank=None,
                lora_alpha=None,
                lora_dropout=None,
                pretrained=True,
                device=torch_device,
-               use_xformers=False  # xformersを使用するかどうかのフラグを追加
+               use_xformers=False, # xformersを使用するかどうかのフラグ
+               use_sageattention=False # SageAttentionを使用するかどうかのフラグを追加
     ) -> tuple[EVA02WithModuleLoRA, LabelData]:
     """モデルを読み込む関数"""
     print(f" === Load Model === ")
+
+    # xformersとsageattentionの同時使用は不可
+    if use_xformers and use_sageattention:
+        raise ValueError("xformersとSageAttentionを同時に有効にすることはできません。どちらか一方を選択してください。")
+    if use_xformers:
+        print("xformersを使用します。")
+    if use_sageattention:
+        print("SageAttentionを使用します。")
+    else:
+        print("xformersとSageAttentionを使用しません。")    
 
     if model_path is None:
         print(f"ベースモデルを読み込んでいます...")
@@ -1013,7 +1158,6 @@ def load_model(model_path=None,
                 print(f"ベースモデルのラベル数: {num_classes}, チェックポイントのラベル数: {head_size}")
             
             # モデルを作成
-            print(f"モデルを作成しています...")
             model = EVA02WithModuleLoRA(
                 base_model=base_model,
                 model_path = model_path,
@@ -1041,12 +1185,43 @@ def load_model(model_path=None,
         else:
             raise ValueError(f"メタデータファイルが見つかりません: {metadata_path}")
     else:
-        raise ValueError("モデルパスが指定されていません")  
-    
-    # xformersを使用する場合はattentionを置き換え
+        # ベースモデルもチェックポイントも指定されない場合 (以前はValueErrorだったが、初期LoRAを許容するならここに来る)
+        print(f"モデルパスが指定されていません。ベースモデル '{base_model}' から初期化します。")
+        # ラベルデータを読み込む
+        print(f"ラベルデータを読み込んでいます...")
+        labels = load_labels_hf(repo_id=base_model)
+        num_classes = len(labels.names)
+
+        idx_to_tag = {i: name for i, name in enumerate(labels.names)}
+        tag_to_idx = {name: i for i, name in enumerate(labels.names)}
+        # カテゴリ情報を付与 (load_labels_hf の情報だけでは不十分なため、taggroup から読み込む方が良いが、ここでは暫定)
+        tag_to_category = {name: 'Rating' if i in labels.rating else
+                                  'Character' if i in labels.character else
+                                  'General' for i, name in enumerate(labels.names)}
+        print(f"カテゴリごとのタグ数: Rating: {len(labels.rating)}, Character: {len(labels.character)}, General: {len(labels.general)}, Artist: {len(labels.artist)}, Copyright: {len(labels.copyright)}, Meta: {len(labels.meta)}")
+
+        print(f"初期化されたLoRAモデルを使用します（ベースモデル: {base_model}, lora_rank: {lora_rank}, lora_alpha: {lora_alpha}, lora_dropout: {lora_dropout}")
+
+        model = EVA02WithModuleLoRA(
+            base_model=base_model,
+            model_path=None,
+            num_classes=num_classes,
+            threshold=0.35,
+            idx_to_tag=idx_to_tag,
+            tag_to_idx=tag_to_idx,
+            tag_to_category=tag_to_category,
+            lora_rank=lora_rank,
+            lora_alpha=lora_alpha,
+            lora_dropout=lora_dropout,
+            pretrained=pretrained # ベースからなのでTrue
+        )
+
+    # xformers または SageAttention を使用する場合はattentionを置き換え
     if use_xformers:
         model = replace_timm_attn_with_xformers(model, use_xformers=True)
-    
+    elif use_sageattention:
+        model = replace_timm_attn_with_sageattention(model, use_sageattention=True)
+
     model = model.to(device)
     model.eval()
 
@@ -2942,7 +3117,8 @@ def main():
     predict_parser.add_argument('--gen_threshold', type=float, default=None, help='一般タグの閾値')
     predict_parser.add_argument('--char_threshold', type=float, default=None, help='キャラクタータグの閾値')
     predict_parser.add_argument('--xformers', action='store_true', help='xformersを使用してメモリ効率の良いattentionを有効化')
-    
+    predict_parser.add_argument('--sageattention', action='store_true', help='SageAttentionを使用してメモリ効率の良いattentionを有効化')
+
     # バッチ推論コマンド
     batch_parser = subparsers.add_parser('batch', help='複数の画像からタグを予測します')
     batch_parser.add_argument('--image_dir', type=str, required=True, help='予測する画像ファイルのディレクトリ')
@@ -2953,6 +3129,7 @@ def main():
     batch_parser.add_argument('--gen_threshold', type=float, default=None, help='一般タグの閾値')
     batch_parser.add_argument('--char_threshold', type=float, default=None, help='キャラクタータグの閾値')
     batch_parser.add_argument('--xformers', action='store_true', help='xformersを使用してメモリ効率の良いattentionを有効化')
+    batch_parser.add_argument('--sageattention', action='store_true', help='SageAttentionを使用してメモリ効率の良いattentionを有効化')
     
     # トレーニングコマンド
     train_parser = subparsers.add_parser('train', help='LoRAモデルをトレーニングします')
@@ -3018,7 +3195,7 @@ def main():
     train_parser.add_argument('--seed', type=int, default=42, help='乱数シード')
 
     train_parser.add_argument('--xformers', action='store_true', help='xformersを使用してメモリ効率の良いattentionを有効化')
-
+    train_parser.add_argument('--sageattention', action='store_true', help='SageAttentionを使用してメモリ効率の良いattentionを有効化')
     # モデルマージコマンド
     merge_parser = subparsers.add_parser('merge', help='LoRAモデルをマージします')
 
@@ -3050,7 +3227,7 @@ def main():
         print(f"使用デバイス: {device}")
 
         # 単一画像の予測
-        model, labels = load_model(args.model_path, args.metadata_path, base_model=args.base_model, device=device, use_xformers=args.xformers)
+        model, labels = load_model(args.model_path, args.metadata_path, base_model=args.base_model, device=device, use_xformers=args.xformers, use_sageattention=args.sageattention)
         
         # 画像に紐づくタグを読み込む
         actual_tags = read_tags_from_file(args.image)
@@ -3122,7 +3299,7 @@ def main():
         print(f"使用デバイス: {device}")
 
         # モデルの読み込み
-        model, labels = load_model(args.model_path, args.metadata_path, base_model=args.base_model, device=device, use_xformers=args.xformers)
+        model, labels = load_model(args.model_path, args.metadata_path, base_model=args.base_model, device=device, use_xformers=args.xformers, use_sageattention=args.sageattention)
         
         # 画像ファイルのリストを取得
         import glob
@@ -3194,8 +3371,11 @@ def main():
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         print(f"使用デバイス: {device}")
 
+        if args.sageattention and sageattention_available:
+            print("SageAttentionを使用します。")
+
         print(f"モデルを読み込んでいます...")
-        model, labels = load_model(args.model_path, args.metadata_path, base_model=args.base_model, lora_rank=args.lora_rank, lora_alpha=args.lora_alpha, lora_dropout=args.lora_dropout, device=device, use_xformers=args.xformers)
+        model, labels = load_model(args.model_path, args.metadata_path, base_model=args.base_model, lora_rank=args.lora_rank, lora_alpha=args.lora_alpha, lora_dropout=args.lora_dropout, device=device, use_xformers=args.xformers, use_sageattention=args.sageattention)
         
         # --- ここから tags_to_remove の処理を追加 ---
         tags_to_remove_list = None
