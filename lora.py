@@ -2742,307 +2742,311 @@ def train_model(
         else:
             print("警告: --use_zclipが指定されましたが、zclip.pyが見つからないためZClipは使用されません。")
 
-    # トレーニングループ
-    for epoch in range(num_epochs):
-        print(f"Epoch {epoch+1}/{num_epochs}")
-        
-        # トレーニングフェーズ
-        model.train()
-        train_loss = 0.0
-        train_preds = []
-        train_targets = []
-        
-        progress_bar = tqdm(train_loader, desc=f"Training")
-        for i, (images, targets) in enumerate(progress_bar):
-            global_step += 1
-            images = images.to(device)
-            targets = targets.to(device)
+    try:
+        # トレーニングループ
+        for epoch in range(num_epochs):
+            print(f"Epoch {epoch+1}/{num_epochs}")
             
-            # 通常のデータでの学習
-            if mixed_precision:
-                with torch.amp.autocast('cuda'):
-                    outputs = model(images)
-                    loss = criterion(outputs, targets)
-
-                scaler.scale(loss).backward()
-                if zclip:
-                    zclip.step(model) # 勾配クリッピングを適用
-                scaler.step(optimizer)
-                scaler.update()
-                optimizer.zero_grad()
-            else:
-                outputs = model(images)
-                loss = criterion(outputs, targets)
-
-                loss.backward()
-                if zclip:
-                    zclip.step(model) # 勾配クリッピングを適用
-                optimizer.step()
-                optimizer.zero_grad()
-
-            # 正則化データセットでの学習
-            if reg_loader is not None:
-                try:
-                    reg_images, reg_targets = next(reg_iter)
-                except (StopIteration, NameError):
-                    reg_iter = iter(reg_loader)
-                    reg_images, reg_targets = next(reg_iter)
-
-                reg_images = reg_images.to(device)
-                reg_targets = reg_targets.to(device)
-
+            # トレーニングフェーズ
+            model.train()
+            train_loss = 0.0
+            train_preds = []
+            train_targets = []
+            
+            progress_bar = tqdm(train_loader, desc=f"Training")
+            for i, (images, targets) in enumerate(progress_bar):
+                global_step += 1
+                images = images.to(device)
+                targets = targets.to(device)
+                
+                # 通常のデータでの学習
                 if mixed_precision:
                     with torch.amp.autocast('cuda'):
-                        reg_outputs = model(reg_images)
-                        reg_loss = criterion(reg_outputs, reg_targets)
+                        outputs = model(images)
+                        loss = criterion(outputs, targets)
 
-                    scaler.scale(reg_loss).backward()
+                    scaler.scale(loss).backward()
                     if zclip:
                         zclip.step(model) # 勾配クリッピングを適用
                     scaler.step(optimizer)
                     scaler.update()
                     optimizer.zero_grad()
                 else:
-                    reg_outputs = model(reg_images)
-                    reg_loss = criterion(reg_outputs, reg_targets)
+                    outputs = model(images)
+                    loss = criterion(outputs, targets)
 
-                    reg_loss.backward()
+                    loss.backward()
                     if zclip:
                         zclip.step(model) # 勾配クリッピングを適用
                     optimizer.step()
                     optimizer.zero_grad()
 
-                loss = (loss + reg_loss) / 2
+                # 正則化データセットでの学習
+                if reg_loader is not None:
+                    try:
+                        reg_images, reg_targets = next(reg_iter)
+                    except (StopIteration, NameError):
+                        reg_iter = iter(reg_loader)
+                        reg_images, reg_targets = next(reg_iter)
 
-            train_loss += loss.item()
+                    reg_images = reg_images.to(device)
+                    reg_targets = reg_targets.to(device)
 
-            # シグモイド関数で確率に変換
-            probs = torch.sigmoid(outputs).detach().cpu().numpy()
-            # 最新100件のみを保持
-            train_preds = (train_preds + [probs])[-100:]
-            train_targets = (train_targets + [targets.detach().cpu().numpy()])[-100:]
+                    if mixed_precision:
+                        with torch.amp.autocast('cuda'):
+                            reg_outputs = model(reg_images)
+                            reg_loss = criterion(reg_outputs, reg_targets)
 
-            progress_bar.set_postfix({"loss": f"{loss.item():.4f}"})
+                        scaler.scale(reg_loss).backward()
+                        if zclip:
+                            zclip.step(model) # 勾配クリッピングを適用
+                        scaler.step(optimizer)
+                        scaler.update()
+                        optimizer.zero_grad()
+                    else:
+                        reg_outputs = model(reg_images)
+                        reg_loss = criterion(reg_outputs, reg_targets)
 
-            # 定期的にTensorBoardに予測結果を記録
-            if tensorboard:
-                # stepごとのlossを記録
-                writer.add_scalar('Train/Step_Loss', loss.item(), epoch * len(train_loader) + i)
+                        reg_loss.backward()
+                        if zclip:
+                            zclip.step(model) # 勾配クリッピングを適用
+                        optimizer.step()
+                        optimizer.zero_grad()
 
-                if i % 100 == 0:
-                    img_grid = visualize_predictions_for_tensorboard(
-                        images[0],
-                        probs[0],
-                        idx_to_tag,
-                        threshold=threshold,
-                        original_tags=targets[0],
-                        tag_to_category=tag_to_category,
-                        neg_means=neg_stats['means'],  # 陰性群の平均値を追加
-                        neg_variance=neg_stats['variance'],  # 陰性群の分散を追加
-                        neg_counts=neg_stats['counts']  # 陰性群のサンプル数を追加
-                    )
-                    writer.add_image(f'predictions/train_epoch_{epoch}', img_grid, i)
+                    loss = (loss + reg_loss) / 2
 
-            if global_step == head_only_train_steps:
-                tqdm.write("ヘッド部分の訓練を終了します")
-                model.freeze_non_lora_parameters()
-        
-        # 学習率のスケジューリング
-        scheduler.step()
-        if tensorboard:
-            writer.add_scalar('Learning_Rate', optimizer.param_groups[0]['lr'], epoch)
-        
-        # トレーニングメトリクスの計算
-        train_loss /= len(train_loader)
+                train_loss += loss.item()
 
-        train_preds = [pred for batch in train_preds for pred in batch]
-        train_targets = [target for batch in train_targets for target in batch]
-        train_preds = np.array(train_preds)
-        train_targets = np.array(train_targets)
-
-        train_metrics = compute_metrics(train_preds,train_targets)
-
-        if dynamic_threshold:
-            threshold = round(train_metrics['threshold'], 2) - 0.1
-        
-        # 既存タグと新規タグに分けてメトリクスを計算
-        if old_tags_count > 0 and len(model.tag_to_idx) > old_tags_count:
-            existing_train_metrics = compute_metrics(train_preds[:,:old_tags_count],train_targets[:,:old_tags_count])
-            new_train_metrics = compute_metrics(train_preds[:,old_tags_count:],train_targets[:,old_tags_count:])
-
-            if tensorboard:
-                writer.add_scalar('Metrics/Train/Loss', train_loss, epoch+1)
-                writer.add_scalar('Metrics/Train/F1_all', train_metrics['f1'], epoch+1)
-                writer.add_scalar('Metrics/Train/Threshold', threshold, epoch+1)
-                writer.add_image('Metrics/Train/F1_vs_Threshold', train_metrics['f1_vs_threshold_plot'], epoch+1)
-                writer.add_scalar('Metrics/Train/F1_existing', existing_train_metrics['f1'], epoch+1)
-                writer.add_scalar('Metrics/Train/F1_new', new_train_metrics['f1'], epoch+1)
-        else:
-            if tensorboard:
-                writer.add_scalar('Metrics/Train/Loss', train_loss, epoch+1)
-                writer.add_scalar('Metrics/Train/F1_all', train_metrics['f1'], epoch+1)
-                writer.add_scalar('Metrics/Train/Threshold', threshold, epoch+1)
-                writer.add_image('Metrics/Train/F1_vs_Threshold', train_metrics['f1_vs_threshold_plot'], epoch+1)
-        del train_preds, train_targets
-
-        # 検証フェーズ
-        model.eval()
-        val_loss = 0.0
-        val_preds = []
-        val_targets = []
-
-        val_neg_preds = []
-        val_pos_preds = []
-        
-        with torch.no_grad():
-            progress_bar = tqdm(val_loader, desc=f"Validation")
-            for i, (images, targets) in enumerate(progress_bar):
-                images = images.to(device)
-                targets = targets.to(device)
-                
-                if mixed_precision:
-                    with torch.amp.autocast('cuda'):
-                        outputs = model(images)
-                        loss = criterion(outputs, targets)
-                else:
-                    outputs = model(images)
-                    loss = criterion(outputs, targets)
-                
-                val_loss += loss.item()
-                
                 # シグモイド関数で確率に変換
-                probs = torch.sigmoid(outputs).cpu().numpy()
+                probs = torch.sigmoid(outputs).detach().cpu().numpy()
                 # 最新100件のみを保持
-                val_preds = (val_preds + [probs])[-100:]
-                val_targets = (val_targets + [targets.detach().cpu().numpy()])[-100:]
-                neg_probs = probs*(1-targets.cpu().numpy())
-                pos_probs = probs*targets.cpu().numpy()
-                val_neg_preds = (val_neg_preds + [neg_probs])[-100:]
-                val_pos_preds = (val_pos_preds + [pos_probs])[-100:]
-                
+                train_preds = (train_preds + [probs])[-100:]
+                train_targets = (train_targets + [targets.detach().cpu().numpy()])[-100:]
+
                 progress_bar.set_postfix({"loss": f"{loss.item():.4f}"})
 
-                if i % 5 == 0 and i / 5 < 10:                        
-                    # 予測の可視化
-                    img_grid = visualize_predictions_for_tensorboard(
-                        images[0], 
-                        probs[0], 
-                        idx_to_tag, 
-                        threshold=threshold, 
-                        original_tags=targets[0],
-                        tag_to_category=tag_to_category,
-                        neg_means=neg_stats['means'],  # 陰性群の平均値を追加
-                        neg_variance=neg_stats['variance'],  # 陰性群の分散を追加
-                        neg_counts=neg_stats['counts']  # 陰性群のサンプル数を追加
-                    )
+                # 定期的にTensorBoardに予測結果を記録
+                if tensorboard:
+                    # stepごとのlossを記録
+                    writer.add_scalar('Train/Step_Loss', loss.item(), epoch * len(train_loader) + i)
 
-                    if tensorboard:
-                        writer.add_image(f'predictions/val_{i}', img_grid, epoch+1)
+                    if i % 100 == 0:
+                        img_grid = visualize_predictions_for_tensorboard(
+                            images[0],
+                            probs[0],
+                            idx_to_tag,
+                            threshold=threshold,
+                            original_tags=targets[0],
+                            tag_to_category=tag_to_category,
+                            neg_means=neg_stats['means'],  # 陰性群の平均値を追加
+                            neg_variance=neg_stats['variance'],  # 陰性群の分散を追加
+                            neg_counts=neg_stats['counts']  # 陰性群のサンプル数を追加
+                        )
+                        writer.add_image(f'predictions/train_epoch_{epoch}', img_grid, i)
 
-
-        # 陽性群と陰性群の統計を計算
-        # pos_stats = calculate_group_stats(val_pos_preds)
-        neg_stats = calculate_group_stats(val_neg_preds)
-
-        # 検証メトリクスの計算
-        val_loss /= len(val_loader)
-
-        val_preds = [pred for batch in val_preds for pred in batch]
-        val_targets = [target for batch in val_targets for target in batch]
-        val_preds = np.array(val_preds)
-        val_targets = np.array(val_targets)
-
-        val_metrics = compute_metrics(val_preds, val_targets)
-        
-        # 結果の表示
-        print(f"Train Loss: {train_loss:.4f}, Train F1: {train_metrics['f1']:.4f}, "
-              f"Val Loss: {val_loss:.4f}, Val F1: {val_metrics['f1']:.4f}")
-         
-        # 既存タグと新規タグに分けてメトリクスを計算
-        if old_tags_count > 0 and len(model.tag_to_idx) > old_tags_count:
-            existing_val_metrics = compute_metrics(
-                val_preds[:, :old_tags_count],
-                val_targets[:, :old_tags_count]
-            )
-            new_val_metrics = compute_metrics(
-                val_preds[:, old_tags_count:],
-                val_targets[:, old_tags_count:]
-            )
+                if global_step == head_only_train_steps:
+                    tqdm.write("ヘッド部分の訓練を終了します")
+                    model.freeze_non_lora_parameters()
             
-            print(f"epoch {epoch+1} 検証結果 - 既存タグ F1: {existing_val_metrics['f1']:.4f}, 新規タグ F1: {new_val_metrics['f1']:.4f}")
-
+            # 学習率のスケジューリング
+            scheduler.step()
             if tensorboard:
-                writer.add_scalar('Metrics/val/F1', val_metrics['f1'], epoch+1)
-                writer.add_scalar('Metrics/val/PR-AUC', val_metrics['pr_auc'], epoch+1)
-                writer.add_scalar('Metrics/val/Threshold', threshold, epoch+1)
-                writer.add_image('Metrics/val/F1_vs_Threshold', val_metrics['f1_vs_threshold_plot'], epoch+1)
+                writer.add_scalar('Learning_Rate', optimizer.param_groups[0]['lr'], epoch)
+            
+            # トレーニングメトリクスの計算
+            train_loss /= len(train_loader)
 
-                if old_tags_count > 0 and len(model.tag_to_idx) > old_tags_count:
-                    writer.add_scalar('Metrics/val/F1_existing', existing_val_metrics['f1'], epoch+1)
-                    writer.add_scalar('Metrics/val/F1_new', new_val_metrics['f1'], epoch+1)
-            del existing_val_metrics, new_val_metrics
-        else:
-            print(f"epoch {epoch+1} 検証結果 - F1: {val_metrics['f1']:.4f}")
-            if tensorboard:
-                writer.add_scalar('Metrics/val/F1', val_metrics['f1'], epoch+1)
-                writer.add_scalar('Metrics/val/PR-AUC', val_metrics['pr_auc'], epoch+1)
-                writer.add_scalar('Metrics/val/Threshold', threshold, epoch+1)
-                writer.add_image('Metrics/val/F1_vs_Threshold', val_metrics['f1_vs_threshold_plot'], epoch+1)
+            train_preds = [pred for batch in train_preds for pred in batch]
+            train_targets = [target for batch in train_targets for target in batch]
+            train_preds = np.array(train_preds)
+            train_targets = np.array(train_targets)
 
-        del val_preds, val_targets, val_neg_preds, val_pos_preds
-        
-        # 最良のモデルを保存
-        save_model_flag = False
-        
-        if save_best == 'f1' and val_metrics['f1'] > best_val_f1:
-            best_val_f1 = val_metrics['f1']
-            save_model_flag = True
-        elif save_best == 'loss' and val_loss < best_val_loss:
-            best_val_loss = val_loss
-            save_model_flag = True
-        elif save_best == 'both':
-            if val_metrics['f1'] > best_val_f1:
+            train_metrics = compute_metrics(train_preds,train_targets)
+
+            if dynamic_threshold:
+                threshold = round(train_metrics['threshold'], 2) - 0.1
+            
+            # 既存タグと新規タグに分けてメトリクスを計算
+            if old_tags_count > 0 and len(model.tag_to_idx) > old_tags_count:
+                existing_train_metrics = compute_metrics(train_preds[:,:old_tags_count],train_targets[:,:old_tags_count])
+                new_train_metrics = compute_metrics(train_preds[:,old_tags_count:],train_targets[:,old_tags_count:])
+
+                if tensorboard:
+                    writer.add_scalar('Metrics/Train/Loss', train_loss, epoch+1)
+                    writer.add_scalar('Metrics/Train/F1_all', train_metrics['f1'], epoch+1)
+                    writer.add_scalar('Metrics/Train/Threshold', threshold, epoch+1)
+                    writer.add_image('Metrics/Train/F1_vs_Threshold', train_metrics['f1_vs_threshold_plot'], epoch+1)
+                    writer.add_scalar('Metrics/Train/F1_existing', existing_train_metrics['f1'], epoch+1)
+                    writer.add_scalar('Metrics/Train/F1_new', new_train_metrics['f1'], epoch+1)
+            else:
+                if tensorboard:
+                    writer.add_scalar('Metrics/Train/Loss', train_loss, epoch+1)
+                    writer.add_scalar('Metrics/Train/F1_all', train_metrics['f1'], epoch+1)
+                    writer.add_scalar('Metrics/Train/Threshold', threshold, epoch+1)
+                    writer.add_image('Metrics/Train/F1_vs_Threshold', train_metrics['f1_vs_threshold_plot'], epoch+1)
+            del train_preds, train_targets
+
+            # 検証フェーズ
+            model.eval()
+            val_loss = 0.0
+            val_preds = []
+            val_targets = []
+
+            val_neg_preds = []
+            val_pos_preds = []
+            
+            with torch.no_grad():
+                progress_bar = tqdm(val_loader, desc=f"Validation")
+                for i, (images, targets) in enumerate(progress_bar):
+                    images = images.to(device)
+                    targets = targets.to(device)
+                    
+                    if mixed_precision:
+                        with torch.amp.autocast('cuda'):
+                            outputs = model(images)
+                            loss = criterion(outputs, targets)
+                    else:
+                        outputs = model(images)
+                        loss = criterion(outputs, targets)
+                    
+                    val_loss += loss.item()
+                    
+                    # シグモイド関数で確率に変換
+                    probs = torch.sigmoid(outputs).cpu().numpy()
+                    # 最新100件のみを保持
+                    val_preds = (val_preds + [probs])[-100:]
+                    val_targets = (val_targets + [targets.detach().cpu().numpy()])[-100:]
+                    neg_probs = probs*(1-targets.cpu().numpy())
+                    pos_probs = probs*targets.cpu().numpy()
+                    val_neg_preds = (val_neg_preds + [neg_probs])[-100:]
+                    val_pos_preds = (val_pos_preds + [pos_probs])[-100:]
+                    
+                    progress_bar.set_postfix({"loss": f"{loss.item():.4f}"})
+
+                    if i % 5 == 0 and i / 5 < 10:                        
+                        # 予測の可視化
+                        img_grid = visualize_predictions_for_tensorboard(
+                            images[0], 
+                            probs[0], 
+                            idx_to_tag, 
+                            threshold=threshold, 
+                            original_tags=targets[0],
+                            tag_to_category=tag_to_category,
+                            neg_means=neg_stats['means'],  # 陰性群の平均値を追加
+                            neg_variance=neg_stats['variance'],  # 陰性群の分散を追加
+                            neg_counts=neg_stats['counts']  # 陰性群のサンプル数を追加
+                        )
+
+                        if tensorboard:
+                            writer.add_image(f'predictions/val_{i}', img_grid, epoch+1)
+
+
+            # 陽性群と陰性群の統計を計算
+            # pos_stats = calculate_group_stats(val_pos_preds)
+            neg_stats = calculate_group_stats(val_neg_preds)
+
+            # 検証メトリクスの計算
+            val_loss /= len(val_loader)
+
+            val_preds = [pred for batch in val_preds for pred in batch]
+            val_targets = [target for batch in val_targets for target in batch]
+            val_preds = np.array(val_preds)
+            val_targets = np.array(val_targets)
+
+            val_metrics = compute_metrics(val_preds, val_targets)
+            
+            # 結果の表示
+            print(f"Train Loss: {train_loss:.4f}, Train F1: {train_metrics['f1']:.4f}, "
+                f"Val Loss: {val_loss:.4f}, Val F1: {val_metrics['f1']:.4f}")
+            
+            # 既存タグと新規タグに分けてメトリクスを計算
+            if old_tags_count > 0 and len(model.tag_to_idx) > old_tags_count:
+                existing_val_metrics = compute_metrics(
+                    val_preds[:, :old_tags_count],
+                    val_targets[:, :old_tags_count]
+                )
+                new_val_metrics = compute_metrics(
+                    val_preds[:, old_tags_count:],
+                    val_targets[:, old_tags_count:]
+                )
+                
+                print(f"epoch {epoch+1} 検証結果 - 既存タグ F1: {existing_val_metrics['f1']:.4f}, 新規タグ F1: {new_val_metrics['f1']:.4f}")
+
+                if tensorboard:
+                    writer.add_scalar('Metrics/val/F1', val_metrics['f1'], epoch+1)
+                    writer.add_scalar('Metrics/val/PR-AUC', val_metrics['pr_auc'], epoch+1)
+                    writer.add_scalar('Metrics/val/Threshold', threshold, epoch+1)
+                    writer.add_image('Metrics/val/F1_vs_Threshold', val_metrics['f1_vs_threshold_plot'], epoch+1)
+
+                    if old_tags_count > 0 and len(model.tag_to_idx) > old_tags_count:
+                        writer.add_scalar('Metrics/val/F1_existing', existing_val_metrics['f1'], epoch+1)
+                        writer.add_scalar('Metrics/val/F1_new', new_val_metrics['f1'], epoch+1)
+                del existing_val_metrics, new_val_metrics
+            else:
+                print(f"epoch {epoch+1} 検証結果 - F1: {val_metrics['f1']:.4f}")
+                if tensorboard:
+                    writer.add_scalar('Metrics/val/F1', val_metrics['f1'], epoch+1)
+                    writer.add_scalar('Metrics/val/PR-AUC', val_metrics['pr_auc'], epoch+1)
+                    writer.add_scalar('Metrics/val/Threshold', threshold, epoch+1)
+                    writer.add_image('Metrics/val/F1_vs_Threshold', val_metrics['f1_vs_threshold_plot'], epoch+1)
+
+            del val_preds, val_targets, val_neg_preds, val_pos_preds
+            
+            # 最良のモデルを保存
+            save_model_flag = False
+            
+            if save_best == 'f1' and val_metrics['f1'] > best_val_f1:
                 best_val_f1 = val_metrics['f1']
                 save_model_flag = True
-            if val_loss < best_val_loss:
+            elif save_best == 'loss' and val_loss < best_val_loss:
                 best_val_loss = val_loss
                 save_model_flag = True
+            elif save_best == 'both':
+                if val_metrics['f1'] > best_val_f1:
+                    best_val_f1 = val_metrics['f1']
+                    save_model_flag = True
+                if val_loss < best_val_loss:
+                    best_val_loss = val_loss
+                    save_model_flag = True
 
-        if save_model_flag:
-            # モデルの保存
-            save_model(output_dir, f'best_model', base_model, save_format, model, optimizer, scheduler, epoch, threshold, val_loss, val_metrics['f1'], tag_to_idx, idx_to_tag, tag_to_category)
-            print(f"Best model saved! (Val F1: {val_metrics['f1']:.4f}, Val Loss: {val_loss:.4f})")
-    
-        if (epoch + 1) % checkpoint_interval == 0:
-            save_model(output_dir, f'checkpoint_epoch_{epoch+1}', base_model, save_format, model, optimizer, scheduler, epoch, threshold, val_loss, val_metrics['f1'], tag_to_idx, idx_to_tag, tag_to_category)
-            print(f"Checkpoint saved at epoch {epoch+1}")
+            if save_model_flag:
+                # モデルの保存
+                save_model(output_dir, f'best_model', base_model, save_format, model, optimizer, scheduler, epoch, threshold, val_loss, val_metrics['f1'], tag_to_idx, idx_to_tag, tag_to_category)
+                print(f"Best model saved! (Val F1: {val_metrics['f1']:.4f}, Val Loss: {val_loss:.4f})")
+        
+            if (epoch + 1) % checkpoint_interval == 0:
+                save_model(output_dir, f'checkpoint_epoch_{epoch+1}', base_model, save_format, model, optimizer, scheduler, epoch, threshold, val_loss, val_metrics['f1'], tag_to_idx, idx_to_tag, tag_to_category)
+                print(f"Checkpoint saved at epoch {epoch+1}")
 
-        if merge_every_n_epochs is not None and (epoch + 1) % merge_every_n_epochs == 0:
-            model.merge_lora_to_base_model(
-                scale=1.0,
-                new_lora_rank=None,
-                new_lora_alpha=None,
-                new_lora_dropout=None
-            )
-            model.to(device)
-            # optimizer, schedulerをリセット
-            optimizer = setup_optimizer(model, learning_rate, weight_decay, use_8bit_optimizer)
-            # schedulerは通常、warmupをやり直すが、ここでは未実装
-    
-    # 最終モデルの保存
-    save_model(output_dir, f'final_model', base_model, save_format, model, optimizer, scheduler, epoch, threshold, val_loss, val_metrics['f1'], tag_to_idx, idx_to_tag, tag_to_category)
-    print(f"Final model saved! (Val F1: {val_metrics['f1']:.4f}, Val Loss: {val_loss:.4f})")
+            if merge_every_n_epochs is not None and (epoch + 1) % merge_every_n_epochs == 0:
+                model.merge_lora_to_base_model(
+                    scale=1.0,
+                    new_lora_rank=None,
+                    new_lora_alpha=None,
+                    new_lora_dropout=None
+                )
+                model.to(device)
+                # optimizer, schedulerをリセット
+                optimizer = setup_optimizer(model, learning_rate, weight_decay, use_8bit_optimizer)
+                # schedulerは通常、warmupをやり直すが、ここでは未実装
+                
+    except Exception as e:
+        print(f"エラーが発生しました: {e}")
 
-    save_tag_mapping(output_dir, idx_to_tag, tag_to_category)
+    finally:
+        # 最終モデルの保存
+        save_model(output_dir, f'final_model', base_model, save_format, model, optimizer, scheduler, epoch, threshold, val_loss, val_metrics['f1'], tag_to_idx, idx_to_tag, tag_to_category)
+        print(f"Final model saved! (Val F1: {val_metrics['f1']:.4f}, Val Loss: {val_loss:.4f})")
 
-    # 'optimizer_state_dict': optimizer.state_dict(),
-    # 'scheduler_state_dict': scheduler.state_dict() if scheduler else None, どうするか後で検討
-    
-    # Close the tensorboard writer
-    if tensorboard:
-        writer.close()
-    
-    return val_metrics    
+        save_tag_mapping(output_dir, idx_to_tag, tag_to_category)
+        # 'optimizer_state_dict': optimizer.state_dict(),
+        # 'scheduler_state_dict': scheduler.state_dict() if scheduler else None, どうするか後で検討
+        
+        # Close the tensorboard writer
+        if tensorboard:
+            writer.close()
+        
+        return val_metrics    
 
 def load_tag_categories():
     """
