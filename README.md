@@ -27,14 +27,20 @@ pip install -r requirements.txt
 
 ### 画像タグの予測
 
+例: 単一画像
 ```bash
-python test.py predict --image_path path/to/image.jpg --model_path path/to/model.safetensors --threshold 0.35
+python onnx_predict.py --image path/to/image.jpg --tag_mapping path/to/tag_mapping.json --model path/to/checkpoint.onnx --gen_threshold 0.35 --output_mode tags
+```
+
+例: フォルダ内一括
+```bash
+python onnx_predict.py  --dirs path/to/dir  --recursive  --batch_size 8 --tag_mapping path/to/tag_mapping.json --model path/to/checkpoint.onnx --gen_threshold 0.35  --char_threshold 0.35 --output_mode tags --tag_mode add --gpu
 ```
 
 ### LoRAによるファインチューニング
 
 ```bash
-python test.py train --image_dirs path/to/images --output_dir lora_model --num_epochs 10 --batch_size 8 --learning_rate 1e-4 --lora_rank 32 --lora_alpha 16 --tensorboard
+python lora.py train --image_dirs path/to/images --output_dir lora_model --num_epochs 10 --batch_size 8 --learning_rate 1e-4 --lora_rank 32 --lora_alpha 16 --tensorboard
 ```
 
 ### 主なオプション
