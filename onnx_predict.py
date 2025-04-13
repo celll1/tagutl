@@ -673,9 +673,13 @@ def extract_frames_from_video(video_path, num_frames):
     cap.release()
     return frames
 
-def predict_with_onnx(image_path, model_path, tag_mapping_path, gen_threshold=0.45, char_threshold=0.45, output_path=None, use_gpu=False, output_mode="visualization", tag_mode="add", remove_threshold=None):
+def predict_with_onnx(
+        image_path, model_path, tag_mapping_path, 
+        gen_threshold=0.45, char_threshold=0.45, output_path=None, 
+        use_gpu=False, output_mode="visualization", tag_mode="add", 
+        remove_threshold=None, batch_size=1):
     # ONNXモデルでの予測
-    print(f"Loading model: {model_path}")
+    print(f"Loading ONNX model: {model_path}")
     
     # モデルがFP16かどうかを確認
     is_fp16_model = False
@@ -868,7 +872,7 @@ def predict_with_onnx(image_path, model_path, tag_mapping_path, gen_threshold=0.
         else:
             # 出力ディレクトリが指定されていない場合
             # バッチ推論時は画像と同じディレクトリ、単一推論時はカレントディレクトリ
-            if batch_mode:
+            if batch_size > 1:
                 tag_output_dir = os.path.dirname(image_path)
             else:
                 tag_output_dir = "."
@@ -1620,7 +1624,8 @@ def main():
             use_gpu=args.gpu,
             output_mode=args.output_mode,
             tag_mode=args.tag_mode,
-            remove_threshold=args.remove_threshold
+            remove_threshold=args.remove_threshold,
+            batch_size=args.batch_size,
         )
     elif args.video:
         # 動画処理
