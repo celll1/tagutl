@@ -53,6 +53,9 @@ except ImportError:
     sageattention = None
     sageattention_available = False
 
+from PIL import ImageFile 
+ImageFile.LOAD_TRUNCATED_IMAGES = True
+
 # デバイスの設定
 torch_device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 Image.MAX_IMAGE_PIXELS = None
