@@ -44,14 +44,14 @@ except ImportError:
 # SageAttentionのインポートを試みる
 # Apache 2.0 License
 # https://github.com/thu-ml/SageAttention
-try:
-    import sageattention
-    # print("sageattentionが正常にインポートされました")
-    sageattention_available = True
-except ImportError:
-    print("sageattentionをインポートできませんでした。pip install sageattention==1.0.6 またはソースからビルドしてください")
-    sageattention = None
-    sageattention_available = False
+# try:
+#     import sageattention
+#     # print("sageattentionが正常にインポートされました")
+#     sageattention_available = True
+# except ImportError:
+#     print("sageattentionをインポートできませんでした。pip install sageattention==1.0.6 またはソースからビルドしてください")
+#     sageattention = None
+#     sageattention_available = False
 
 from PIL import ImageFile 
 ImageFile.LOAD_TRUNCATED_IMAGES = True
@@ -188,6 +188,21 @@ def replace_timm_attn_with_xformers(model, use_xformers=False):
     print(f"モデルのattentionをxformersのメモリ効率の良いバージョンに置き換えました（{replaced_count}層）")
     return model
 
+# SageAttentionのインポートを試みる
+def import_sageattention():
+    try:
+        import sageattention
+        print("sageattentionが正常にインポートされました")
+        # sageattn 関数が存在するか確認
+        if hasattr(sageattention, 'sageattn'):
+             return True
+        else:
+            print("sageattentionのバージョンが古いか、正しくインストールされていません。sageattn関数が見つかりません。")
+            return False
+    except ImportError:
+        print("sageattentionをインポートできませんでした。pip install sageattention==1.0.6 またはソースからビルドしてください")
+        return False
+    
 def replace_timm_attn_with_sageattention(model, use_sageattention=False):
     """
     EVA02モデルのattentionをSageAttentionに置き換えます。
@@ -199,12 +214,12 @@ def replace_timm_attn_with_sageattention(model, use_sageattention=False):
     if not use_sageattention:
         return model
 
-    if not sageattention_available:
+    # ★★★ ここで import_sageattention() を呼び出す ★★★
+    if not import_sageattention():
         print("sageattentionが利用できないため、標準のattentionを使用します")
         return model
 
-    print("sageattentionが正常にインポートされました")
-
+    import sageattention # import_sageattention() で成功を確認しているので、ここでは単純にimport
     from timm.models.eva import EvaAttention, apply_rot_embed_cat
 
     class SageEvaAttention(nn.Module):
@@ -268,6 +283,7 @@ def replace_timm_attn_with_sageattention(model, use_sageattention=False):
                 # is_causal は元の EvaAttention にはないため、False固定とする
                 # 必要であれば、モデルの使い方に応じて変更する
                 is_causal = False
+                # ★★★ sageattention モジュール名を直接使用 ★★★
                 x_out = sageattention.sageattn(
                     q, k, v,
                     tensor_layout="HND",
@@ -308,6 +324,158 @@ def replace_timm_attn_with_sageattention(model, use_sageattention=False):
                 # print(f"SageAttention対応に置き換え: {name}") # tqdmとかぶるのでコメントアウト推奨
 
     print(f"モデルのattentionをSageAttentionに置き換えました（{replaced_count}層）")
+    return model
+
+# flash-attentionのインポートを試みる
+def import_flash_attention():
+    try:
+        import flash_attn
+        print("flash-attentionが正常にインポートされました")
+        # flash_attn_func が存在するか確認 (v2.0以降の主要関数)
+        if hasattr(flash_attn, 'flash_attn_func'):
+            return True
+        else:
+            print("flash-attention v2.0以降が必要です。flash_attn_funcが見つかりません。")
+            return False
+    except ImportError:
+        print("flash-attentionをインポートできませんでした。pip install flash-attn でインストールしてください")
+        return False
+
+def replace_timm_attn_with_flashattention(model, use_flashattention=False):
+    """
+    EVA02モデルのattentionをFlashAttention (v2)に置き換えます。
+
+    Args:
+        model: EVA02モデル
+        use_flashattention: FlashAttentionを使用するかどうか
+    """
+    if not use_flashattention:
+        return model
+
+    if not import_flash_attention():
+        print("flash-attentionが利用できないため、標準のattentionを使用します")
+        return model
+
+    print("flash-attentionを正常にインポートしました")
+
+    from flash_attn import flash_attn_func
+    from timm.models.eva import EvaAttention, apply_rot_embed_cat
+
+    class FlashEvaAttention(nn.Module):
+        def __init__(self, original_module):
+            super().__init__()
+            # 属性のコピー
+            self.num_heads = original_module.num_heads
+            self.scale = original_module.scale
+            self.num_prefix_tokens = original_module.num_prefix_tokens
+            self.attn_drop = original_module.attn_drop # flash_attn_funcに渡すため保持
+            self.qkv_bias_separate = getattr(original_module, 'qkv_bias_separate', False)
+
+            # 層のコピー
+            self.qkv = original_module.qkv
+            self.q_proj = original_module.q_proj
+            self.k_proj = original_module.k_proj
+            self.v_proj = original_module.v_proj
+            self.q_bias = original_module.q_bias
+            self.k_bias = original_module.k_bias
+            self.v_bias = original_module.v_bias
+
+            self.norm = original_module.norm
+            self.proj = original_module.proj
+            self.proj_drop = original_module.proj_drop # Attention後のDropoutは維持
+
+        def forward(self, x, rope=None, attn_mask=None):
+            B, N, C = x.shape
+
+            # q, k, v計算（連続性のためcontiguous()を呼ぶ）
+            if self.qkv is not None:
+                if self.q_bias is None:
+                    qkv = self.qkv(x)
+                else:
+                    qkv_bias = torch.cat((self.q_bias, self.k_bias, self.v_bias))
+                    if self.qkv_bias_separate:
+                        qkv = self.qkv(x)
+                        qkv += qkv_bias
+                    else:
+                        qkv = F.linear(x, weight=self.qkv.weight, bias=qkv_bias)
+                # FlashAttentionは (B, N, 3, num_heads, head_dim) を期待するため、permuteを調整
+                qkv = qkv.reshape(B, N, 3, self.num_heads, -1)
+                q, k, v = qkv.unbind(2) # dim=2 で分割 -> (B, N, num_heads, head_dim)
+                # FlashAttentionは (B, N, num_heads, head_dim) の入力を受け付ける
+            else:
+                # FlashAttention用に reshape を調整
+                q = self.q_proj(x).reshape(B, N, self.num_heads, -1)
+                k = self.k_proj(x).reshape(B, N, self.num_heads, -1)
+                v = self.v_proj(x).reshape(B, N, self.num_heads, -1)
+
+
+            # ropeの適用（rotary embedding）
+            if rope is not None:
+                npt = self.num_prefix_tokens
+                # FlashAttentionの入力形状 (B, N, num_heads, head_dim) に合わせてropeを適用
+                q_rope = q[:, npt:, :, :]
+                k_rope = k[:, npt:, :, :]
+                # apply_rot_embed_cat は (B, num_heads, N, C) を期待するため、transposeが必要
+                q_rope_perm = q_rope.transpose(1, 2) # (B, num_heads, N-npt, head_dim)
+                k_rope_perm = k_rope.transpose(1, 2) # (B, num_heads, N-npt, head_dim)
+                q_rope_rotated = apply_rot_embed_cat(q_rope_perm, rope).transpose(1, 2) # (B, N-npt, num_heads, head_dim)
+                k_rope_rotated = apply_rot_embed_cat(k_rope_perm, rope).transpose(1, 2) # (B, N-npt, num_heads, head_dim)
+
+                q = torch.cat([q[:, :npt, :, :], q_rope_rotated], dim=1).type_as(v)
+                k = torch.cat([k[:, :npt, :, :], k_rope_rotated], dim=1).type_as(v)
+
+
+            # FlashAttention呼び出し (flash_attn_funcを使用)
+            # 入力形状: (batch_size, seqlen, nheads, headdim)
+            # causal=False (EvaAttentionでは未使用), softmax_scaleを設定
+            try:
+                # flash_attn_func は dropout_p を受け付ける
+                x_out = flash_attn_func(
+                    q, k, v,
+                    dropout_p=self.attn_drop.p if self.training else 0.0,
+                    softmax_scale=self.scale, # 事前スケーリングの代わりに引数で渡す
+                    causal=False # EvaAttentionではcausalマスクは使われていない想定
+                    # attn_bias は None (EvaAttentionでは未使用)
+                )
+            except Exception as e:
+                print(f"FlashAttentionの呼び出しでエラーが発生しました: {e}")
+                print("標準のattentionにフォールバックします（性能に影響が出る可能性があります）")
+                # フォールバック (xformers版から流用、ただし非効率)
+                # (B, N, H, D) -> (B, H, N, D) に変換して計算
+                q_perm = q.transpose(1, 2)
+                k_perm = k.transpose(1, 2)
+                v_perm = v.transpose(1, 2)
+                q_perm = q_perm * self.scale # フォールバック時は事前スケール
+                attn = (q_perm @ k_perm.transpose(-2, -1))
+                attn = attn.softmax(dim=-1)
+                attn = self.attn_drop(attn) # フォールバック時はDropout適用
+                x_out_perm = attn @ v_perm
+                # (B, H, N, D) -> (B, N, H, D) に戻す
+                x_out = x_out_perm.transpose(1, 2)
+
+            # 元の形状に戻し、正規化・投影処理
+            # FlashAttentionの出力は (B, N, nheads*headdim) ではないので reshape の前に形状を確認
+            # x_out は (B, N, num_heads, head_dim) のはず
+            x_out = x_out.reshape(B, N, -1) # ここで (B, N, C) になるはず
+            x_out = self.norm(x_out)
+            x_out = self.proj(x_out)
+            x_out = self.proj_drop(x_out) # Attention後のdropoutは適用
+            return x_out
+
+    # モデル内の EvaAttention モジュールを置換
+    replaced_count = 0
+    for name, module in model.named_modules():
+        if isinstance(module, EvaAttention):
+            parent_name = '.'.join(name.split('.')[:-1])
+            child_name = name.split('.')[-1]
+            if parent_name:
+                parent = model.get_submodule(parent_name)
+                new_attn = FlashEvaAttention(module)
+                setattr(parent, child_name, new_attn)
+                replaced_count += 1
+                # print(f"FlashAttention対応に置き換え: {name}") # tqdmとかぶるのでコメントアウト推奨
+
+    print(f"モデルのattentionをFlashAttentionに置き換えました（{replaced_count}層）")
     return model
 
 # Loraレイヤーの定義
@@ -962,7 +1130,8 @@ def load_model(model_path=None,
                pretrained=True,
                device=torch_device,
                use_xformers=False, # xformersを使用するかどうかのフラグ
-               use_sageattention=False # SageAttentionを使用するかどうかのフラグを追加
+               use_sageattention=False, # SageAttentionを使用するかどうかのフラグを追加
+               use_flashattention=False # FlashAttentionを使用するかどうかのフラグを追加
     ) -> tuple[EVA02WithModuleLoRA, LabelData]:
     """モデルを読み込む関数"""
     print(f" === Load Model === ")
@@ -974,8 +1143,10 @@ def load_model(model_path=None,
         print("xformersを使用します。")
     if use_sageattention:
         print("SageAttentionを使用します。")
+    if use_flashattention:
+        print("FlashAttentionを使用します。")
     else:
-        print("xformersとSageAttentionを使用しません。")    
+        print("xformersとSageAttentionとFlashAttentionを使用しません。")    
 
     if model_path is None:
         print(f"ベースモデルを読み込んでいます...")
@@ -1224,6 +1395,8 @@ def load_model(model_path=None,
         model = replace_timm_attn_with_xformers(model, use_xformers=True)
     elif use_sageattention:
         model = replace_timm_attn_with_sageattention(model, use_sageattention=True)
+    elif use_flashattention:
+        model = replace_timm_attn_with_flashattention(model, use_flashattention=True)
 
     model = model.to(device)
     model.eval()
@@ -1547,6 +1720,9 @@ def visualize_predictions_for_tensorboard(img_tensor, probs, idx_to_tag, thresho
     above_threshold_in_tags.sort(key=lambda x: x[1], reverse=True)
     above_threshold_not_in_tags.sort(key=lambda x: x[1], reverse=True)
     below_threshold_in_tags.sort(key=lambda x: x[1], reverse=True)
+    
+    # 偽陽性を100件までに制限
+    above_threshold_not_in_tags = above_threshold_not_in_tags[:100]
     
     # プロットの作成
     fig, axs = plt.subplots(1, 2, figsize=(15, 10))
@@ -3125,6 +3301,7 @@ def main():
     predict_parser.add_argument('--char_threshold', type=float, default=None, help='キャラクタータグの閾値')
     predict_parser.add_argument('--xformers', action='store_true', help='xformersを使用してメモリ効率の良いattentionを有効化')
     predict_parser.add_argument('--sageattention', action='store_true', help='SageAttentionを使用してメモリ効率の良いattentionを有効化')
+    predict_parser.add_argument('--flashattention', action='store_true', help='FlashAttentionを使用してメモリ効率の良いattentionを有効化')
 
     # バッチ推論コマンド
     batch_parser = subparsers.add_parser('batch', help='複数の画像からタグを予測します')
@@ -3137,6 +3314,7 @@ def main():
     batch_parser.add_argument('--char_threshold', type=float, default=None, help='キャラクタータグの閾値')
     batch_parser.add_argument('--xformers', action='store_true', help='xformersを使用してメモリ効率の良いattentionを有効化')
     batch_parser.add_argument('--sageattention', action='store_true', help='SageAttentionを使用してメモリ効率の良いattentionを有効化')
+    batch_parser.add_argument('--flashattention', action='store_true', help='FlashAttentionを使用してメモリ効率の良いattentionを有効化')
     
     # トレーニングコマンド
     train_parser = subparsers.add_parser('train', help='LoRAモデルをトレーニングします')
@@ -3203,6 +3381,7 @@ def main():
 
     train_parser.add_argument('--xformers', action='store_true', help='xformersを使用してメモリ効率の良いattentionを有効化')
     train_parser.add_argument('--sageattention', action='store_true', help='SageAttentionを使用してメモリ効率の良いattentionを有効化')
+    train_parser.add_argument('--flashattention', action='store_true', help='FlashAttentionを使用してメモリ効率の良いattentionを有効化')
     # モデルマージコマンド
     merge_parser = subparsers.add_parser('merge', help='LoRAモデルをマージします')
 
@@ -3234,7 +3413,7 @@ def main():
         print(f"使用デバイス: {device}")
 
         # 単一画像の予測
-        model, labels = load_model(args.model_path, args.metadata_path, base_model=args.base_model, device=device, use_xformers=args.xformers, use_sageattention=args.sageattention)
+        model, labels = load_model(args.model_path, args.metadata_path, base_model=args.base_model, device=device, use_xformers=args.xformers, use_sageattention=args.sageattention, use_flashattention=args.flashattention)
         
         # 画像に紐づくタグを読み込む
         actual_tags = read_tags_from_file(args.image)
@@ -3306,7 +3485,7 @@ def main():
         print(f"使用デバイス: {device}")
 
         # モデルの読み込み
-        model, labels = load_model(args.model_path, args.metadata_path, base_model=args.base_model, device=device, use_xformers=args.xformers, use_sageattention=args.sageattention)
+        model, labels = load_model(args.model_path, args.metadata_path, base_model=args.base_model, device=device, use_xformers=args.xformers, use_sageattention=args.sageattention, use_flashattention=args.flashattention)
         
         # 画像ファイルのリストを取得
         import glob
@@ -3382,7 +3561,7 @@ def main():
             print("SageAttentionを使用します。")
 
         print(f"モデルを読み込んでいます...")
-        model, labels = load_model(args.model_path, args.metadata_path, base_model=args.base_model, lora_rank=args.lora_rank, lora_alpha=args.lora_alpha, lora_dropout=args.lora_dropout, device=device, use_xformers=args.xformers, use_sageattention=args.sageattention)
+        model, labels = load_model(args.model_path, args.metadata_path, base_model=args.base_model, lora_rank=args.lora_rank, lora_alpha=args.lora_alpha, lora_dropout=args.lora_dropout, device=device, use_xformers=args.xformers, use_sageattention=args.sageattention, use_flashattention=args.flashattention)
         
         # --- ここから tags_to_remove の処理を追加 ---
         tags_to_remove_list = None
