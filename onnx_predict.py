@@ -21,7 +21,7 @@ class LabelData:
     character: list[np.int64]
     copyright: list[np.int64]
     meta: list[np.int64]
-
+    quality: list[np.int64]
 def pil_ensure_rgb(image: Image.Image) -> Image.Image:
     """
     画像を確実にRGB形式に変換する
@@ -137,7 +137,8 @@ def get_tags(probs, labels, gen_threshold, char_threshold):
         "character": [],
         "copyright": [],
         "artist": [],
-        "meta": []
+        "meta": [],
+        "quality": []
     }
     
     # レーティング（最大値を選択）
@@ -172,6 +173,14 @@ def get_tags(probs, labels, gen_threshold, char_threshold):
     for i in labels.meta:
         if probs[i] >= gen_threshold:
             result["meta"].append((labels.names[i], float(probs[i])))
+
+    # 品質タグ（最大値を選択）
+    if len(labels.quality) > 0:
+        quality_probs = probs[labels.quality]
+        quality_idx = np.argmax(quality_probs)
+        quality_name = labels.names[labels.quality[quality_idx]]
+        quality_conf = float(quality_probs[quality_idx])
+        result["quality"].append((quality_name, quality_conf))
     
     # 確率の降順でソート
     for k in result:
@@ -228,7 +237,8 @@ def visualize_predictions(image, tags, predictions, threshold=0.45, output_path=
         'copyright': 'purple',
         'artist': 'orange',
         'general': 'green',
-        'meta': 'gray'
+        'meta': 'gray',
+        'quality': 'yellow'
     }
     
     # Add rating tags (all of them)
@@ -272,6 +282,13 @@ def visualize_predictions(image, tags, predictions, threshold=0.45, output_path=
         all_probs.append(prob)
         all_colors.append(color_map['meta'])
         all_categories.append('meta')
+
+    # Add quality tags (all above threshold)
+    for tag, prob in predictions["quality"]:
+        all_tags.append(f"[Q] {tag}")
+        all_probs.append(prob)
+        all_colors.append(color_map['quality'])
+        all_categories.append('quality')
     
     # Sort by probability (descending)
     sorted_indices = sorted(range(len(all_probs)), key=lambda i: all_probs[i], reverse=True)
@@ -337,7 +354,8 @@ def visualize_predictions(image, tags, predictions, threshold=0.45, output_path=
         Patch(facecolor=color_map['copyright'], label='Copyright'),
         Patch(facecolor=color_map['artist'], label='Artist'),
         Patch(facecolor=color_map['general'], label='General'),
-        Patch(facecolor=color_map['meta'], label='Meta')
+        Patch(facecolor=color_map['meta'], label='Meta'),
+        Patch(facecolor=color_map['quality'], label='Quality')
     ]
     ax_tags.legend(handles=legend_elements, loc='lower right', fontsize=8)
     
@@ -396,6 +414,10 @@ def visualize_predictions(image, tags, predictions, threshold=0.45, output_path=
             for tag, prob in predictions["meta"]:
                 f.write(f"{tag}: {prob:.3f}\n")
             
+            f.write("\n=== Quality Tags ===\n")
+            for tag, prob in predictions["quality"]:
+                f.write(f"{tag}: {prob:.3f}\n")
+            
             # Add a section for filtered meta tags
             filtered_count = 0
             f.write("\n=== Filtered Meta Tags (not displayed) ===\n")
@@ -438,7 +460,8 @@ def load_tag_mapping(mapping_path):
     character = []
     copyright = []
     meta = []
-    
+    quality = []
+
     for idx, tag in idx_to_tag.items():
         names[idx] = tag
         category = tag_to_category[tag]
@@ -455,7 +478,9 @@ def load_tag_mapping(mapping_path):
             copyright.append(idx)
         elif category == 'Meta':
             meta.append(idx)
-    
+        elif category == 'Quality':
+            quality.append(idx)    
+
     label_data = LabelData(
         names=names,
         rating=np.array(rating, dtype=np.int64),
@@ -463,7 +488,8 @@ def load_tag_mapping(mapping_path):
         artist=np.array(artist, dtype=np.int64),
         character=np.array(character, dtype=np.int64),
         copyright=np.array(copyright, dtype=np.int64),
-        meta=np.array(meta, dtype=np.int64)
+        meta=np.array(meta, dtype=np.int64),
+        quality=np.array(quality, dtype=np.int64)
     )
     
     return label_data, idx_to_tag, tag_to_category
@@ -551,10 +577,10 @@ def save_tags_as_csv(predictions, output_path, threshold=0.45, mode="overwrite",
         new_tags_probs[normalize_tag(tag)] = prob
     
     # 他のカテゴリのタグを追加
-    for category in ["character", "copyright", "artist", "general", "meta"]:
+    for category in ["character", "copyright", "artist", "general", "meta", "quality"]:
         for tag, prob in predictions[category]:
             # メタタグの中でidやcommentaryを含むものは除外
-            if category == "meta" and any(pattern in tag.lower() for pattern in ['id', 'commentary']):
+            if category == "meta" and any(pattern in tag.lower() for pattern in ['id', 'commentary', 'mismatch']):
                 continue
             new_tags.append(tag)
             new_tags_probs[normalize_tag(tag)] = prob
@@ -843,7 +869,7 @@ def predict_with_onnx(
     print(f"Meta tags (threshold={gen_threshold}):")
     # Filter out unwanted meta tags for display
     filtered_meta = []
-    excluded_meta_patterns = ['id', 'commentary']
+    excluded_meta_patterns = ['id', 'commentary', 'mismatch']
     
     for tag, conf in predictions["meta"]:
         if not any(pattern in tag.lower() for pattern in excluded_meta_patterns):
@@ -851,6 +877,11 @@ def predict_with_onnx(
             filtered_meta.append((tag, conf))
         else:
             print(f"  [FILTERED] {tag}: {conf:.3f}")
+
+    print("--------")
+    print(f"Quality tags:")
+    for tag, conf in predictions["quality"]:
+        print(f"  {tag}: {conf:.3f}")
     
     # 出力パスの設定
     base_filename = os.path.splitext(os.path.basename(image_path))[0]
@@ -1287,7 +1318,8 @@ def combine_frame_predictions(frame_predictions, gen_threshold=0.45, char_thresh
         "character": {},
         "copyright": {},
         "artist": {},
-        "meta": {}
+        "meta": {},
+        "quality": {}
     }
     
     # 各フレームの予測を処理
@@ -1336,6 +1368,11 @@ def combine_frame_predictions(frame_predictions, gen_threshold=0.45, char_thresh
     for tag, prob in combined["meta"].items():
         if prob >= gen_threshold:
             result["meta"].append((tag, prob))
+
+    # クオリティは最大確率のものを選択
+    if combined["quality"]:
+        top_quality = max(combined["quality"].items(), key=lambda x: x[1])
+        result["quality"].append(top_quality)
     
     # 各カテゴリ内で確率の降順にソート
     for category in result:
@@ -1536,6 +1573,11 @@ def predict_video_with_onnx(video_path, model_path, tag_mapping_path, gen_thresh
     # 不要なメタタグをフィルタリング
     filtered_meta = []
     excluded_meta_patterns = ['id', 'commentary']
+
+    print("--------")
+    print(f"品質タグ:")
+    for tag, conf in combined_predictions["quality"]:
+        print(f"  {tag}: {conf:.3f}")
     
     for tag, conf in combined_predictions["meta"]:
         if not any(pattern in tag.lower() for pattern in excluded_meta_patterns):
