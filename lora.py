@@ -1309,8 +1309,8 @@ def load_model(model_path=None,
                     labels.rating.extend([i for i, name in enumerate(labels.names) if name not in tag_to_category and name in ['general', 'sensitive', 'questionable', 'explicit']])
                     labels.general.extend([i for i, name in enumerate(labels.names) if name not in tag_to_category and name not in ['general', 'sensitive', 'questionable', 'explicit']])
 
-                    # 'best_quality', 'high_quality', 'medium_quality', 'low_quality', 'worst_quality'はqualityに入るように
-                    labels.quality.extend([i for i, name in enumerate(labels.names) if name not in tag_to_category and name in ['best_quality', 'high_quality', 'medium_quality', 'low_quality', 'worst_quality']])
+                    # 'best_quality', 'high_quality', 'normal_quality', 'medium_quality', 'low_quality', 'bad_quality', 'worst_quality'はqualityに入るように
+                    labels.quality.extend([i for i, name in enumerate(labels.names) if name not in tag_to_category and name in ['best_quality', 'high_quality', 'normal_quality', 'medium_quality', 'low_quality', 'bad_quality', 'worst_quality']])
                     
             except Exception as e:
                 print(f"チェックポイントからラベルデータが見つかりません。{e}, ベースモデルから読み込んでいます...")
@@ -3752,7 +3752,7 @@ def main():
              if rating_tag in model.tag_to_idx: # モデルに存在する場合のみ上書き
                  valid_tag_to_category[rating_tag] = 'Rating'
         # Qualityタグを強制的に上書き
-        for quality_tag in ['best_quality', 'high_quality', 'medium_quality', 'low_quality', 'worst_quality']:
+        for quality_tag in ['best_quality', 'high_quality', 'normal_quality', 'medium_quality', 'low_quality', 'bad_quality', 'worst_quality']:
             if quality_tag in model.tag_to_idx: # モデルに存在する場合のみ上書き
                 valid_tag_to_category[quality_tag] = 'Quality'
         # model の tag_to_category を更新
