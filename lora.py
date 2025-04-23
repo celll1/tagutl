@@ -13,26 +13,30 @@ from collections import defaultdict
 
 import numpy as np
 import pandas as pd
+import matplotlib
+matplotlib.use('Agg') 
 import matplotlib.pyplot as plt
 from matplotlib.lines import Line2D
 import math
-import torch
-from huggingface_hub import hf_hub_download
-from huggingface_hub.utils import HfHubHTTPError
 from PIL import Image
+from PIL import ImageFile 
+ImageFile.LOAD_TRUNCATED_IMAGES = True
 import timm
 from timm.data import create_transform, resolve_data_config
 import gc
+import torch
 from torch import Tensor, nn
 from torch.nn import functional as F
 from torchvision import transforms
 import bitsandbytes as bnb
+from huggingface_hub import hf_hub_download
+from huggingface_hub.utils import HfHubHTTPError
 
 from io import BytesIO
 from tqdm.auto import tqdm
 
 # ZClipのインポートを試みる
-# Apache 2.0 License
+# MIT License
 # https://github.com/bluorion-com/ZClip
 try:
     from zclip import ZClip
@@ -40,21 +44,6 @@ try:
 except ImportError:
     ZClip = None
     zclip_available = False
-
-# SageAttentionのインポートを試みる
-# Apache 2.0 License
-# https://github.com/thu-ml/SageAttention
-# try:
-#     import sageattention
-#     # print("sageattentionが正常にインポートされました")
-#     sageattention_available = True
-# except ImportError:
-#     print("sageattentionをインポートできませんでした。pip install sageattention==1.0.6 またはソースからビルドしてください")
-#     sageattention = None
-#     sageattention_available = False
-
-from PIL import ImageFile 
-ImageFile.LOAD_TRUNCATED_IMAGES = True
 
 # デバイスの設定
 torch_device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -1647,11 +1636,6 @@ def visualize_predictions_for_tensorboard(img_tensor, probs, idx_to_tag, thresho
         neg_variance: 陰性群の分散
         neg_counts: 陰性群のサンプル数
     """
-    import matplotlib.pyplot as plt
-    import numpy as np
-    from PIL import Image
-    import torch
-    from collections import defaultdict
 
     # 確率値をnumpy配列に変換
     if isinstance(probs, torch.Tensor):
