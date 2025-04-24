@@ -555,42 +555,47 @@ def convert_tag_format(tag: str) -> str:
     
     return tag
 
-def save_tags_as_csv(predictions, output_path, tag_to_category, threshold=0.45, mode="overwrite", remove_threshold=None):
+def save_tags_as_csv(predictions, output_path, tag_to_category, threshold=0.45, mode="overwrite", remove_threshold=None, skip_rating=False, skip_quality=False):
     """
     予測されたタグをカンマ区切りのテキストファイルとして保存する
+    Rating/Qualityタグの保存をスキップするオプション付き
 
     Args:
         predictions: 予測結果の辞書
         output_path: 出力ファイルパス
-        tag_to_category: タグからカテゴリへのマッピング辞書 ★追加★
+        tag_to_category: タグからカテゴリへのマッピング辞書
         threshold: タグの閾値 (現在は主に参照用)
         mode: 保存モード ("overwrite"=上書き, "add"=既存タグに追加)
         remove_threshold: 既存タグを除去する閾値（Noneの場合は除去しない）
+        skip_rating (bool): Rating タグの保存をスキップするかどうか ★追加★
+        skip_quality (bool): Quality タグの保存をスキップするかどうか ★追加★
     """
-    # すべてのタグを収集 (予測結果から)
+    # 予測結果から保存対象のタグリストを作成
     predicted_tags = []
     predicted_tags_probs = {}  # タグと確率のマッピング
-    predicted_rating_tag = None
-    predicted_quality_tag = None
 
-    # レーティングタグ（最も確率の高いもののみ）
-    if predictions["rating"]:
+    # レーティングタグ（スキップフラグがFalseの場合のみ追加）
+    if not skip_rating and predictions["rating"]:
         tag, prob = predictions["rating"][0]
-        predicted_rating_tag = tag # 予測されたRatingタグを保持
         predicted_tags.append(tag)
         predicted_tags_probs[normalize_tag(tag)] = prob
+        print("Rating tag included for saving.")
+    elif skip_rating:
+        print("Skipping rating tag saving.")
 
-    # クオリティタグ（最も確率の高いもののみ）
-    if predictions["quality"]:
+
+    # クオリティタグ（スキップフラグがFalseの場合のみ追加）
+    if not skip_quality and predictions["quality"]:
         tag, prob = predictions["quality"][0]
-        predicted_quality_tag = tag # 予測されたQualityタグを保持
         predicted_tags.append(tag)
         predicted_tags_probs[normalize_tag(tag)] = prob
+        print("Quality tag included for saving.")
+    elif skip_quality:
+         print("Skipping quality tag saving.")
 
     # 他のカテゴリのタグを追加 (閾値以上のもの)
     for category in ["character", "copyright", "artist", "general", "meta"]:
         for tag, prob in predictions[category]:
-            # メタタグの中でidやcommentaryを含むものは除外 (このロジックは維持)
             if category == "meta" and any(pattern in tag.lower() for pattern in ['id', 'commentary', 'mismatch']):
                 continue
             predicted_tags.append(tag)
@@ -598,107 +603,81 @@ def save_tags_as_csv(predictions, output_path, tag_to_category, threshold=0.45, 
 
     # 既存のタグを読み込む (addモードの場合)
     existing_tags = []
-    has_existing_rating = False # ★追加★
-    has_existing_quality = False # ★追加★
     final_tags = [] # 最終的に保存するタグリスト
 
     if mode == "add" and os.path.exists(output_path):
         try:
             with open(output_path, 'r', encoding='utf-8') as f:
                 content = f.read().strip()
-                # カンマ区切りで読み込み、前後の空白を除去
                 existing_tags = [t.strip() for t in content.split(',') if t.strip()]
 
-            # 既存タグを正規化し、カテゴリを確認
+            # 既存タグを正規化し、カテゴリを確認（remove_threshold用）
             normalized_existing_tags = set()
-            temp_existing_tags = [] # remove_threshold 適用前のリスト
+            temp_existing_tags = []
             for tag in existing_tags:
                 norm_tag = normalize_tag(tag)
                 normalized_existing_tags.add(norm_tag)
-                temp_existing_tags.append(tag) # 元の形式で保持
+                temp_existing_tags.append(tag)
 
-                # ★★★ 既存タグのカテゴリを確認 ★★★
-                # tag_to_category は正規化されていないキーを持つ場合があるので注意
-                # まず元のタグ名で探し、なければ正規化名で探す
-                category = tag_to_category.get(tag)
-                if category is None:
-                    category = tag_to_category.get(norm_tag, 'General') # 見つからなければGeneral扱い
-
-                if category == 'Rating':
-                    has_existing_rating = True
-                elif category == 'Quality':
-                    has_existing_quality = True
-            print(f"既存のタグ: {len(normalized_existing_tags)}個 (Rating:{has_existing_rating}, Quality:{has_existing_quality})")
+            print(f"Existing tags read: {len(normalized_existing_tags)} unique normalized tags.")
 
             # remove_thresholdが設定されている場合、低確率タグを除去
             if remove_threshold is not None:
                 filtered_existing_tags = []
                 removed_tags = []
-                for tag in temp_existing_tags: # remove_threshold適用前のリストでループ
+                # 既存タグリスト(temp_existing_tags)をループ
+                for tag in temp_existing_tags:
                     normalized_tag = normalize_tag(tag)
-                    # 新しい予測に含まれるタグの場合のみ確率をチェック
+                    # 予測結果に存在するタグかチェック
                     if normalized_tag in predicted_tags_probs:
+                        # 予測確率が除去閾値以上なら保持
                         if predicted_tags_probs[normalized_tag] >= remove_threshold:
                             filtered_existing_tags.append(tag)
                         else:
                             removed_tags.append((tag, predicted_tags_probs[normalized_tag]))
                     else:
-                        # 予測に含まれない既存タグは保持
+                        # 予測結果にない既存タグは保持 (そのまま)
                         filtered_existing_tags.append(tag)
 
                 if removed_tags:
-                    print(f"除去された既存タグ（閾値{remove_threshold}未満）: {len(removed_tags)}個")
-                    removed_tags.sort(key=lambda x: x[1]) # 確率低い順に表示
-                    for tag, prob in removed_tags[:10]: # 最初の10個表示
-                        print(f"  - {tag}: {prob:.3f}")
-                    if len(removed_tags) > 10:
-                        print(f"  ...他 {len(removed_tags) - 10} 個")
+                    print(f"Removing {len(removed_tags)} existing tags below remove_threshold {remove_threshold}:")
+                    removed_tags.sort(key=lambda x: x[1])
+                    for tag, prob in removed_tags[:10]: print(f"  - {tag}: {prob:.3f}")
+                    if len(removed_tags) > 10: print(f"  ...and {len(removed_tags) - 10} more.")
 
                 final_tags = filtered_existing_tags # フィルタリング後のタグを初期リストとする
                 normalized_existing_tags = {normalize_tag(tag) for tag in final_tags if tag.strip()} # セットも更新
             else:
                 final_tags = temp_existing_tags # removeしない場合は元のリスト
 
-            # 新しいタグのうち、追加すべきものだけを抽出
+            # 新しいタグのうち、既存の正規化タグセットに含まれていないものを追加
             unique_new_tags = []
-            for tag in predicted_tags:
+            for tag in predicted_tags: # predicted_tagsには既にskipフラグが適用されている
                 normalized_tag = normalize_tag(tag)
-                is_rating_tag = (tag == predicted_rating_tag)
-                is_quality_tag = (tag == predicted_quality_tag)
-
-                # ★★★ Rating/Qualityタグの追加条件 ★★★
-                should_add = True
-                if is_rating_tag and has_existing_rating:
-                    should_add = False
-                elif is_quality_tag and has_existing_quality:
-                    should_add = False
-
-                # ★★★ 重複チェックと追加 ★★★
-                if should_add and normalized_tag not in normalized_existing_tags:
+                if normalized_tag not in normalized_existing_tags:
                     unique_new_tags.append(tag)
-                    normalized_existing_tags.add(normalized_tag) # 追加したタグをセットにも記録
+                    normalized_existing_tags.add(normalized_tag) # セットにも追加
 
-            print(f"追加される新しいタグ: {len(unique_new_tags)}個")
-            # 既存のタグリストに新しいユニークなタグを追加
+            print(f"Adding {len(unique_new_tags)} new unique tags.")
             final_tags.extend(unique_new_tags)
 
         except Exception as e:
-            print(f"既存タグの読み込み/処理エラー: {e}。予測されたタグのみで上書きします。")
-            final_tags = predicted_tags
+            print(f"Error reading/processing existing tags from {output_path}: {e}. Overwriting with predicted tags.")
+            final_tags = predicted_tags # エラー時は予測結果で上書き
     else:
-        # 上書きモードまたは既存ファイルがない場合は予測されたタグのみ
-        final_tags = predicted_tags
+        # 上書きモードまたは既存ファイルがない場合
+        final_tags = predicted_tags # skipフラグ適用済みのリスト
 
     # 出力前に全タグを標準形式にフォーマット
-    formatted_tags = [standardize_tag_format(tag) for tag in final_tags if tag] # 空タグを除外
+    formatted_tags = [standardize_tag_format(tag) for tag in final_tags if tag]
 
     # カンマ区切りで保存（カンマの後にスペースを入れる）
     try:
         with open(output_path, 'w', encoding='utf-8') as f:
             f.write(", ".join(formatted_tags))
-        print(f"タグをカンマ区切りで保存しました: {output_path} (モード: {mode}, 総タグ数: {len(formatted_tags)})")
+        print(f"Tags saved to {output_path} (Mode: {mode}, Total tags: {len(formatted_tags)})")
     except Exception as e:
-        print(f"タグファイルの書き込みエラー ({output_path}): {e}")
+        print(f"Error writing tags to {output_path}: {e}")
 
     return formatted_tags
 
@@ -755,7 +734,8 @@ def predict_with_onnx(
         image_path, model_path, tag_mapping_path, 
         gen_threshold=0.45, char_threshold=0.45, output_path=None, 
         use_gpu=False, output_mode="visualization", tag_mode="add", 
-        remove_threshold=None, batch_size=1):
+        remove_threshold=None, batch_size=1, # batch_size は未使用だが維持
+        skip_rating=False, skip_quality=False): # ★ skip_* 引数を追加 ★
     # ONNXモデルでの予測
     print(f"Loading ONNX model: {model_path}")
     
@@ -972,9 +952,9 @@ def predict_with_onnx(
             output_path=viz_output_path
         )
     else:
-        save_tags_as_csv(predictions, tag_output_path, tag_to_category, threshold=gen_threshold, mode=tag_mode, remove_threshold=remove_threshold)
+        save_tags_as_csv(predictions, tag_output_path, tag_to_category, threshold=gen_threshold, mode=tag_mode, remove_threshold=remove_threshold, skip_rating=skip_rating, skip_quality=skip_quality)
     
-    return predictions
+    return predictions, tag_output_path
 
 def debug_preprocessing(image_path):
     # デバッグ用の関数
@@ -1021,7 +1001,7 @@ def debug_preprocessing(image_path):
 
 def batch_predict(dirs, model_path, tag_mapping_path, gen_threshold=0.45, char_threshold=0.45, video_frames=3,
                  use_gpu=False, output_mode="visualization", recursive=False, batch_size=1, tag_mode="add", 
-                 remove_threshold=None):  # remove_thresholdパラメータを追加
+                 remove_threshold=None, skip_rating=False, skip_quality=False):  # remove_thresholdパラメータを追加
     """
     複数のディレクトリ内の画像に対してバッチ推論を実行する
     
@@ -1038,6 +1018,8 @@ def batch_predict(dirs, model_path, tag_mapping_path, gen_threshold=0.45, char_t
         batch_size: バッチサイズ（デフォルト: 1）
         tag_mode: タグ保存モード ("overwrite"=上書き, "add"=既存タグに追加)
         remove_threshold: 既存タグを除去する閾値（Noneの場合は除去しない）
+        skip_rating (bool): Rating タグの保存をスキップするかどうか ★追加★
+        skip_quality (bool): Quality タグの保存をスキップするかどうか ★追加★
     """
     print(f"モデルを読み込み中: {model_path}")
     
@@ -1216,7 +1198,7 @@ def batch_predict(dirs, model_path, tag_mapping_path, gen_threshold=0.45, char_t
                             )
                         else:
                             save_tags_as_csv(predictions, output_path, tag_to_category, threshold=gen_threshold, 
-                                             mode=tag_mode, remove_threshold=remove_threshold)
+                                             mode=tag_mode, remove_threshold=remove_threshold, skip_rating=skip_rating, skip_quality=skip_quality)
                         
                         print(f"処理完了 [{batch_start+idx+1}/{total_images}]: {image_path}")
                         
@@ -1337,7 +1319,7 @@ def batch_predict(dirs, model_path, tag_mapping_path, gen_threshold=0.45, char_t
                     )
                 else:
                     save_tags_as_csv(combined_predictions, output_path, tag_to_category, threshold=gen_threshold, 
-                                     mode=tag_mode, remove_threshold=remove_threshold)
+                                     mode=tag_mode, remove_threshold=remove_threshold, skip_rating=skip_rating, skip_quality=skip_quality)
                 
                 print(f"動画処理完了: {video_path}")
             
@@ -1665,7 +1647,7 @@ def predict_video_with_onnx(video_path, model_path, tag_mapping_path, gen_thresh
             output_path=output_path
         )
     else:
-        save_tags_as_csv(combined_predictions, output_path, tag_to_category, threshold=gen_threshold, mode=tag_mode, remove_threshold=remove_threshold)
+        save_tags_as_csv(combined_predictions, output_path, tag_to_category, threshold=gen_threshold, mode=tag_mode, remove_threshold=remove_threshold, skip_rating=skip_rating, skip_quality=skip_quality)
     
     print(f"動画処理完了: {video_path}")
     return combined_predictions, frame
@@ -1704,6 +1686,10 @@ def main():
     parser.add_argument('--remove_threshold', default=None, type=float,
                         help='既存タグを除去する確率の閾値（addモードでのみ有効）')
     
+    # ★★★ skip オプションを追加 ★★★
+    parser.add_argument('--skip_rating', action='store_true', help='Ratingタグをタグファイルに保存しない')
+    parser.add_argument('--skip_quality', action='store_true', help='Qualityタグをタグファイルに保存しない')
+    
     args = parser.parse_args()
     
     if args.image:
@@ -1720,6 +1706,8 @@ def main():
             tag_mode=args.tag_mode,
             remove_threshold=args.remove_threshold,
             batch_size=args.batch_size,
+            skip_rating=args.skip_rating,
+            skip_quality=args.skip_quality
         )
     elif args.video:
         # 動画処理
@@ -1734,7 +1722,9 @@ def main():
             output_mode=args.output_mode,
             video_frames=args.video_frames,
             tag_mode=args.tag_mode,
-            remove_threshold=args.remove_threshold
+            remove_threshold=args.remove_threshold,
+            skip_rating=args.skip_rating,
+            skip_quality=args.skip_quality
         )
     elif args.dirs:
         # バッチ処理
@@ -1750,7 +1740,9 @@ def main():
             batch_size=args.batch_size,
             video_frames=args.video_frames,
             tag_mode=args.tag_mode,
-            remove_threshold=args.remove_threshold
+            remove_threshold=args.remove_threshold,
+            skip_rating=args.skip_rating,
+            skip_quality=args.skip_quality
         )
 
 # GPUが利用可能かチェックする関数
