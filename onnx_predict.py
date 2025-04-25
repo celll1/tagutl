@@ -579,19 +579,18 @@ def save_tags_as_csv(predictions, output_path, tag_to_category, threshold=0.45, 
         tag, prob = predictions["rating"][0]
         predicted_tags.append(tag)
         predicted_tags_probs[normalize_tag(tag)] = prob
-        print("Rating tag included for saving.")
-    elif skip_rating:
-        print("Skipping rating tag saving.")
-
+        # print("Rating tag included for saving.")
+    # elif skip_rating:
+        # print("Skipping rating tag saving.")
 
     # クオリティタグ（スキップフラグがFalseの場合のみ追加）
     if not skip_quality and predictions["quality"]:
         tag, prob = predictions["quality"][0]
         predicted_tags.append(tag)
         predicted_tags_probs[normalize_tag(tag)] = prob
-        print("Quality tag included for saving.")
-    elif skip_quality:
-         print("Skipping quality tag saving.")
+        # print("Quality tag included for saving.")
+    # elif skip_quality:
+        # print("Skipping quality tag saving.")
 
     # 他のカテゴリのタグを追加 (閾値以上のもの)
     for category in ["character", "copyright", "artist", "general", "meta"]:
@@ -925,6 +924,7 @@ def predict_with_onnx(
             prediction_dir = "prediction"
         os.makedirs(prediction_dir, exist_ok=True)
         viz_output_path = os.path.join(prediction_dir, f"{base_filename}.png")
+        tag_output_path = None
     else:
         # タグのみの出力の場合
         if output_path:
