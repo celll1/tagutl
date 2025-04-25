@@ -423,8 +423,9 @@ def replace_timm_attn_with_flashattention(model, use_flashattention=False):
                     q, k, v,
                     dropout_p=self.attn_drop.p if self.training else 0.0,
                     softmax_scale=self.scale, # 事前スケーリングの代わりに引数で渡す
-                    causal=False # EvaAttentionではcausalマスクは使われていない想定
+                    causal=False, # EvaAttentionではcausalマスクは使われていない想定
                     # attn_bias は None (EvaAttentionでは未使用)
+                    deterministic=True
                 )
             except Exception as e:
                 print(f"FlashAttentionの呼び出しでエラーが発生しました: {e}")
@@ -2604,7 +2605,7 @@ def train_model(
     old_tags_count,
     learning_rate,
     weight_decay,
-    use_8bit_optimizer,
+    optimizer_type, # ★追加★
     criterion, 
     num_epochs, 
     device, 
@@ -2703,43 +2704,105 @@ def train_model(
         writer = SummaryWriter(log_dir=os.path.join(tb_log_dir, run_name))
         print(f"TensorBoard logs will be saved to: {os.path.join(tb_log_dir, run_name)}")
 
-    def setup_optimizer(model, learning_rate, weight_decay, use_8bit_optimizer):
+    def setup_optimizer(model, learning_rate, weight_decay, optimizer_type): # ★引数変更★
         """オプティマイザを設定する関数
-        
+
         Args:
             model: 対象のモデル
             learning_rate (float): 学習率
             weight_decay (float): Weight decay
-            use_8bit_optimizer (bool): 8-bitオプティマイザを使用するかどうか
-            
+            optimizer_type (str): オプティマイザの種類 ('adamw', 'adamw8bit', 'lion', 'lion8bit') ★変更★
+
         Returns:
             optimizer: 設定されたオプティマイザ
         """
-        if use_8bit_optimizer:
+        trainable_params = [p for p in model.parameters() if p.requires_grad]
+        print(f"訓練可能なパラメータ数: {sum(p.numel() for p in trainable_params)}")
+
+        optimizer_type = optimizer_type.lower() # 小文字に統一
+
+        if optimizer_type == 'adamw8bit':
             try:
-                optimizer = bnb.optim.AdamW8bit(
-                    model.parameters(),
+                optimizer = bnb.optim.Adam8bit(
+                    trainable_params,
                     lr=learning_rate,
+                    betas=(0.9, 0.99), # AdamWのデフォルトに近いbeta値
                     weight_decay=weight_decay
                 )
-                print("8-bitオプティマイザを使用します")
-            except ImportError:
-                print("bitsandbytesがインストールされていないため、通常のAdamWを使用します")
+                print("AdamW8bit オプティマイザを使用します")
+            except Exception as e:
+                print(f"AdamW8bitの初期化に失敗しました ({e})。通常のAdamWを使用します。")
                 optimizer = torch.optim.AdamW(
-                    model.parameters(),
+                    trainable_params,
                     lr=learning_rate,
                     weight_decay=weight_decay
                 )
-        else:
+        elif optimizer_type == 'lion8bit':
+            try:
+                optimizer = bnb.optim.Lion8bit(
+                    trainable_params,
+                    lr=learning_rate,
+                    weight_decay=weight_decay
+                )
+                print("Lion8bit オプティマイザを使用します")
+            except Exception as e:
+                print(f"Lion8bitの初期化に失敗しました ({e})。通常のLionを使用します。")
+                try:
+                    optimizer = bnb.optim.Lion(
+                        trainable_params,
+                        lr=learning_rate,
+                        weight_decay=weight_decay
+                    )
+                    print("Lion オプティマイザを使用します")
+                except Exception as e_lion:
+                     print(f"Lionの初期化にも失敗しました ({e_lion})。AdamWを使用します。")
+                     optimizer = torch.optim.AdamW(
+                         trainable_params,
+                         lr=learning_rate,
+                         weight_decay=weight_decay
+                     )
+        elif optimizer_type == 'lion':
+            try:
+                optimizer = bnb.optim.Lion(
+                    trainable_params,
+                    lr=learning_rate,
+                    weight_decay=weight_decay
+                )
+                print("Lion オプティマイザを使用します")
+            except Exception as e:
+                print(f"Lionの初期化に失敗しました ({e})。AdamWを使用します。")
+                optimizer = torch.optim.AdamW(
+                    trainable_params,
+                    lr=learning_rate,
+                    weight_decay=weight_decay
+                )
+        elif optimizer_type == 'adamw':
             optimizer = torch.optim.AdamW(
-                model.parameters(),
+                trainable_params,
                 lr=learning_rate,
                 weight_decay=weight_decay
             )
+            print("AdamW オプティマイザを使用します")
+        else:
+            print(f"未対応のオプティマイザタイプ: {optimizer_type}。デフォルトのAdamW8bitを使用します。")
+            try:
+                optimizer = bnb.optim.Adam8bit(
+                    trainable_params,
+                    lr=learning_rate,
+                    betas=(0.9, 0.99),
+                    weight_decay=weight_decay
+                )
+            except Exception as e:
+                print(f"AdamW8bitの初期化に失敗しました ({e})。通常のAdamWを使用します。")
+                optimizer = torch.optim.AdamW(
+                    trainable_params,
+                    lr=learning_rate,
+                    weight_decay=weight_decay
+                )
         return optimizer
 
     # オプティマイザの設定
-    optimizer = setup_optimizer(model, learning_rate, weight_decay, use_8bit_optimizer)
+    optimizer = setup_optimizer(model, learning_rate, weight_decay, optimizer_type) # ★引数変更★
     
     # 学習率スケジューラの設定
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
@@ -3200,11 +3263,35 @@ def train_model(
                 )
                 model.to(device)
                 # optimizer, schedulerをリセット
-                optimizer = setup_optimizer(model, learning_rate, weight_decay, use_8bit_optimizer)
+                optimizer = setup_optimizer(model, learning_rate, weight_decay, optimizer_type)
                 # schedulerは通常、warmupをやり直すが、ここでは未実装
                 
     except Exception as e:
         print(f"エラーが発生しました: {e}")
+        # ★★★ 割り込み時やエラー時にもモデルを保存 ★★★
+        try:
+            print("エラーまたは中断により、現在の状態を保存します...")
+            save_model(
+                output_dir,
+                f'interrupted_checkpoint_epoch_{epoch+1 if "epoch" in locals() else 0}', # epochが存在すれば使う
+                base_model,
+                save_format,
+                model,
+                optimizer,
+                scheduler,
+                epoch if "epoch" in locals() else 0,
+                threshold if "threshold" in locals() else initial_threshold,
+                val_loss if "val_loss" in locals() else float('inf'),
+                val_metrics['f1'] if "val_metrics" in locals() else 0.0,
+                tag_to_idx,
+                idx_to_tag,
+                tag_to_category
+            )
+        except Exception as save_e:
+            print(f"状態の保存中にさらにエラーが発生しました: {save_e}")
+        # ★★★ ここまで追加 ★★★
+        raise e # エラーを再送出
+
 
     finally:
         # 最終モデルの保存
@@ -3343,7 +3430,9 @@ def main():
     train_parser.add_argument('--num_epochs', type=int, default=10, help='エポック数')
     train_parser.add_argument('--learning_rate', type=float, default=1e-4, help='学習率')
     train_parser.add_argument('--weight_decay', type=float, default=0.01, help='重み減衰')
-    train_parser.add_argument('--use_8bit_optimizer', action='store_true', help='8-bitオプティマイザを使用する')
+    train_parser.add_argument('--optimizer', type=str, default='adamw8bit',
+                              choices=['adamw', 'adamw8bit', 'lion', 'lion8bit'],
+                              help='使用するオプティマイザの種類') # ★追加★
     train_parser.add_argument('--use_zclip', action='store_true', help='ZClipによる勾配クリッピングを使用する') # ZClip引数を追加
 
     train_parser.add_argument('--tags_to_remove', type=str, default=None, help='削除するタグのファイルパス')
@@ -3758,7 +3847,7 @@ def main():
             old_tags_count=old_tags_count, # prepare_datasetから返された削除後の既存タグ数を渡す
             learning_rate=args.learning_rate,
             weight_decay=args.weight_decay,
-            use_8bit_optimizer=args.use_8bit_optimizer,
+            optimizer_type=args.optimizer, # ★引数変更★
             criterion=criterion,
             num_epochs=args.num_epochs,
             device=device,
