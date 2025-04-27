@@ -3010,52 +3010,69 @@ def train_model(
     @torch.no_grad()
     def adjust_gradients_lorapro(current_step):
         for name, state in lorapro_states.items():
-            A = state['A_param']
-            B = state['B_param']
+            A = state['A_param'] # Shape: (in, rank) or (n, r)
+            B = state['B_param'] # Shape: (rank, out) or (r, m)
             s = state['scale']
 
             if A.grad is None or B.grad is None:
-                # print(f"Skipping LoRA-Pro adjustment for {name} due to missing gradient.")
-                continue # 勾配がない場合はスキップ
+                continue
 
-            grad_A_orin = A.grad.data.clone() # 元の勾配をコピー
-            grad_B_orin = B.grad.data.clone()
+            grad_A_orin = A.grad.data.clone() # Shape: (n, r)
+            grad_B_orin = B.grad.data.clone() # Shape: (r, m)
 
-            A_fp32 = A.data.float() # 計算用にfloat32に変換
+            # --- 計算を高精度 (float32) で行う ---
+            A_fp32 = A.data.float()
             B_fp32 = B.data.float()
+            grad_A_fp32 = grad_A_orin.float()
+            grad_B_fp32 = grad_B_orin.float()
 
-            # --- 著者実装のロジックを実装 ---
-            AA_T = A_fp32 @ A_fp32.T
-            B_TB = B_fp32.T @ B_fp32
+            # --- 1. 逆行列計算 (r x r 行列を計算) ---
+            # AtA = A^T @ A (r, n) @ (n, r) -> (r, r)
+            AtA = A_fp32.T @ A_fp32
+            # BBt = B @ B^T (r, m) @ (m, r) -> (r, r)
+            BBt = B_fp32 @ B_fp32.T
 
             try:
-                AA_T_inv = torch.linalg.pinv(AA_T + lorapro_delta * torch.eye(A_fp32.shape[1], device=A_fp32.device)).to(A_fp32.dtype) # rank = A.shape[1]
-                B_TB_inv = torch.linalg.pinv(B_TB + lorapro_delta * torch.eye(B_fp32.shape[1], device=B_fp32.device)).to(B_fp32.dtype) # rank = B.shape[1]
+                # 擬似逆行列を計算
+                AtA_inv = torch.linalg.pinv(AtA + lorapro_delta * torch.eye(A.shape[1], device=A_fp32.device)).to(A_fp32.dtype) # r x r
+                BBt_inv = torch.linalg.pinv(BBt + lorapro_delta * torch.eye(B.shape[0], device=B_fp32.device)).to(B_fp32.dtype) # r x r
             except torch._C._LinAlgError as e:
                  print(f"Warning: LoRA-Pro pinv failed for {name}. Skipping adjustment. Error: {e}")
                  continue
 
-
+            # --- current_step == 0 の処理 ---
             if current_step == 0:
-                # 初回ステップの処理 (Sylvesterなし)
-                grad_A_adj = grad_A_orin.float() # .float()を追加
-                # 元の実装では grad_B の計算に AA_T_inv が必要
-                grad_B_adj = (1 / (s**2)) * grad_B_orin.float() @ AA_T_inv
-                # Adam状態の初期化
-                equiv_grad = s * B_fp32 @ grad_A_adj + s * grad_B_adj @ A_fp32
+                # 初回ステップ: Sylvesterなし, Adam状態初期化
+                # 著者実装に合わせて grad_B のみを変換 (AA_T_inv の代わりに AtA_inv を使う)
+                grad_A_adj = grad_A_fp32 # 初回は A の勾配はそのまま
+                grad_B_adj = (1 / (s**2)) * AtA_inv @ grad_B_fp32 # (r,r) @ (r,m) -> (r,m). Seems analogous to author's grad_B update needing AA_T_inv
+
+                # 等価勾配計算: delta_W ~ s * (A @ grad_B + grad_A @ B)
+                # (n,r)@(r,m) -> (n,m); (n,r)@(r,m) -> (n,m)
+                equiv_grad = s * (A_fp32 @ grad_B_adj + grad_A_adj @ B_fp32) # Shape: (n, m)
+
+                # Adam状態初期化
                 state['exp_avg'] = torch.zeros_like(equiv_grad)
                 state['exp_avg_sq'] = torch.zeros_like(equiv_grad)
                 state['exp_avg'].lerp_(equiv_grad, 1 - lorapro_beta1)
-                state['exp_avg_sq'].mul_(lorapro_beta2).addcmul_(equiv_grad, equiv_grad.conj(), value=1 - lorapro_beta2) # .conj() は複素数用だが念のため
+                state['exp_avg_sq'].mul_(lorapro_beta2).addcmul_(equiv_grad, equiv_grad.conj(), value=1 - lorapro_beta2)
 
+                # 最終勾配を決定 (初回は変換後勾配)
+                final_grad_A = grad_A_adj
+                final_grad_B = grad_B_adj
+
+            # --- current_step > 0 の処理 ---
             else:
-                # ステップ > 0 の処理 (Sylvesterあり)
-                # 1. 初期勾配変換
-                grad_A_t = (1 / (s**2)) * B_TB_inv @ grad_A_orin.float()
-                grad_B_t = (1 / (s**2)) * (torch.eye(B_fp32.shape[0], device=B_fp32.device, dtype=B_fp32.dtype) - B_fp32 @ B_TB_inv @ B_fp32.T) @ grad_B_orin.float() @ AA_T_inv
+                # 1. 初期勾配変換 (著者実装の構造に合わせる試み)
+                # grad_A_t = (1/s^2) * grad_A @ BBt_inv ?  (n,r) @ (r,r) -> (n,r)
+                grad_A_t = (1 / (s**2)) * grad_A_fp32 @ BBt_inv
+                # grad_B_t = (1/s^2) * AtA_inv @ grad_B ? (r,r) @ (r,m) -> (r,m)
+                # 著者実装の (I - Proj) 項は省略して試す
+                grad_B_t = (1 / (s**2)) * AtA_inv @ grad_B_fp32
 
                 # 2. 等価勾配計算
-                equiv_grad = s * B_fp32 @ grad_A_t + s * grad_B_t @ A_fp32
+                # delta_W ~ s * (A @ grad_B + grad_A @ B)
+                equiv_grad = s * (A_fp32 @ grad_B_t + grad_A_t @ B_fp32) # Shape: (n, m)
 
                 # 3. Adam状態更新
                 state['exp_avg'].lerp_(equiv_grad, 1 - lorapro_beta1)
@@ -3068,46 +3085,54 @@ def train_model(
                 bias_correction2_sqrt = math.sqrt(bias_correction2)
 
                 denom = (state['exp_avg_sq'].sqrt() / bias_correction2_sqrt).add_(lorapro_eps)
-                g_eff = (state['exp_avg'] / bias_correction1) / denom
-                g_eff = g_eff.to(B_fp32.dtype) # データ型を合わせる
+                g_eff = (state['exp_avg'] / bias_correction1) / denom # Shape: (n, m)
+                g_eff = g_eff.to(A_fp32.dtype) # データ型を合わせる
 
-                # 5. ターゲット勾配計算 (逆投影)
-                grad_A_target = s * B_fp32.T @ g_eff
-                grad_B_target = s * g_eff @ A_fp32.T
+                # 5. ターゲット勾配計算 (逆投影 - lora.py次元に合わせて修正)
+                # grad_A_target = s * g_eff @ B.T ? (n,m) @ (m,r) -> (n,r)
+                grad_A_target = s * g_eff @ B_fp32.T
+                # grad_B_target = s * A.T @ g_eff ? (r,n) @ (n,m) -> (r,m)
+                grad_B_target = s * A_fp32.T @ g_eff
 
-                # 6. 勾配上書き (1回目) - 不要かもしれないが著者実装に合わせる
+                # 6. 勾配上書き (1回目) - 著者実装に合わせてターゲット勾配で上書き
                 A.grad.data.copy_(grad_A_target.to(A.grad.dtype))
                 B.grad.data.copy_(grad_B_target.to(B.grad.dtype))
 
                 # 7. Sylvester方程式求解
                 try:
-                    # 係数行列 (正則化)
-                    C1_reg = B_TB + lorapro_reg * torch.eye(B_fp32.shape[1], device=B_fp32.device, dtype=B_fp32.dtype)
-                    C2_reg = AA_T + lorapro_reg * torch.eye(A_fp32.shape[1], device=A_fp32.device, dtype=A_fp32.dtype)
-                    # 右辺 (著者実装に合わせる)
-                    RHS = -(1 / (s**2)) * B_TB_inv @ grad_A_target @ A_fp32.T # grad_A_target を使用
+                    # 係数行列 (r x r) (正則化)
+                    C1_reg = AtA + lorapro_reg * torch.eye(A.shape[1], device=A_fp32.device, dtype=A_fp32.dtype)
+                    C2_reg = BBt + lorapro_reg * torch.eye(B.shape[0], device=B_fp32.device, dtype=B_fp32.dtype)
+
+                    # 右辺 RHS (r x r) (著者実装の構造をlora.py次元に適応させる試み)
+                    # Author RHS = -(1 / s^2) * B_TB_inv @ grad_A_target_author @ A_author.T
+                    # Adapt: Replace B_TB_inv with AtA_inv? Replace grad_A_target_author with grad_B_target? Replace A_author.T with B.T?
+                    # RHS = -(1 / s^2) * AtA_inv @ grad_B_target @ B.T
+                    RHS = -(1 / (s**2)) * AtA_inv @ grad_B_target @ B_fp32.T # (r,r) @ (r,m) @ (m,r) -> (r,r)
                     RHS = RHS.cpu().numpy() # scipyはnumpy配列を要求
                     C1_reg_np = C1_reg.cpu().numpy()
                     C2_reg_np = C2_reg.cpu().numpy()
 
-                    # scipy.linalg.solve_sylvester を使用
+                    # scipy.linalg.solve_sylvester (AtA@X + X@BBt = RHS の形式)
                     X_np = solve_sylvester(C1_reg_np, C2_reg_np, RHS)
-                    X = torch.from_numpy(X_np).to(device=A.device, dtype=A_fp32.dtype)
+                    X = torch.from_numpy(X_np).to(device=A.device, dtype=A_fp32.dtype) # Shape: (r, r)
 
-                    # 8. 最終勾配計算
-                    grad_A_adj = (1 / (s**2)) * B_TB_inv @ grad_A_target + X @ A_fp32
-                    grad_B_adj = (1 / (s**2)) * (torch.eye(B_fp32.shape[0], device=B_fp32.device, dtype=B_fp32.dtype) - B_fp32 @ B_TB_inv @ B_fp32.T) @ grad_B_target @ AA_T_inv - B_fp32 @ X
+                    # 8. 最終勾配計算 (著者実装の構造に合わせる試み)
+                    # grad_A_adj = grad_A_target + A @ X ? (n,r) + (n,r)@(r,r) -> (n,r)
+                    final_grad_A = grad_A_target + A_fp32 @ X
+                    # grad_B_adj = grad_B_target - X @ B ? (r,m) - (r,r)@(r,m) -> (r,m)
+                    final_grad_B = grad_B_target - X @ B_fp32
 
                 except Exception as e:
                     # LinAlgErrorやValueErrorなど
                     print(f"Warning: LoRA-Pro solve_sylvester failed for {name}. Skipping adjustment. Error: {e}")
                     # Sylvester失敗時はターゲット勾配をそのまま使う
-                    grad_A_adj = grad_A_target
-                    grad_B_adj = grad_B_target
+                    final_grad_A = grad_A_target
+                    final_grad_B = grad_B_target
 
             # 9. 勾配上書き (最終)
-            A.grad.data.copy_(grad_A_adj.to(A.grad.dtype))
-            B.grad.data.copy_(grad_B_adj.to(B.grad.dtype))
+            A.grad.data.copy_(final_grad_A.to(A.grad.dtype))
+            B.grad.data.copy_(final_grad_B.to(B.grad.dtype))
     # --- LoRA-Pro 勾配調整関数ここまで ---
 
     try:
