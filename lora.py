@@ -34,6 +34,7 @@ from huggingface_hub.utils import HfHubHTTPError
 
 from io import BytesIO
 from tqdm.auto import tqdm
+from scipy.linalg import solve_sylvester # Sylvester方程式の求解に必要
 
 # ZClipのインポートを試みる
 # MIT License
@@ -2620,11 +2621,38 @@ def train_model(
     dynamic_threshold=True,
     head_only_train_steps=0,
     cache_dir=None,  # キャッシュディレクトリのパラメータを追加
-    use_zclip=False # zclipを使用するかどうかのフラグを追加
+    use_zclip=False, # zclipを使用するかどうかのフラグを追加
+    # --- LoRA-Pro 引数を追加 ---
+    use_lora_pro=False,
+    lorapro_beta1=0.9,
+    lorapro_beta2=0.999,
+    lorapro_eps=1e-8,
+    lorapro_delta=1e-8,
+    lorapro_reg=1e-8
+    # --- LoRA-Pro 引数ここまで ---
 ):
     """モデルをトレーニングする関数"""
     # 出力ディレクトリの作成
     os.makedirs(output_dir, exist_ok=True)
+
+    # --- LoRA-Pro 状態の初期化 ---
+    lorapro_states = {} # 各LoRA層の状態を保持する辞書
+    if use_lora_pro:
+        print("LoRA-Proを使用します。状態を初期化中...")
+        lorapro_global_step = 0
+        # モデル内のLoRALinear層を特定し、状態辞書を準備
+        for name, module in model.named_modules():
+            if isinstance(module, LoRALinear):
+                # キーとしてモジュール名を使用
+                lorapro_states[name] = {
+                    'exp_avg': None,    # shape: (out_features, in_features) - equiv_gradと同じ
+                    'exp_avg_sq': None, # shape: (out_features, in_features) - equiv_gradと同じ
+                    'A_param': module.lora.lora_A, # Parameter A
+                    'B_param': module.lora.lora_B, # Parameter B
+                    'scale': module.lora.scale     # Scaling factor s
+                }
+        print(f"LoRA-Pro: {len(lorapro_states)}個のLoRA層の状態を管理します。")
+    # --- LoRA-Pro 状態の初期化ここまで ---
 
     def save_model(output_dir, filename, base_model, save_format, model, optimizer, scheduler, epoch, threshold, val_loss, val_f1, tag_to_idx, idx_to_tag, tag_to_category):
         os.makedirs(output_dir, exist_ok=True)
@@ -2978,6 +3006,110 @@ def train_model(
         else:
             print("警告: --use_zclipが指定されましたが、zclip.pyが見つからないためZClipは使用されません。")
 
+    # --- LoRA-Pro 勾配調整関数 ---
+    @torch.no_grad()
+    def adjust_gradients_lorapro(current_step):
+        for name, state in lorapro_states.items():
+            A = state['A_param']
+            B = state['B_param']
+            s = state['scale']
+
+            if A.grad is None or B.grad is None:
+                # print(f"Skipping LoRA-Pro adjustment for {name} due to missing gradient.")
+                continue # 勾配がない場合はスキップ
+
+            grad_A_orin = A.grad.data.clone() # 元の勾配をコピー
+            grad_B_orin = B.grad.data.clone()
+
+            A_fp32 = A.data.float() # 計算用にfloat32に変換
+            B_fp32 = B.data.float()
+
+            # --- 著者実装のロジックを実装 ---
+            AA_T = A_fp32 @ A_fp32.T
+            B_TB = B_fp32.T @ B_fp32
+
+            try:
+                AA_T_inv = torch.linalg.pinv(AA_T + lorapro_delta * torch.eye(A_fp32.shape[1], device=A_fp32.device)).to(A_fp32.dtype) # rank = A.shape[1]
+                B_TB_inv = torch.linalg.pinv(B_TB + lorapro_delta * torch.eye(B_fp32.shape[1], device=B_fp32.device)).to(B_fp32.dtype) # rank = B.shape[1]
+            except torch._C._LinAlgError as e:
+                 print(f"Warning: LoRA-Pro pinv failed for {name}. Skipping adjustment. Error: {e}")
+                 continue
+
+
+            if current_step == 0:
+                # 初回ステップの処理 (Sylvesterなし)
+                grad_A_adj = grad_A_orin.float() # .float()を追加
+                # 元の実装では grad_B の計算に AA_T_inv が必要
+                grad_B_adj = (1 / (s**2)) * grad_B_orin.float() @ AA_T_inv
+                # Adam状態の初期化
+                equiv_grad = s * B_fp32 @ grad_A_adj + s * grad_B_adj @ A_fp32
+                state['exp_avg'] = torch.zeros_like(equiv_grad)
+                state['exp_avg_sq'] = torch.zeros_like(equiv_grad)
+                state['exp_avg'].lerp_(equiv_grad, 1 - lorapro_beta1)
+                state['exp_avg_sq'].mul_(lorapro_beta2).addcmul_(equiv_grad, equiv_grad.conj(), value=1 - lorapro_beta2) # .conj() は複素数用だが念のため
+
+            else:
+                # ステップ > 0 の処理 (Sylvesterあり)
+                # 1. 初期勾配変換
+                grad_A_t = (1 / (s**2)) * B_TB_inv @ grad_A_orin.float()
+                grad_B_t = (1 / (s**2)) * (torch.eye(B_fp32.shape[0], device=B_fp32.device, dtype=B_fp32.dtype) - B_fp32 @ B_TB_inv @ B_fp32.T) @ grad_B_orin.float() @ AA_T_inv
+
+                # 2. 等価勾配計算
+                equiv_grad = s * B_fp32 @ grad_A_t + s * grad_B_t @ A_fp32
+
+                # 3. Adam状態更新
+                state['exp_avg'].lerp_(equiv_grad, 1 - lorapro_beta1)
+                state['exp_avg_sq'].mul_(lorapro_beta2).addcmul_(equiv_grad, equiv_grad.conj(), value=1 - lorapro_beta2)
+
+                # 4. 実効勾配計算
+                step = current_step + 1
+                bias_correction1 = 1 - lorapro_beta1 ** step
+                bias_correction2 = 1 - lorapro_beta2 ** step
+                bias_correction2_sqrt = math.sqrt(bias_correction2)
+
+                denom = (state['exp_avg_sq'].sqrt() / bias_correction2_sqrt).add_(lorapro_eps)
+                g_eff = (state['exp_avg'] / bias_correction1) / denom
+                g_eff = g_eff.to(B_fp32.dtype) # データ型を合わせる
+
+                # 5. ターゲット勾配計算 (逆投影)
+                grad_A_target = s * B_fp32.T @ g_eff
+                grad_B_target = s * g_eff @ A_fp32.T
+
+                # 6. 勾配上書き (1回目) - 不要かもしれないが著者実装に合わせる
+                A.grad.data.copy_(grad_A_target.to(A.grad.dtype))
+                B.grad.data.copy_(grad_B_target.to(B.grad.dtype))
+
+                # 7. Sylvester方程式求解
+                try:
+                    # 係数行列 (正則化)
+                    C1_reg = B_TB + lorapro_reg * torch.eye(B_fp32.shape[1], device=B_fp32.device, dtype=B_fp32.dtype)
+                    C2_reg = AA_T + lorapro_reg * torch.eye(A_fp32.shape[1], device=A_fp32.device, dtype=A_fp32.dtype)
+                    # 右辺 (著者実装に合わせる)
+                    RHS = -(1 / (s**2)) * B_TB_inv @ grad_A_target @ A_fp32.T # grad_A_target を使用
+                    RHS = RHS.cpu().numpy() # scipyはnumpy配列を要求
+                    C1_reg_np = C1_reg.cpu().numpy()
+                    C2_reg_np = C2_reg.cpu().numpy()
+
+                    # scipy.linalg.solve_sylvester を使用
+                    X_np = solve_sylvester(C1_reg_np, C2_reg_np, RHS)
+                    X = torch.from_numpy(X_np).to(device=A.device, dtype=A_fp32.dtype)
+
+                    # 8. 最終勾配計算
+                    grad_A_adj = (1 / (s**2)) * B_TB_inv @ grad_A_target + X @ A_fp32
+                    grad_B_adj = (1 / (s**2)) * (torch.eye(B_fp32.shape[0], device=B_fp32.device, dtype=B_fp32.dtype) - B_fp32 @ B_TB_inv @ B_fp32.T) @ grad_B_target @ AA_T_inv - B_fp32 @ X
+
+                except Exception as e:
+                    # LinAlgErrorやValueErrorなど
+                    print(f"Warning: LoRA-Pro solve_sylvester failed for {name}. Skipping adjustment. Error: {e}")
+                    # Sylvester失敗時はターゲット勾配をそのまま使う
+                    grad_A_adj = grad_A_target
+                    grad_B_adj = grad_B_target
+
+            # 9. 勾配上書き (最終)
+            A.grad.data.copy_(grad_A_adj.to(A.grad.dtype))
+            B.grad.data.copy_(grad_B_adj.to(B.grad.dtype))
+    # --- LoRA-Pro 勾配調整関数ここまで ---
+
     try:
         # トレーニングループ
         for epoch in range(num_epochs):
@@ -2991,33 +3123,22 @@ def train_model(
             
             progress_bar = tqdm(train_loader, desc=f"Training")
             for i, (images, targets) in enumerate(progress_bar):
-                global_step += 1
                 images = images.to(device)
                 targets = targets.to(device)
-                
-                # 通常のデータでの学習
+
+                # メインデータの処理
                 if mixed_precision:
                     with torch.amp.autocast('cuda'):
                         outputs = model(images)
                         loss = criterion(outputs, targets)
-
-                    scaler.scale(loss).backward()
-                    if zclip:
-                        zclip.step(model) # 勾配クリッピングを適用
-                    scaler.step(optimizer)
-                    scaler.update()
-                    optimizer.zero_grad()
+                    scaler.scale(loss).backward() # 勾配計算 (スケール済み)
                 else:
                     outputs = model(images)
                     loss = criterion(outputs, targets)
+                    loss.backward() # 勾配計算
 
-                    loss.backward()
-                    if zclip:
-                        zclip.step(model) # 勾配クリッピングを適用
-                    optimizer.step()
-                    optimizer.zero_grad()
-
-                # 正則化データセットでの学習
+                # 正則化データの処理 (勾配を蓄積)
+                reg_loss = None # loss記録用
                 if reg_loader is not None:
                     try:
                         reg_images, reg_targets = next(reg_iter)
@@ -3031,25 +3152,47 @@ def train_model(
                     if mixed_precision:
                         with torch.amp.autocast('cuda'):
                             reg_outputs = model(reg_images)
-                            reg_loss = criterion(reg_outputs, reg_targets)
-
-                        scaler.scale(reg_loss).backward()
-                        if zclip:
-                            zclip.step(model) # 勾配クリッピングを適用
-                        scaler.step(optimizer)
-                        scaler.update()
-                        optimizer.zero_grad()
+                            reg_loss_val = criterion(reg_outputs, reg_targets)
+                        # メインのlossの勾配に加算 (スケール済み)
+                        scaler.scale(reg_loss_val).backward()
+                        loss = (loss + reg_loss_val) / 2 # loss記録用
                     else:
                         reg_outputs = model(reg_images)
-                        reg_loss = criterion(reg_outputs, reg_targets)
+                        reg_loss_val = criterion(reg_outputs, reg_targets)
+                        reg_loss_val.backward() # メインのlossの勾配に加算
+                        loss = (loss + reg_loss_val) / 2 # loss記録用
 
-                        reg_loss.backward()
-                        if zclip:
-                            zclip.step(model) # 勾配クリッピングを適用
-                        optimizer.step()
-                        optimizer.zero_grad()
 
-                    loss = (loss + reg_loss) / 2
+                # --- 勾配調整とオプティマイザステップ ---
+                if mixed_precision:
+                    # LoRA-Pro: unscaleしてから調整
+                    if use_lora_pro:
+                        scaler.unscale_(optimizer) # ★ unscale を調整前に実行 ★
+                        adjust_gradients_lorapro(lorapro_global_step)
+
+                    # Z-Clip (unscale後)
+                    if zclip:
+                        # scaler.unscale_(optimizer) # 上でunscale済みなら不要
+                        zclip.step(model) # 勾配クリッピング
+
+                    scaler.step(optimizer) # optimizer実行 (内部で再度勾配チェックあり)
+                    scaler.update()        # スケーラー更新
+                else:
+                    # LoRA-Pro: 通常勾配に対して調整
+                    if use_lora_pro:
+                        adjust_gradients_lorapro(lorapro_global_step)
+
+                    # Z-Clip
+                    if zclip:
+                        zclip.step(model)
+
+                    optimizer.step() # optimizer実行
+
+                # ★ global_step インクリメント (LoRA-Pro用) ★
+                if use_lora_pro:
+                    lorapro_global_step += 1
+
+                optimizer.zero_grad(set_to_none=True) # 勾配リセット
 
                 train_loss += loss.item()
 
@@ -3465,6 +3608,22 @@ def main():
     train_parser.add_argument('--xformers', action='store_true', help='xformersを使用してメモリ効率の良いattentionを有効化')
     train_parser.add_argument('--sageattention', action='store_true', help='SageAttentionを使用してメモリ効率の良いattentionを有効化')
     train_parser.add_argument('--flashattention', action='store_true', help='FlashAttentionを使用してメモリ効率の良いattentionを有効化')
+
+    # --- LoRA-Pro 関連の引数を追加 ---
+    train_parser.add_argument('--use_lora_pro', action='store_true',
+                              help='LoRA-Proによる勾配調整を使用する')
+    train_parser.add_argument('--lorapro_beta1', type=float, default=0.9,
+                              help='LoRA-Pro: Adam状態のbeta1')
+    train_parser.add_argument('--lorapro_beta2', type=float, default=0.999,
+                              help='LoRA-Pro: Adam状態のbeta2')
+    train_parser.add_argument('--lorapro_eps', type=float, default=1e-8,
+                              help='LoRA-Pro: Adam状態計算時のepsilon')
+    train_parser.add_argument('--lorapro_delta', type=float, default=1e-8,
+                              help='LoRA-Pro: 擬似逆行列計算時のdelta')
+    train_parser.add_argument('--lorapro_reg', type=float, default=1e-8,
+                              help='LoRA-Pro: Sylvester方程式求解時の正則化項')
+    # --- LoRA-Pro 関連の引数ここまで ---
+
     # モデルマージコマンド
     merge_parser = subparsers.add_parser('merge', help='LoRAモデルをマージします')
 
@@ -3862,7 +4021,15 @@ def main():
             dynamic_threshold=args.dynamic_threshold,
             head_only_train_steps=args.head_only_train_steps,
             cache_dir=False, # args.cache_dir を渡す
-            use_zclip=args.use_zclip
+            use_zclip=args.use_zclip,
+            # --- LoRA-Pro 引数を追加 ---
+            use_lora_pro=args.use_lora_pro,
+            lorapro_beta1=args.lorapro_beta1,
+            lorapro_beta2=args.lorapro_beta2,
+            lorapro_eps=args.lorapro_eps,
+            lorapro_delta=args.lorapro_delta,
+            lorapro_reg=args.lorapro_reg
+            # --- LoRA-Pro 引数ここまで ---
         )
         print("トレーニングが完了しました！")
 
