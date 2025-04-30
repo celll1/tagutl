@@ -8,7 +8,7 @@ import requests
 
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Optional, List, Dict, Tuple, Union
+from typing import Optional, List, Dict, Tuple, Union, Callable
 from collections import defaultdict
 
 import numpy as np
@@ -2371,7 +2371,7 @@ class AsymmetricLossOptimized(nn.Module):
     ''' Notice - optimized version, minimizes memory allocation and gpu uploading,
     favors inplace operations'''
 
-    def __init__(self, gamma_neg=4, gamma_pos=1, clip=0.05, eps=1e-6, disable_torch_grad_focal_loss=False):
+    def __init__(self, gamma_neg=4, gamma_pos=1, clip=0.05, eps=1e-6, disable_torch_grad_focal_loss=False, reduction='mean'): # ★ reduction追加
         super(AsymmetricLossOptimized, self).__init__()
 
         self.gamma_neg = gamma_neg
@@ -2379,6 +2379,7 @@ class AsymmetricLossOptimized(nn.Module):
         self.clip = clip
         self.disable_torch_grad_focal_loss = disable_torch_grad_focal_loss
         self.eps = eps
+        self.reduction = reduction # ★ 保存
 
         # prevent memory allocation and gpu uploading every iteration, and encourages inplace operations
         self.targets = self.anti_targets = self.xs_pos = self.xs_neg = self.asymmetric_w = self.loss = None
@@ -2423,7 +2424,80 @@ class AsymmetricLossOptimized(nn.Module):
             self.loss *= self.asymmetric_w
 
         # バッチ単位で平均を取る（サンプル数で割る）
-        return -self.loss.mean()
+        # ★ Apply reduction based on the parameter ★
+        if self.reduction == 'mean':
+            return -self.loss.mean()
+        elif self.reduction == 'sum':
+            return -self.loss.sum()
+        elif self.reduction == 'none':
+            return -self.loss # Return per-element loss (positive value)
+        else:
+            raise ValueError(f"Unsupported reduction type: {self.reduction}")
+
+# --- Sample Weighting Wrapper ---
+class SampleWeightedLossWrapper(nn.Module):
+    """
+    任意の基底損失関数をラップし、サンプルごとの学習度合いに基づいて
+    損失の重みを動的に調整するラッパー。
+    """
+    def __init__(self,
+                 base_criterion: nn.Module,             # ★ ラップする基底損失関数
+                 sample_weighting_type: str = 'variance_mean_penalty',
+                 min_weight: float = 0.1):
+        super().__init__()
+
+        # Ensure the base criterion will return per-element loss
+        if hasattr(base_criterion, 'reduction'):
+            print(f"Setting base_criterion reduction to 'none' for SampleWeightedLossWrapper.")
+            base_criterion.reduction = 'none'
+        else:
+            # If the base criterion doesn't have a standard 'reduction' param,
+            # we assume its forward() already returns per-element loss.
+            # Add checks or specific handling if needed for other loss types.
+            print(f"Warning: base_criterion ({type(base_criterion).__name__}) does not have a 'reduction' attribute. Assuming it returns per-element loss.")
+
+
+        self.base_criterion = base_criterion
+        self.sample_weighting_type = sample_weighting_type
+        self.min_weight = min_weight
+
+        if sample_weighting_type not in ['variance_mean_penalty']:
+             raise ValueError(f"Unsupported sample_weighting_type: {sample_weighting_type}")
+        if not (0.0 <= min_weight <= 1.0):
+            raise ValueError(f"min_weight must be between 0.0 and 1.0, got {min_weight}")
+
+    def forward(self, x, y):
+        """
+        Args:
+            x: input logits
+            y: targets (multi-label binarized vector)
+        """
+        # 1. Calculate per-element loss using the base criterion
+        # Ensure base_criterion returns per-element loss (positive)
+        per_element_loss = self.base_criterion(x, y) # Shape: [batch_size, num_classes]
+
+        # 2. Calculate sample weights based on prediction probabilities
+        with torch.no_grad(): # Weight calculation should not affect gradients
+            probs = torch.sigmoid(x) # Shape: [batch_size, num_classes]
+
+            if self.sample_weighting_type == 'variance_mean_penalty':
+                sample_mean_probs = probs.mean(dim=1) # Shape: [batch_size]
+                sample_var_probs = probs.var(dim=1)   # Shape: [batch_size]
+                learning_level = (1.0 - sample_var_probs - 4.0 * (sample_mean_probs - 0.5)**2).clamp(0.0, 1.0)
+            else:
+                learning_level = torch.zeros_like(probs.mean(dim=1)) # Default to no weighting
+
+            sample_weights = 1.0 - learning_level * (1.0 - self.min_weight) # Shape: [batch_size]
+            sample_weights = torch.nan_to_num(sample_weights, nan=1.0) # Handle potential NaNs
+
+        # 3. Calculate mean loss per sample
+        sample_mean_loss = per_element_loss.mean(dim=1) # Shape: [batch_size]
+
+        # 4. Apply sample weights
+        weighted_sample_loss = sample_mean_loss * sample_weights
+
+        # 5. Return the mean of weighted sample losses
+        return weighted_sample_loss.mean()
 
 def compute_metrics(outputs, targets):
     """
@@ -3450,10 +3524,20 @@ def main():
     train_parser.add_argument('--output_dir', type=str, default='lora_model', help='出力ディレクトリ')
     
     # 損失関数関連の引数
-    train_parser.add_argument('--loss_fn', type=str, default='bce', choices=['bce', 'asl', 'asl_optimized'], help='損失関数')
+    train_parser.add_argument('--loss_fn', type=str, default='asl_optimized',
+                              choices=['bce', 'asl', 'asl_optimized'], # ★ 基底損失関数のみ ★
+                              help='使用する基底損失関数')
     train_parser.add_argument('--gamma_neg', type=float, default=4, help='ASL: 負例のガンマ値')
     train_parser.add_argument('--gamma_pos', type=float, default=1, help='ASL: 正例のガンマ値')
     train_parser.add_argument('--clip', type=float, default=0.05, help='ASL: クリップ値')
+    # ★サンプル重み付け用引数を追加★
+    train_parser.add_argument('--use_sample_weighting', action='store_true', default=True,
+                              help='サンプルごとの学習度合いに基づいて損失の重みを調整する機能を有効化')
+    train_parser.add_argument('--sample_weighting_type', type=str, default='variance_mean_penalty',
+                              choices=['variance_mean_penalty'],
+                              help='サンプル重み計算方法')
+    train_parser.add_argument('--min_weight', type=float, default=0.1,
+                              help='学習済みと判断されたサンプルの最小損失重み (0.0-1.0)')
 
     # その他のオプション
     train_parser.add_argument('--mixed_precision', action='store_true', help='混合精度トレーニングを使用する')
@@ -3781,25 +3865,68 @@ def main():
             )
         else:
             reg_loader = None
-        
-        # 損失関数の設定
+            
+        # ★★★ criterion の設定ロジックを変更 ★★★
+        print("損失関数を設定しています...")
+        base_criterion: nn.Module # 型ヒント
+        reduction_type = 'none' if args.use_sample_weighting else 'mean'
+
         if args.loss_fn == 'bce':
-            criterion = nn.BCEWithLogitsLoss()
+            # BCEWithLogitsLoss は reduction をコンストラクタで受け取る
+            base_criterion = nn.BCEWithLogitsLoss(reduction=reduction_type)
+            print(f"基底損失関数: BCEWithLogitsLoss (reduction='{reduction_type}')")
         elif args.loss_fn == 'asl':
-            criterion = AsymmetricLoss(
-                gamma_neg=args.gamma_neg,
-                gamma_pos=args.gamma_pos,
-                clip=args.clip,
-            )
+            # AsymmetricLoss が reduction をサポートするように修正が必要な場合がある
+            # 仮にサポートしているとする
+            try:
+                base_criterion = AsymmetricLoss(
+                    gamma_neg=args.gamma_neg, gamma_pos=args.gamma_pos, clip=args.clip,
+                    reduction=reduction_type # 仮定
+                )
+                print(f"基底損失関数: AsymmetricLoss (reduction='{reduction_type}')")
+            except TypeError: # もし reduction 引数がなければ、古いバージョンとみなし、後で対応
+                 print(f"警告: AsymmetricLoss が reduction 引数をサポートしていないようです。")
+                 # use_sample_weighting が True の場合はエラーにするか、別の方法を考える
+                 if args.use_sample_weighting:
+                      raise NotImplementedError("AsymmetricLoss needs modification to support reduction='none' for sample weighting.")
+                 else:
+                      # 重み付けなしなら、デフォルトの挙動（おそらく mean）でOK
+                      base_criterion = AsymmetricLoss(gamma_neg=args.gamma_neg, gamma_pos=args.gamma_pos, clip=args.clip)
+                      print("基底損失関数: AsymmetricLoss (デフォルトの reduction)")
+
         elif args.loss_fn == 'asl_optimized':
-            criterion = AsymmetricLossOptimized(
-                gamma_neg=args.gamma_neg,
-                gamma_pos=args.gamma_pos,
-                clip=args.clip,
+            # 修正済みの AsymmetricLossOptimized を使う
+            base_criterion = AsymmetricLossOptimized(
+                gamma_neg=args.gamma_neg, gamma_pos=args.gamma_pos, clip=args.clip,
+                reduction=reduction_type # 'none' または 'mean' を指定
             )
+            print(f"基底損失関数: AsymmetricLossOptimized (reduction='{reduction_type}')")
         else:
-            print("損失関数が指定されていません。BCEWithLogitsLossを使用します。")
-            criterion = nn.BCEWithLogitsLoss()
+            # Fallback to BCE
+            print(f"未対応または不正な基底損失関数: {args.loss_fn}。BCEWithLogitsLossを使用します。")
+            base_criterion = nn.BCEWithLogitsLoss(reduction=reduction_type)
+            print(f"基底損失関数: BCEWithLogitsLoss (reduction='{reduction_type}')")
+
+        # サンプル重み付けが有効な場合、ラッパーでラップする
+        if args.use_sample_weighting:
+            # base_criterion は reduction='none' でインスタンス化されている必要がある
+            if hasattr(base_criterion, 'reduction') and base_criterion.reduction != 'none':
+                 raise RuntimeError(f"Sample weighting requires base criterion with reduction='none', but got '{base_criterion.reduction}'.")
+            elif not hasattr(base_criterion, 'reduction'):
+                 # reduction 属性がない場合、要素ごと損失を返すか確認が必要
+                 pass # 既に警告済み
+
+            criterion = SampleWeightedLossWrapper(
+                base_criterion=base_criterion,
+                sample_weighting_type=args.sample_weighting_type,
+                min_weight=args.min_weight
+            )
+            print(f"サンプル重み付けラッパーを有効化しました (type={args.sample_weighting_type}, min_weight={args.min_weight})")
+        else:
+            # 重み付けしない場合は、基底損失関数をそのまま使う (reduction='mean' であるはず)
+            criterion = base_criterion
+            print("サンプル重み付けは使用しません。")
+        # ★★★ criterion 設定ロジックここまで ★★★
         
         # TensorBoardの設定
         if args.tensorboard:

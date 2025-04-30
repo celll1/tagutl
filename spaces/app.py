@@ -271,7 +271,8 @@ REPO_ID = "celstk/wd-eva02-lora-onnx"
 # Model options
 MODEL_OPTIONS = {
     "cl_eva02_tagger_v1_250426": "cl_eva02_tagger_v1_250426/model.onnx",
-    "cl_eva02_tagger_v1_250427": "cl_eva02_tagger_v1_250427/model.onnx"
+    "cl_eva02_tagger_v1_250427": "cl_eva02_tagger_v1_250427/model.onnx",
+    "cl_eva02_tagger_v1_250430": "cl_eva02_tagger_v1_250430/model.onnx"
 }
 DEFAULT_MODEL = "cl_eva02_tagger_v1_250426"
 CACHE_DIR = "./model_cache"
