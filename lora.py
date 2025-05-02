@@ -2682,6 +2682,7 @@ def train_model(
     optimizer_type, # ★追加★
     criterion, 
     num_epochs, 
+    equal_reg_epochs: Optional[int],
     device, 
     output_dir='lora_model',
     save_format='safetensors',
@@ -2894,6 +2895,46 @@ def train_model(
     # epochにより動的に閾値を設定する
     threshold = initial_threshold if initial_threshold is not None else 0.35
 
+    # ★★★ データローダー準備 (結合データローダーの事前作成) ★★★
+    combined_loader = None
+    if equal_reg_epochs is not None and reg_loader is not None:
+        print(f"最初の {equal_reg_epochs} エポックは正則化データと1:1で学習し、その後は全データを結合して学習します。")
+        # train_loader と reg_loader のデータセットを取得
+        # 注意: DataLoaderから直接Datasetを取り出すのは非推奨な場合があるが、ここでは実装を簡潔にする
+        if isinstance(train_loader.dataset, TagImageDataset) and isinstance(reg_loader.dataset, TagImageDataset):
+            train_dataset = train_loader.dataset
+            reg_dataset = reg_loader.dataset
+
+            # データを結合
+            combined_image_paths = train_dataset.image_paths + reg_dataset.image_paths
+            combined_tags_list = train_dataset.tags_list + reg_dataset.tags_list
+
+            print(f"結合後の総データ数: {len(combined_image_paths)}")
+
+            # 結合データセットを作成 (キャッシュはここでは使わない、または別途設定が必要)
+            combined_dataset = TagImageDataset(
+                image_paths=combined_image_paths,
+                tags_list=combined_tags_list,
+                tag_to_idx=model.tag_to_idx,
+                transform=model.transform,
+                # cache_dir=os.path.join(cache_dir, 'combined') if cache_dir else None, # 必要ならキャッシュ設定
+                cache_dir=None, # 結合データセットはキャッシュしない方が無難か
+                force_recache=False,
+            )
+
+            # 結合データローダーを作成
+            combined_loader = torch.utils.data.DataLoader(
+                combined_dataset,
+                batch_size=train_loader.batch_size, # train_loaderのバッチサイズに合わせる
+                shuffle=True, # 結合後はシャッフルする
+                num_workers=train_loader.num_workers,
+                pin_memory=True
+            )
+            print("結合データローダーを作成しました。")
+        else:
+            print("警告: 結合データローダーの作成に失敗しました。データセットのタイプが予期されたものではありません。")
+            combined_loader = None # 作成失敗
+
     # 初期検証（もともとの重みにより推論はある程度できるはず）
     model.eval()
     val_loss = 0.0
@@ -3051,94 +3092,113 @@ def train_model(
             print("ZClipによる勾配クリッピングを有効化しました。")
         else:
             print("警告: --use_zclipが指定されましたが、zclip.pyが見つからないためZClipは使用されません。")
-
     try:
         # トレーニングループ
         for epoch in range(num_epochs):
             print(f"Epoch {epoch+1}/{num_epochs}")
-            
+
+            # --- エポック数に応じてデータローダーと学習方法を決定 ---
+            current_train_loader = None
+            use_separate_reg = False 
+
+            if equal_reg_epochs is not None and epoch >= equal_reg_epochs and combined_loader is not None:
+                current_train_loader = combined_loader
+                use_separate_reg = False 
+                print(f"エポック {epoch+1}: 結合データローダーを使用します。")
+            else:
+                current_train_loader = train_loader
+                use_separate_reg = reg_loader is not None and (equal_reg_epochs is None or epoch < equal_reg_epochs)
+                if use_separate_reg:
+                    print(f"エポック {epoch+1}: メインデータと正則化データを個別に学習します。")
+                    # ★★★ イテレータをエポック開始時に初期化 ★★★
+                    reg_iter = iter(reg_loader) 
+                else:
+                    print(f"エポック {epoch+1}: メインデータのみで学習します。")
+            # --- ここまで ---
+
             # トレーニングフェーズ
             model.train()
             train_loss = 0.0
             train_preds = []
             train_targets = []
-            
-            progress_bar = tqdm(train_loader, desc=f"Training")
+
+            progress_bar = tqdm(current_train_loader, desc=f"Training (Epoch {epoch+1})")
             for i, (images, targets) in enumerate(progress_bar):
                 global_step += 1
                 images = images.to(device)
                 targets = targets.to(device)
-                
-                # 通常のデータでの学習
+
+                # メインデータ (または結合データ) での学習
                 if mixed_precision:
                     with torch.amp.autocast('cuda'):
                         outputs = model(images)
                         loss = criterion(outputs, targets)
-
                     scaler.scale(loss).backward()
-                    if zclip:
-                        zclip.step(model) # 勾配クリッピングを適用
+                    if zclip: zclip.step(model)
                     scaler.step(optimizer)
                     scaler.update()
                     optimizer.zero_grad()
                 else:
                     outputs = model(images)
                     loss = criterion(outputs, targets)
-
                     loss.backward()
-                    if zclip:
-                        zclip.step(model) # 勾配クリッピングを適用
+                    if zclip: zclip.step(model)
                     optimizer.step()
                     optimizer.zero_grad()
 
-                # 正則化データセットでの学習
-                if reg_loader is not None:
+                current_batch_loss = loss.item() 
+
+                # 正則化データセットでの学習 (個別に扱う場合のみ)
+                if use_separate_reg:
                     try:
+                        # ★★★ tryブロック内で next を実行 ★★★
                         reg_images, reg_targets = next(reg_iter)
-                    except (StopIteration, NameError):
-                        reg_iter = iter(reg_loader)
-                        reg_images, reg_targets = next(reg_iter)
+                        
+                        # ★★★ nextが成功した場合のみ処理を実行 ★★★
+                        reg_images = reg_images.to(device)
+                        reg_targets = reg_targets.to(device)
 
-                    reg_images = reg_images.to(device)
-                    reg_targets = reg_targets.to(device)
-
-                    if mixed_precision:
-                        with torch.amp.autocast('cuda'):
+                        if mixed_precision:
+                            with torch.amp.autocast('cuda'):
+                                reg_outputs = model(reg_images)
+                                reg_loss = criterion(reg_outputs, reg_targets)
+                            scaler.scale(reg_loss).backward()
+                            if zclip: zclip.step(model)
+                            scaler.step(optimizer)
+                            scaler.update()
+                            optimizer.zero_grad()
+                        else:
                             reg_outputs = model(reg_images)
                             reg_loss = criterion(reg_outputs, reg_targets)
+                            reg_loss.backward()
+                            if zclip: zclip.step(model)
+                            optimizer.step()
+                            optimizer.zero_grad()
 
-                        scaler.scale(reg_loss).backward()
-                        if zclip:
-                            zclip.step(model) # 勾配クリッピングを適用
-                        scaler.step(optimizer)
-                        scaler.update()
-                        optimizer.zero_grad()
-                    else:
-                        reg_outputs = model(reg_images)
-                        reg_loss = criterion(reg_outputs, reg_targets)
+                        current_batch_loss = (current_batch_loss + reg_loss.item()) / 2
 
-                        reg_loss.backward()
-                        if zclip:
-                            zclip.step(model) # 勾配クリッピングを適用
-                        optimizer.step()
-                        optimizer.zero_grad()
+                    except StopIteration:
+                        # ★★★ 正則化データが尽きたら、イテレータをリセットして次のステップに備える ★★★
+                        # print("正則化データローダーが1周しました。リセットします。") # デバッグ用
+                        reg_iter = iter(reg_loader)
+                        # このステップでは正則化データの学習はスキップされる
 
-                    loss = (loss + reg_loss) / 2
+                # ★★★ 不要なdel文を削除 ★★★
+                # del reg_images, reg_targets, reg_outputs, reg_loss 
 
-                train_loss += loss.item()
+                train_loss += current_batch_loss 
 
-                # シグモイド関数で確率に変換
+                # シグモイド関数で確率に変換 (変更なし)
                 probs = torch.sigmoid(outputs).detach().cpu().numpy()
-                # 最新100件のみを保持
                 train_preds = (train_preds + [probs])[-100:]
                 train_targets = (train_targets + [targets.detach().cpu().numpy()])[-100:]
 
-                progress_bar.set_postfix({"loss": f"{loss.item():.4f}"})
+                progress_bar.set_postfix({"loss": f"{current_batch_loss:.4f}"})
 
-                # 定期的にTensorBoardに予測結果を記録
+                # 定期的にTensorBoardに記録
                 if tensorboard:
                     # stepごとのlossを記録
-                    writer.add_scalar('Train/Step_Loss', loss.item(), epoch * len(train_loader) + i)
+                    writer.add_scalar('Train/Step_Loss', current_batch_loss, epoch * len(current_train_loader) + i)
 
                     if i % 100 == 0:
                         img_grid = visualize_predictions_for_tensorboard(
@@ -3155,23 +3215,24 @@ def train_model(
                         writer.add_image(f'predictions/train_epoch_{epoch}', img_grid, i)
 
                 if global_step == head_only_train_steps:
-                    tqdm.write("ヘッド部分の訓練を終了します")
-                    model.freeze_non_lora_parameters()
-            
-            # 学習率のスケジューリング
+                     tqdm.write("ヘッド部分の訓練を終了します")
+                     model.freeze_non_lora_parameters()
+
+            # 学習率のスケジューリング (変更なし)
             scheduler.step()
             if tensorboard:
                 writer.add_scalar('Learning_Rate', optimizer.param_groups[0]['lr'], epoch)
-            
+
             # トレーニングメトリクスの計算
-            train_loss /= len(train_loader)
+            # ★★★ current_train_loader の長さで割る ★★★
+            train_loss /= len(current_train_loader)
 
             train_preds = [pred for batch in train_preds for pred in batch]
             train_targets = [target for batch in train_targets for target in batch]
             train_preds = np.array(train_preds)
             train_targets = np.array(train_targets)
 
-            train_metrics = compute_metrics(train_preds,train_targets)
+            train_metrics = compute_metrics(train_preds, train_targets)
 
             if dynamic_threshold:
                 threshold = round(train_metrics['threshold'], 2) - 0.1
@@ -3486,6 +3547,10 @@ def main():
     train_parser.add_argument('--image_dirs', type=str, nargs='+', required=True, help='トレーニング画像のディレクトリ（複数指定可）')
     train_parser.add_argument('--val_split', type=float, default=0.1, help='検証データの割合')
     train_parser.add_argument('--reg_image_dirs', type=str, nargs='+', default=None, help='正則化画像のディレクトリ（複数指定可）')
+    # ★★★ 新しい引数を追加 ★★★
+    train_parser.add_argument('--equal_reg_epochs', type=int, default=None,
+                              help='正則化データと1:1で学習するエポック数。指定しない場合は全エポックで1:1学習（正則化データがある場合）。')
+    # ★★★ ここまで ★★★
     train_parser.add_argument('--min_tag_freq', type=int, default=10, help='タグの最小出現頻度')
     train_parser.add_argument('--remove_special_prefix', default="omit", choices=["remove", "omit"], help='特殊プレフィックス（例：a@、g@など）を除去する')
     # train_parser.add_argument('--image_size', type=int, default=224, help='画像サイズ')
@@ -3977,6 +4042,7 @@ def main():
             optimizer_type=args.optimizer, # ★引数変更★
             criterion=criterion,
             num_epochs=args.num_epochs,
+            equal_reg_epochs=args.equal_reg_epochs,
             device=device,
             output_dir=args.output_dir,
             save_format=args.save_format,
