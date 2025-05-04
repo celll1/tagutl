@@ -1959,21 +1959,23 @@ def analyze_model_structure(base_model='SmilingWolf/wd-eva02-large-tagger-v3'):
 # トレーニング用のデータセットクラス
 class TagImageDataset(torch.utils.data.Dataset):
     def __init__(
-        self, 
-        image_paths, 
-        tags_list, 
-        tag_to_idx, 
+        self,
+        image_paths,
+        tags_list,
+        tag_to_idx,
+        tag_to_category: Dict[str, str], # ★ tag_to_category を追加
         transform=None,
-        cache_dir=None,  # キャッシュディレクトリを指定するパラメータ
-        force_recache=False,  # キャッシュを強制的に再作成するフラグ
+        cache_dir=None,
+        force_recache=False,
     ):
         """
         画像とタグのデータセット
-        
+
         Args:
             image_paths: 画像ファイルパスのリスト
             tags_list: 各画像に対応するタグのリスト（リストのリスト）
             tag_to_idx: タグから索引へのマッピング辞書
+            tag_to_category: タグからカテゴリへのマッピング辞書 ★追加★
             transform: 画像変換関数
             cache_dir: キャッシュディレクトリ（Noneの場合はキャッシュを使用しない）
             force_recache: 既存のキャッシュを無視して再作成するかどうか
@@ -1981,17 +1983,31 @@ class TagImageDataset(torch.utils.data.Dataset):
         self.image_paths = image_paths
         self.tags_list = tags_list
         self.tag_to_idx = tag_to_idx
+        self.tag_to_category = tag_to_category # ★ 保存
         self.transform = transform
         self.cache_dir = cache_dir
         self.force_recache = force_recache
-        
+
         print(f"データセットのタグ数: {len(self.tag_to_idx)}")
-        
+
+        # ★ Rating と Quality タグのインデックスを特定 ★
+        self.rating_indices = []
+        self.quality_indices = []
+        for tag, idx in self.tag_to_idx.items():
+            category = self.tag_to_category.get(tag) # タグに対応するカテゴリを取得
+            if category == 'Rating':
+                self.rating_indices.append(idx)
+            elif category == 'Quality':
+                self.quality_indices.append(idx)
+        print(f"Rating indices identified: {len(self.rating_indices)}")
+        print(f"Quality indices identified: {len(self.quality_indices)}")
+        # ★ ここまで追加 ★
+
         # キャッシュ関連の初期化
         self.using_cache = cache_dir is not None
         self.cache_metadata_file = None
         self.cache_files_exist = False
-        
+
         # キャッシュディレクトリが指定されている場合
         if self.using_cache:
             os.makedirs(cache_dir, exist_ok=True)
@@ -2022,119 +2038,139 @@ class TagImageDataset(torch.utils.data.Dataset):
     def _create_cache(self):
         """個別のファイルにデータをキャッシュする"""
         print("データセットのキャッシュを作成中...")
-        
-        # キャッシュ作成のために情報を収集
+
         dataset_info = {
             'dataset_size': len(self.image_paths),
             'num_classes': len(self.tag_to_idx),
-            'missing_samples': []  # 読み込みに失敗したサンプルのリスト
+            'missing_samples': []
         }
-        
+
         for idx in tqdm(range(len(self.image_paths)), desc="Caching dataset"):
-            # 画像を読み込み前処理を適用
             try:
                 img_path = self.image_paths[idx]
-                
+
                 image = Image.open(img_path)
                 image = pil_ensure_rgb(image)
                 image = pil_pad_square(image)
-                
+
                 if self.transform:
                     image = self.transform(image)
-                    # RGB to BGR for EVA02 model
                     image = image[[2, 1, 0]]
-                
-                # タグをone-hotエンコーディング
+
                 tags = self.tags_list[idx]
                 num_classes = len(self.tag_to_idx)
                 label = torch.zeros(num_classes)
-                
+
+                # ★★★ 損失マスク生成ロジック (キャッシュ作成時にも必要) ★★★
+                loss_mask = torch.ones(num_classes) # デフォルトは全て1
+                has_rating_tag = False
+                has_quality_tag = False
                 for tag in tags:
                     if tag in self.tag_to_idx:
                         label[self.tag_to_idx[tag]] = 1.0
-                
-                # 個別のファイルとしてキャッシュに保存
+                        # カテゴリチェック
+                        category = self.tag_to_category.get(tag)
+                        if category == 'Rating':
+                            has_rating_tag = True
+                        elif category == 'Quality':
+                            has_quality_tag = True
+
+                if not has_rating_tag and self.rating_indices:
+                    loss_mask[self.rating_indices] = 0.0 # Ratingタグがなければマスク
+                if not has_quality_tag and self.quality_indices:
+                    loss_mask[self.quality_indices] = 0.0 # Qualityタグがなければマスク
+                # ★★★ ここまで ★★★
+
                 cache_path = self._get_cache_path(idx)
-                torch.save((image, label), cache_path)
-                
+                # ★ 保存するデータに loss_mask を追加 ★
+                torch.save((image, label, loss_mask), cache_path)
+
             except (Image.UnidentifiedImageError, OSError, IOError) as e:
-                # 画像が読み込めない場合のエラーをスキップし、メタデータに記録
                 print(f"Warning: キャッシュ作成中に画像の読み込みに失敗しました: {img_path}, エラー: {str(e)}")
                 dataset_info['missing_samples'].append(idx)
-        
-        # メタデータをディスクに保存
+
         with open(self.cache_metadata_file, 'w') as f:
             json.dump(dataset_info, f)
-            
-        print(f"キャッシュの作成が完了しました。{len(self.image_paths)}個のサンプルが処理されました。")
+
+        print(f"キャッシュの作成が完了しました。")
         print(f"読み込みに失敗したサンプル: {len(dataset_info['missing_samples'])}")
-        
-        # キャッシュが作成されたことを記録
         self.cache_files_exist = True
 
     def __len__(self):
         return len(self.image_paths)
-    
+
     def __getitem__(self, idx):
         # キャッシュを使用している場合はキャッシュファイルからデータを取得
         if self.using_cache and self.cache_files_exist:
             cache_path = self._get_cache_path(idx)
             if os.path.exists(cache_path):
                 try:
-                    return torch.load(cache_path)
+                    # ★ キャッシュから loss_mask も読み込む ★
+                    image, label, loss_mask = torch.load(cache_path)
+                    return image, label, loss_mask
                 except Exception as e:
                     print(f"Warning: キャッシュファイルの読み込みに失敗しました: {cache_path}, エラー: {str(e)}")
-                    # キャッシュ読み込み失敗時は通常の処理にフォールバック
-        
+
         # キャッシュがない場合や読み込み失敗時は通常通り処理
-        # 最大再試行回数
         max_retries = 5
         current_idx = idx
-        
+
         for _ in range(max_retries):
-            # 画像の読み込みと前処理
             img_path = self.image_paths[current_idx]
-            
             try:
                 image = Image.open(img_path)
                 image = pil_ensure_rgb(image)
                 image = pil_pad_square(image)
-                
+
                 if self.transform:
                     image = self.transform(image)
-                    # RGB to BGR for EVA02 model
                     image = image[[2, 1, 0]]
-                
-                # タグをone-hotエンコーディング
+
                 tags = self.tags_list[current_idx]
                 num_classes = len(self.tag_to_idx)
                 label = torch.zeros(num_classes)
-                
+                loss_mask = torch.ones(num_classes) # ★ デフォルトは全て1 ★
+
+                # ★★★ ラベルとマスクの同時生成 ★★★
+                has_rating_tag = False
+                has_quality_tag = False
                 for tag in tags:
+                    # ★ 正規化は不要 (prepare_datasetで既に実施済み想定)
                     if tag in self.tag_to_idx:
-                        label[self.tag_to_idx[tag]] = 1.0
-                
+                        tag_idx = self.tag_to_idx[tag]
+                        label[tag_idx] = 1.0
+                        # カテゴリチェック (tag_to_categoryを使用)
+                        category = self.tag_to_category.get(tag)
+                        if category == 'Rating':
+                            has_rating_tag = True
+                        elif category == 'Quality':
+                            has_quality_tag = True
+
+                # ★ マスクの設定 ★
+                if not has_rating_tag and self.rating_indices: # rating_indicesが空でないことも確認
+                    loss_mask[self.rating_indices] = 0.0 # Ratingタグがなければマスク
+                if not has_quality_tag and self.quality_indices: # quality_indicesが空でないことも確認
+                    loss_mask[self.quality_indices] = 0.0 # Qualityタグがなければマスク
+                # ★★★ ここまで ★★★
+
                 # キャッシュが有効でファイルが存在しない場合は、遅延キャッシュを作成
                 if self.using_cache and self.cache_files_exist:
                     cache_path = self._get_cache_path(current_idx)
                     if not os.path.exists(cache_path):
-                        torch.save((image, label), cache_path)
-                
-                return image, label
-                
+                        # ★ loss_mask も一緒に保存 ★
+                        torch.save((image, label, loss_mask), cache_path)
+
+                return image, label, loss_mask # ★ loss_mask を返す
+
             except (Image.UnidentifiedImageError, OSError, IOError) as e:
-                # 画像が読み込めない場合のエラーログ
                 print(f"Warning: 画像の読み込みに失敗しました: {img_path}, エラー: {str(e)}")
-                
-                # 次のインデックスを試す
                 current_idx = (current_idx + 1) % len(self)
-        
-        # すべての再試行が失敗した場合、ダミーデータを返す
+
         print(f"Error: {max_retries}回の再試行後も画像を読み込めませんでした。ダミーデータを返します。")
-        dummy_image = torch.zeros(3, 224, 224)  # モデルの入力サイズに合わせて調整
+        dummy_image = torch.zeros(3, model.img_size[0], model.img_size[1]) # モデルサイズに合わせる
         dummy_target = torch.zeros(len(self.tag_to_idx))
-        
-        return dummy_image, dummy_target
+        dummy_mask = torch.ones(len(self.tag_to_idx)) # ★ ダミーマスクも返す ★
+        return dummy_image, dummy_target, dummy_mask
 
 
 # データセットの準備関数
@@ -2384,12 +2420,13 @@ class AsymmetricLossOptimized(nn.Module):
         # prevent memory allocation and gpu uploading every iteration, and encourages inplace operations
         self.targets = self.anti_targets = self.xs_pos = self.xs_neg = self.asymmetric_w = self.loss = None
 
-    def forward(self, x, y):
+    def forward(self, x, y, loss_mask=None): # ★ loss_mask 引数を追加 (デフォルトNone)
         """"
         Parameters
         ----------
         x: input logits
         y: targets (multi-label binarized vector)
+        loss_mask: Optional tensor to mask loss per element ★追加★
         """
 
         self.targets = y
@@ -2423,9 +2460,16 @@ class AsymmetricLossOptimized(nn.Module):
             
             self.loss *= self.asymmetric_w
 
-        # バッチ単位で平均を取る（サンプル数で割る）
-        # ★ Apply reduction based on the parameter ★
+        # ★ Apply loss mask if provided ★
+        if loss_mask is not None:
+            self.loss = self.loss * loss_mask
+
+        # Apply reduction based on the parameter
         if self.reduction == 'mean':
+            # ★ マスク適用後の要素数を考慮して平均を取る場合 (オプション)
+            # masked_elements = loss_mask.sum() if loss_mask is not None else self.loss.numel()
+            # return -self.loss.sum() / masked_elements.clamp(min=1.0)
+            # ★ シンプルに全体の平均を取る場合 (マスクされた要素は0として平均に寄与)
             return -self.loss.mean()
         elif self.reduction == 'sum':
             return -self.loss.sum()
@@ -2466,15 +2510,25 @@ class SampleWeightedLossWrapper(nn.Module):
         if not (0.0 <= min_weight <= 1.0):
             raise ValueError(f"min_weight must be between 0.0 and 1.0, got {min_weight}")
 
-    def forward(self, x, y):
+    def forward(self, x, y, loss_mask=None): # ★ loss_mask 引数を追加
         """
         Args:
             x: input logits
             y: targets (multi-label binarized vector)
+            loss_mask: Optional tensor to mask loss per element ★追加★
         """
         # 1. Calculate per-element loss using the base criterion
-        # Ensure base_criterion returns per-element loss (positive)
-        per_element_loss = self.base_criterion(x, y) # Shape: [batch_size, num_classes]
+        # Ensure base_criterion can accept loss_mask and has reduction='none'
+        try:
+             # ★ 基底損失関数に loss_mask を渡す ★
+            per_element_loss = self.base_criterion(x, y, loss_mask=loss_mask)
+        except TypeError:
+             # 基底損失が loss_mask を受け付けない場合 (古いASLなど)
+             print("Warning: Base criterion does not accept loss_mask. Applying mask after base loss calculation.")
+             per_element_loss = self.base_criterion(x, y) # reduction='none'前提
+             if loss_mask is not None:
+                 per_element_loss = per_element_loss * loss_mask
+
 
         # 2. Calculate sample weights based on prediction probabilities
         with torch.no_grad(): # Weight calculation should not affect gradients
@@ -2483,14 +2537,29 @@ class SampleWeightedLossWrapper(nn.Module):
             if self.sample_weighting_type == 'variance_mean_penalty':
                 sample_mean_probs = probs.mean(dim=1) # Shape: [batch_size]
                 sample_var_probs = probs.var(dim=1)   # Shape: [batch_size]
-                learning_level = (1.0 - sample_var_probs - 4.0 * (sample_mean_probs - 0.5)**2).clamp(0.0, 1.0)
+                # 学習度合いの計算 (分散が大きいほど、平均が0.5から遠いほど未学習)
+                # learning_level: 0 (未学習) -> 1 (学習済み)
+                # 4.0 * (m-0.5)^2 は 0 (m=0.5) から 1 (m=0 or m=1) の範囲
+                # variance は 0 (全予測同一) から 0.25 (全予測0.5) の範囲
+                # (1 - var - penalty) は 学習済み(var->0, pen->1)で 0 に、未学習(var->0.25, pen->0)で 0.75に近づく?
+                # ちょっと指標として微妙かも？ varianceが大きいほど学習が進んでいないはず。
+                # varianceが大きい -> 多くの予測が0.5に近い -> 未学習
+                # varianceが小さい -> 多くの予測が0か1に近い -> 学習済み
+                # penaltyが大きい -> 平均が0.5から遠い -> 学習済み？ (これは微妙)
+                # 指標案修正: (1 - sample_var_probs) -> variance が小さいほど 1 に近づく
+                learning_level = (1.0 - sample_var_probs.clamp(0.0, 0.25) / 0.25) # 0(未学習) ~ 1(学習済み) スケールに正規化
             else:
                 learning_level = torch.zeros_like(probs.mean(dim=1)) # Default to no weighting
 
+            # 重み: 未学習(level=0) -> 1.0, 学習済み(level=1) -> min_weight
             sample_weights = 1.0 - learning_level * (1.0 - self.min_weight) # Shape: [batch_size]
             sample_weights = torch.nan_to_num(sample_weights, nan=1.0) # Handle potential NaNs
 
-        # 3. Calculate mean loss per sample
+        # 3. Calculate mean loss per sample (using the potentially masked loss)
+        # ★ マスク適用済みの要素ごとの損失を使う ★
+        # per_element_loss は既にマスクされているか、ここでマスクを適用
+        # (base_criterionがmaskを受け付けない場合を考慮し、ここで適用するのが安全か？)
+        # いや、base_criterion='none'なら要素ごと損失は返るので、上でマスクした方が良い。
         sample_mean_loss = per_element_loss.mean(dim=1) # Shape: [batch_size]
 
         # 4. Apply sample weights
@@ -2905,17 +2974,20 @@ def train_model(
     
     with torch.no_grad():
         progress_bar = tqdm(val_loader, desc=f"Initial Validation")
-        for i, (images, targets) in enumerate(progress_bar):
+        for i, (images, targets, loss_masks) in enumerate(progress_bar):
             images = images.to(device)
             targets = targets.to(device)
+            loss_masks = loss_masks.to(device) # ★ マスクもデバイスへ ★
             
             if mixed_precision:
                 with torch.amp.autocast('cuda'):
                     outputs = model(images)
-                    loss = criterion(outputs, targets)
+                    # ★ 損失関数に loss_masks を渡す ★
+                    loss = criterion(outputs, targets, loss_mask=loss_masks)
             else:
                 outputs = model(images)
-                loss = criterion(outputs, targets)
+                # ★ 損失関数に loss_masks を渡す ★
+                loss = criterion(outputs, targets, loss_mask=loss_masks)
             
             val_loss += loss.item()
             
@@ -3051,7 +3123,6 @@ def train_model(
             print("ZClipによる勾配クリッピングを有効化しました。")
         else:
             print("警告: --use_zclipが指定されましたが、zclip.pyが見つからないためZClipは使用されません。")
-
     try:
         # トレーニングループ
         for epoch in range(num_epochs):
@@ -3064,16 +3135,19 @@ def train_model(
             train_targets = []
             
             progress_bar = tqdm(train_loader, desc=f"Training")
-            for i, (images, targets) in enumerate(progress_bar):
+            # ★ データローダーから loss_mask を受け取る ★
+            for i, (images, targets, loss_masks) in enumerate(progress_bar):
                 global_step += 1
                 images = images.to(device)
                 targets = targets.to(device)
+                loss_masks = loss_masks.to(device) # ★ マスクもデバイスへ ★
                 
                 # 通常のデータでの学習
                 if mixed_precision:
                     with torch.amp.autocast('cuda'):
                         outputs = model(images)
-                        loss = criterion(outputs, targets)
+                        # ★ 損失関数に loss_masks を渡す ★
+                        loss = criterion(outputs, targets, loss_mask=loss_masks)
 
                     scaler.scale(loss).backward()
                     if zclip:
@@ -3083,7 +3157,8 @@ def train_model(
                     optimizer.zero_grad()
                 else:
                     outputs = model(images)
-                    loss = criterion(outputs, targets)
+                    # ★ 損失関数に loss_masks を渡す ★
+                    loss = criterion(outputs, targets, loss_mask=loss_masks)
 
                     loss.backward()
                     if zclip:
@@ -3094,18 +3169,21 @@ def train_model(
                 # 正則化データセットでの学習
                 if reg_loader is not None:
                     try:
-                        reg_images, reg_targets = next(reg_iter)
+                        # ★ reg_loader からも loss_mask を受け取る ★
+                        reg_images, reg_targets, reg_loss_masks = next(reg_iter)
                     except (StopIteration, NameError):
                         reg_iter = iter(reg_loader)
-                        reg_images, reg_targets = next(reg_iter)
+                        reg_images, reg_targets, reg_loss_masks = next(reg_iter)
 
                     reg_images = reg_images.to(device)
                     reg_targets = reg_targets.to(device)
+                    reg_loss_masks = reg_loss_masks.to(device) # ★ マスクもデバイスへ ★
 
                     if mixed_precision:
                         with torch.amp.autocast('cuda'):
                             reg_outputs = model(reg_images)
-                            reg_loss = criterion(reg_outputs, reg_targets)
+                            # ★ 損失関数に reg_loss_masks を渡す ★
+                            reg_loss = criterion(reg_outputs, reg_targets, loss_mask=reg_loss_masks)
 
                         scaler.scale(reg_loss).backward()
                         if zclip:
@@ -3115,7 +3193,8 @@ def train_model(
                         optimizer.zero_grad()
                     else:
                         reg_outputs = model(reg_images)
-                        reg_loss = criterion(reg_outputs, reg_targets)
+                        # ★ 損失関数に reg_loss_masks を渡す ★
+                        reg_loss = criterion(reg_outputs, reg_targets, loss_mask=reg_loss_masks)
 
                         reg_loss.backward()
                         if zclip:
@@ -3207,17 +3286,21 @@ def train_model(
             
             with torch.no_grad():
                 progress_bar = tqdm(val_loader, desc=f"Validation")
-                for i, (images, targets) in enumerate(progress_bar):
+                # ★ データローダーから loss_mask を受け取る ★
+                for i, (images, targets, loss_masks) in enumerate(progress_bar):
                     images = images.to(device)
                     targets = targets.to(device)
+                    loss_masks = loss_masks.to(device) # ★ マスクもデバイスへ ★
                     
                     if mixed_precision:
                         with torch.amp.autocast('cuda'):
                             outputs = model(images)
-                            loss = criterion(outputs, targets)
+                            # ★ 損失関数に loss_masks を渡す ★
+                            loss = criterion(outputs, targets, loss_mask=loss_masks)
                     else:
                         outputs = model(images)
-                        loss = criterion(outputs, targets)
+                        # ★ 損失関数に loss_masks を渡す ★
+                        loss = criterion(outputs, targets, loss_mask=loss_masks)
                     
                     val_loss += loss.item()
                     
@@ -3806,14 +3889,33 @@ def main():
         else:
              print("LoRAがすでに適用されています。")
 
-
         model = model.to(device)
+
+        tag_to_category = load_tag_categories()
+        # model.tag_to_idx に存在するタグのみを tag_to_category に含める
+        valid_tag_to_category = {tag: category for tag, category in tag_to_category.items()
+                          if tag in model.tag_to_idx}
+        # 不足しているタグがあればGeneralとして追加
+        for tag_idx, tag in model.idx_to_tag.items():
+            if tag not in valid_tag_to_category:
+                 valid_tag_to_category[tag] = 'General'
+        # Ratingタグを強制的に上書き
+        for rating_tag in ['general', 'sensitive', 'questionable', 'explicit']:
+             if rating_tag in model.tag_to_idx: # モデルに存在する場合のみ上書き
+                 valid_tag_to_category[rating_tag] = 'Rating'
+        # Qualityタグを強制的に上書き
+        for quality_tag in ['best_quality', 'high_quality', 'normal_quality', 'medium_quality', 'low_quality', 'bad_quality', 'worst_quality']:
+            if quality_tag in model.tag_to_idx: # モデルに存在する場合のみ上書き
+                valid_tag_to_category[quality_tag] = 'Quality'
+        # model の tag_to_category を更新
+        model.tag_to_category = valid_tag_to_category
 
         # データセットの作成
         train_dataset = TagImageDataset(
             image_paths=train_image_paths,
             tags_list=train_tags_list,
             tag_to_idx=model.tag_to_idx,
+            tag_to_category=model.tag_to_category,
             transform=model.transform,
             cache_dir=None if args.cache_dir is None else os.path.join(args.cache_dir, 'train'),  # トレーニング用キャッシュディレクトリ
             force_recache=False,  # キャッシュを強制的に再作成するフラグ
@@ -3823,6 +3925,7 @@ def main():
             image_paths=val_image_paths,
             tags_list=val_tags_list,
             tag_to_idx=model.tag_to_idx,
+            tag_to_category=model.tag_to_category,
             transform=model.transform,
             cache_dir=None if args.cache_dir is None else os.path.join(args.cache_dir, 'val'),  # 検証用キャッシュディレクトリ
             force_recache=False,  # キャッシュを強制的に再作成するフラグ
@@ -3833,6 +3936,7 @@ def main():
                 image_paths=reg_image_paths,
                 tags_list=reg_tags_list,
                 tag_to_idx=model.tag_to_idx,
+                tag_to_category=model.tag_to_category,
                 transform=model.transform,
                 cache_dir=None if args.cache_dir is None else os.path.join(args.cache_dir, 'reg'),  # 正則化用キャッシュディレクトリ
                 force_recache=False,  # キャッシュを強制的に再作成するフラグ
@@ -3938,26 +4042,6 @@ def main():
                 print(f"TensorBoardを起動しました: http://localhost:{args.tensorboard_port}")
             except Exception as e:
                 print(f"TensorBoardの起動に失敗しました: {e}")
-
-        tag_to_category = load_tag_categories()
-        # model.tag_to_idx に存在するタグのみを tag_to_category に含める
-        valid_tag_to_category = {tag: category for tag, category in tag_to_category.items()
-                          if tag in model.tag_to_idx}
-        # 不足しているタグがあればGeneralとして追加
-        for tag_idx, tag in model.idx_to_tag.items():
-            if tag not in valid_tag_to_category:
-                 valid_tag_to_category[tag] = 'General'
-        # Ratingタグを強制的に上書き
-        for rating_tag in ['general', 'sensitive', 'questionable', 'explicit']:
-             if rating_tag in model.tag_to_idx: # モデルに存在する場合のみ上書き
-                 valid_tag_to_category[rating_tag] = 'Rating'
-        # Qualityタグを強制的に上書き
-        for quality_tag in ['best_quality', 'high_quality', 'normal_quality', 'medium_quality', 'low_quality', 'bad_quality', 'worst_quality']:
-            if quality_tag in model.tag_to_idx: # モデルに存在する場合のみ上書き
-                valid_tag_to_category[quality_tag] = 'Quality'
-        # model の tag_to_category を更新
-        model.tag_to_category = valid_tag_to_category
-
 
         # トレーニングの実行
         print("トレーニングを開始します...")
