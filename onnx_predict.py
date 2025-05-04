@@ -628,14 +628,9 @@ def save_tags_as_csv(predictions, # これは閾値などでフィルタリン�
                          np.exp(x) / (1 + np.exp(x))
                      )
                 # 渡された配列が確率かロジットかに関わらず、ここで確率に変換する
-                # all_probs_or_logits が多次元の場合も考慮(batch predictから呼ばれる場合)
-                # ここでは single predict/video predict から呼ばれる前提で squeeze するか、
-                # 呼び出し元で確実に 1D 配列を渡すようにする。
-                # 今回は呼び出し元で 1D になっている前提とする。
                 if all_probs_or_logits.ndim > 1:
                      print(f"Warning: Received multi-dimensional array ({all_probs_or_logits.shape}) in save_tags_as_csv. Assuming first dimension.")
                      # 必要に応じて適切な処理を追加 (例: all_probs_or_logits = all_probs_or_logits[0])
-                     # ここでは単純化のため、1D配列が来ると仮定
 
                 # 値が0-1の範囲外なら sigmoid を適用 (簡易的な判定)
                 if np.any(all_probs_or_logits < -0.1) or np.any(all_probs_or_logits > 1.1):
@@ -645,44 +640,75 @@ def save_tags_as_csv(predictions, # これは閾値などでフィルタリン�
                     all_probs_calculated = all_probs_or_logits # 既に確率だと仮定
 
                 for tag in existing_tags_raw:
-                    tag_index = name_to_idx.get(tag)
+                    # ★ タグの正規化をしてからインデックスを検索
+                    normalized_tag = normalize_tag(tag)
+                    tag_index = name_to_idx.get(normalized_tag) # ★ 正規化後のタグで検索
 
                     if tag_index is not None and tag_index < len(all_probs_calculated):
                         # ★★★ 再計算した確率を使用 ★★★
                         current_prob = all_probs_calculated[tag_index]
                         if current_prob >= remove_threshold:
-                            filtered_existing_tags.append(tag)
+                            filtered_existing_tags.append(tag) # ★ 元のタグ名を追加
                             kept_tags_info.append((tag, current_prob))
                         else:
                             removed_tags_info.append((tag, current_prob))
                     else:
-                        filtered_existing_tags.append(tag)
+                        # モデルの語彙にない既存タグはそのまま保持
+                        filtered_existing_tags.append(tag) # ★ 元のタグ名を追加
                         kept_tags_info.append((tag, None))
 
                 # --- デバッグ出力 ---
                 if kept_tags_info:
                     kept_tags_info.sort(key=lambda x: x[1] if x[1] is not None else -1, reverse=True)
-                    print(f"Kept {len(kept_tags_info)} existing tags (either >= {remove_threshold} or not in model vocab): " + " ".join([f"{tag}({prob:.3f})" if prob is not None else f"{tag}(Not in Vocab)" for tag, prob in kept_tags_info[:5]]) + (f" ...and {len(kept_tags_info) - 5} more." if len(kept_tags_info) > 5 else ""))
+                    print(f"Kept {len(kept_tags_info)} existing tags (either >= {remove_threshold} or not in model vocab): " + " ".join([f"{standardize_tag_format(tag)}({prob:.3f})" if prob is not None else f"{standardize_tag_format(tag)}(Not in Vocab)" for tag, prob in kept_tags_info[:5]]) + (f" ...and {len(kept_tags_info) - 5} more." if len(kept_tags_info) > 5 else ""))
 
                 if removed_tags_info:
                     removed_tags_info.sort(key=lambda x: x[1])
-                    print(f"Removing {len(removed_tags_info)} existing tags below remove_threshold {remove_threshold}: " + " ".join([f"{tag}({prob:.3f})" for tag, prob in removed_tags_info[:10]]) + (f" ...and {len(removed_tags_info) - 10} more." if len(removed_tags_info) > 10 else ""))
+                    print(f"Removing {len(removed_tags_info)} existing tags below remove_threshold {remove_threshold}: " + " ".join([f"{standardize_tag_format(tag)}({prob:.3f})" for tag, prob in removed_tags_info[:10]]) + (f" ...and {len(removed_tags_info) - 10} more." if len(removed_tags_info) > 10 else ""))
                 else:
                     print("No existing tags removed by remove_threshold.")
                 # --- デバッグ出力ここまで ---
 
                 final_tags = filtered_existing_tags # フィルタリング後のタグを初期リストとする
             else:
-                 final_tags = existing_tags_raw # remove しない場合はそのまま
+                 # remove しない場合はそのまま (raw = 読み込んだそのままのタグリスト)
+                 final_tags = existing_tags_raw
 
-            # 3. 新規タグの追加 (重複排除)
-            normalized_final_tags = {normalize_tag(tag) for tag in final_tags} # 重複チェック用セット
+            # 3. 新規タグの追加 (重複排除 + Rating/Quality重複チェック)
+            # ★ 重複チェック用のセットは正規化されたタグ名で作成
+            normalized_final_tags = {normalize_tag(tag) for tag in final_tags}
+
+            # ★★★ 既存タグにRating/Qualityがあるかチェック (正規化してカテゴリ判定) ★★★
+            existing_has_rating = any(tag_to_category.get(normalize_tag(tag)) == 'Rating' for tag in final_tags)
+            existing_has_quality = any(tag_to_category.get(normalize_tag(tag)) == 'Quality' for tag in final_tags)
+
             unique_new_tags_added = []
+            skipped_rating_quality_count = 0 # ★ スキップカウント用
             for tag in predicted_tags_to_save: # skip適用済みのリスト
+                # ★ 追加するタグも正規化してチェック
                 normalized_tag = normalize_tag(tag)
                 if normalized_tag not in normalized_final_tags:
-                    unique_new_tags_added.append(tag)
-                    normalized_final_tags.add(normalized_tag) # セットも更新
+                    # ★★★ Rating/Quality タグの追加条件チェック ★★★
+                    # カテゴリ判定は正規化後のタグで行う
+                    tag_category = tag_to_category.get(normalized_tag)
+
+                    # remove_threshold が None の場合のみ、この追加制限を適用
+                    if remove_threshold is None:
+                        if tag_category == 'Rating' and existing_has_rating:
+                            # 既存ファイルにRatingタグがあり、追加しようとしているのもRatingタグならスキップ
+                            skipped_rating_quality_count += 1
+                            continue # ★ 次の予測タグへ
+                        if tag_category == 'Quality' and existing_has_quality:
+                            # 既存ファイルにQualityタグがあり、追加しようとしているのもQualityタグならスキップ
+                            skipped_rating_quality_count += 1
+                            continue # ★ 次の予測タグへ
+
+                    # 上記条件に当てはまらない場合、または remove_threshold が設定されている場合は追加
+                    unique_new_tags_added.append(tag) # ★ 元のタグ名を追加
+                    normalized_final_tags.add(normalized_tag) # セットも更新 (正規化済み)
+
+            if skipped_rating_quality_count > 0:
+                 print(f"Skipped adding {skipped_rating_quality_count} Rating/Quality tag(s) because tags from the same category already exist in the file and remove_threshold is not set.") # ★ スキップ情報をログ出力
 
             print(f"Adding {len(unique_new_tags_added)} new unique tags.")
             final_tags.extend(unique_new_tags_added)
