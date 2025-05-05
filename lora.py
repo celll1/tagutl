@@ -3111,6 +3111,9 @@ def train_model(
             print("警告: --use_zclipが指定されましたが、zclip.pyが見つからないためZClipは使用されません。")
             use_zclip = False # Disable zclip if not available
 
+    # Add a very large number for max_norm when not clipping
+    infinity_norm = float('inf')
+
     try:
         # トレーニングループ
         for epoch in range(num_epochs):
@@ -3131,6 +3134,7 @@ def train_model(
                 loss_masks = loss_masks.to(device) # ★ マスクもデバイスへ ★
                 
                 clipped_grad_norm = None # Initialize clipped_grad_norm
+                unclipped_grad_norm = None # Initialize unclipped_grad_norm
 
                 # 通常のデータでの学習
                 if mixed_precision:
@@ -3140,8 +3144,19 @@ def train_model(
                         loss = criterion(outputs, targets, loss_mask=loss_masks)
 
                     scaler.scale(loss).backward()
+
+                    # Unscale gradients before clipping/norm calculation if using scaler
+                    scaler.unscale_(optimizer)
+
                     if zclip:
                         clipped_grad_norm = zclip.step(model) # 勾配クリッピングを適用し、クリップ後のノルムを取得
+                    else:
+                        # Calculate norm without applying zclip clipping
+                        unclipped_grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=infinity_norm)
+                        # Convert to float if it's a tensor
+                        if isinstance(unclipped_grad_norm, torch.Tensor):
+                            unclipped_grad_norm = unclipped_grad_norm.item()
+
                     scaler.step(optimizer)
                     scaler.update()
                     optimizer.zero_grad()
@@ -3151,8 +3166,16 @@ def train_model(
                     loss = criterion(outputs, targets, loss_mask=loss_masks)
 
                     loss.backward()
+
                     if zclip:
                         clipped_grad_norm = zclip.step(model) # 勾配クリッピングを適用し、クリップ後のノルムを取得
+                    else:
+                         # Calculate norm without applying zclip clipping
+                        unclipped_grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=infinity_norm)
+                         # Convert to float if it's a tensor
+                        if isinstance(unclipped_grad_norm, torch.Tensor):
+                            unclipped_grad_norm = unclipped_grad_norm.item()
+
                     optimizer.step()
                     optimizer.zero_grad()
 
@@ -3170,6 +3193,7 @@ def train_model(
                     reg_loss_masks = reg_loss_masks.to(device) # ★ マスクもデバイスへ ★
 
                     reg_clipped_grad_norm = None # Initialize for reg data
+                    reg_unclipped_grad_norm = None # Initialize for reg data
 
                     if mixed_precision:
                         with torch.amp.autocast('cuda'):
@@ -3178,8 +3202,19 @@ def train_model(
                             reg_loss = criterion(reg_outputs, reg_targets, loss_mask=reg_loss_masks)
 
                         scaler.scale(reg_loss).backward()
+
+                        # Unscale gradients before clipping/norm calculation if using scaler
+                        scaler.unscale_(optimizer)
+
                         if zclip:
                             reg_clipped_grad_norm = zclip.step(model) # 正則化データの勾配にも適用
+                        else:
+                            # Calculate norm without applying zclip clipping for reg data
+                            reg_unclipped_grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=infinity_norm)
+                            if isinstance(reg_unclipped_grad_norm, torch.Tensor):
+                                reg_unclipped_grad_norm = reg_unclipped_grad_norm.item()
+
+
                         scaler.step(optimizer)
                         scaler.update()
                         optimizer.zero_grad()
@@ -3189,8 +3224,16 @@ def train_model(
                         reg_loss = criterion(reg_outputs, reg_targets, loss_mask=reg_loss_masks)
 
                         reg_loss.backward()
+
                         if zclip:
                             reg_clipped_grad_norm = zclip.step(model) # 正則化データの勾配にも適用
+                        else:
+                            # Calculate norm without applying zclip clipping for reg data
+                            reg_unclipped_grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=infinity_norm)
+                            if isinstance(reg_unclipped_grad_norm, torch.Tensor):
+                                reg_unclipped_grad_norm = reg_unclipped_grad_norm.item()
+
+
                         optimizer.step()
                         optimizer.zero_grad()
 
@@ -3200,6 +3243,13 @@ def train_model(
                         clipped_grad_norm = (clipped_grad_norm + reg_clipped_grad_norm) / 2
                     elif reg_clipped_grad_norm is not None:
                          clipped_grad_norm = reg_clipped_grad_norm
+
+                    # Average unclipped norms if both exist
+                    if unclipped_grad_norm is not None and reg_unclipped_grad_norm is not None:
+                        unclipped_grad_norm = (unclipped_grad_norm + reg_unclipped_grad_norm) / 2
+                    elif reg_unclipped_grad_norm is not None:
+                         unclipped_grad_norm = reg_unclipped_grad_norm
+
 
                 train_loss += loss.item()
 
@@ -3216,9 +3266,12 @@ def train_model(
                     # stepごとのlossを記録
                     writer.add_scalar('Train/Step_Loss', loss.item(), global_step) # Use global_step
 
-                    # クリップ後の勾配ノルムを記録 (zclipが有効な場合)
+                    # 勾配ノルムを記録
                     if use_zclip and clipped_grad_norm is not None:
                         writer.add_scalar('Train/Clipped_Grad_Norm', clipped_grad_norm, global_step) # Use global_step
+                    elif not use_zclip and unclipped_grad_norm is not None: # zclip OFF かつノルム計算済み
+                        writer.add_scalar('Train/Unclipped_Grad_Norm', unclipped_grad_norm, global_step)
+
 
                     if i % 100 == 0:
                         img_grid = visualize_predictions_for_tensorboard(
@@ -3233,7 +3286,7 @@ def train_model(
                             neg_counts=neg_stats['counts']  # 陰性群のサンプル数を追加
                         )
                         # Use global_step for image logging as well
-                        writer.add_image(f'predictions/train_step_{global_step}', img_grid, global_step)
+                        writer.add_image(f'predictions/train_step', img_grid, global_step)
 
                 if global_step == head_only_train_steps:
                     tqdm.write("ヘッド部分の訓練を終了します")
