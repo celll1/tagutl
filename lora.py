@@ -2506,7 +2506,7 @@ class SampleWeightedLossWrapper(nn.Module):
         self.min_weight = min_weight
 
         if sample_weighting_type not in ['variance_mean_penalty']:
-             raise ValueError(f"Unsupported sample_weighting_type: {sample_weighting_type}")
+            raise ValueError(f"Unsupported sample_weighting_type: {sample_weighting_type}")
         if not (0.0 <= min_weight <= 1.0):
             raise ValueError(f"min_weight must be between 0.0 and 1.0, got {min_weight}")
 
@@ -2537,17 +2537,7 @@ class SampleWeightedLossWrapper(nn.Module):
             if self.sample_weighting_type == 'variance_mean_penalty':
                 sample_mean_probs = probs.mean(dim=1) # Shape: [batch_size]
                 sample_var_probs = probs.var(dim=1)   # Shape: [batch_size]
-                # 学習度合いの計算 (分散が大きいほど、平均が0.5から遠いほど未学習)
-                # learning_level: 0 (未学習) -> 1 (学習済み)
-                # 4.0 * (m-0.5)^2 は 0 (m=0.5) から 1 (m=0 or m=1) の範囲
-                # variance は 0 (全予測同一) から 0.25 (全予測0.5) の範囲
-                # (1 - var - penalty) は 学習済み(var->0, pen->1)で 0 に、未学習(var->0.25, pen->0)で 0.75に近づく?
-                # ちょっと指標として微妙かも？ varianceが大きいほど学習が進んでいないはず。
-                # varianceが大きい -> 多くの予測が0.5に近い -> 未学習
-                # varianceが小さい -> 多くの予測が0か1に近い -> 学習済み
-                # penaltyが大きい -> 平均が0.5から遠い -> 学習済み？ (これは微妙)
-                # 指標案修正: (1 - sample_var_probs) -> variance が小さいほど 1 に近づく
-                learning_level = (1.0 - sample_var_probs.clamp(0.0, 0.25) / 0.25) # 0(未学習) ~ 1(学習済み) スケールに正規化
+                learning_level = (1.0 - sample_var_probs - 4.0 * (sample_mean_probs - 0.5)**2).clamp(0.0, 1.0)
             else:
                 learning_level = torch.zeros_like(probs.mean(dim=1)) # Default to no weighting
 
@@ -2556,10 +2546,6 @@ class SampleWeightedLossWrapper(nn.Module):
             sample_weights = torch.nan_to_num(sample_weights, nan=1.0) # Handle potential NaNs
 
         # 3. Calculate mean loss per sample (using the potentially masked loss)
-        # ★ マスク適用済みの要素ごとの損失を使う ★
-        # per_element_loss は既にマスクされているか、ここでマスクを適用
-        # (base_criterionがmaskを受け付けない場合を考慮し、ここで適用するのが安全か？)
-        # いや、base_criterion='none'なら要素ごと損失は返るので、上でマスクした方が良い。
         sample_mean_loss = per_element_loss.mean(dim=1) # Shape: [batch_size]
 
         # 4. Apply sample weights
@@ -3123,6 +3109,8 @@ def train_model(
             print("ZClipによる勾配クリッピングを有効化しました。")
         else:
             print("警告: --use_zclipが指定されましたが、zclip.pyが見つからないためZClipは使用されません。")
+            use_zclip = False # Disable zclip if not available
+
     try:
         # トレーニングループ
         for epoch in range(num_epochs):
@@ -3142,6 +3130,8 @@ def train_model(
                 targets = targets.to(device)
                 loss_masks = loss_masks.to(device) # ★ マスクもデバイスへ ★
                 
+                clipped_grad_norm = None # Initialize clipped_grad_norm
+
                 # 通常のデータでの学習
                 if mixed_precision:
                     with torch.amp.autocast('cuda'):
@@ -3151,7 +3141,7 @@ def train_model(
 
                     scaler.scale(loss).backward()
                     if zclip:
-                        zclip.step(model) # 勾配クリッピングを適用
+                        clipped_grad_norm = zclip.step(model) # 勾配クリッピングを適用し、クリップ後のノルムを取得
                     scaler.step(optimizer)
                     scaler.update()
                     optimizer.zero_grad()
@@ -3162,7 +3152,7 @@ def train_model(
 
                     loss.backward()
                     if zclip:
-                        zclip.step(model) # 勾配クリッピングを適用
+                        clipped_grad_norm = zclip.step(model) # 勾配クリッピングを適用し、クリップ後のノルムを取得
                     optimizer.step()
                     optimizer.zero_grad()
 
@@ -3179,6 +3169,8 @@ def train_model(
                     reg_targets = reg_targets.to(device)
                     reg_loss_masks = reg_loss_masks.to(device) # ★ マスクもデバイスへ ★
 
+                    reg_clipped_grad_norm = None # Initialize for reg data
+
                     if mixed_precision:
                         with torch.amp.autocast('cuda'):
                             reg_outputs = model(reg_images)
@@ -3187,7 +3179,7 @@ def train_model(
 
                         scaler.scale(reg_loss).backward()
                         if zclip:
-                            zclip.step(model) # 勾配クリッピングを適用
+                            reg_clipped_grad_norm = zclip.step(model) # 正則化データの勾配にも適用
                         scaler.step(optimizer)
                         scaler.update()
                         optimizer.zero_grad()
@@ -3198,11 +3190,16 @@ def train_model(
 
                         reg_loss.backward()
                         if zclip:
-                            zclip.step(model) # 勾配クリッピングを適用
+                            reg_clipped_grad_norm = zclip.step(model) # 正則化データの勾配にも適用
                         optimizer.step()
                         optimizer.zero_grad()
 
                     loss = (loss + reg_loss) / 2
+                    # Average clipped norms if both exist
+                    if clipped_grad_norm is not None and reg_clipped_grad_norm is not None:
+                        clipped_grad_norm = (clipped_grad_norm + reg_clipped_grad_norm) / 2
+                    elif reg_clipped_grad_norm is not None:
+                         clipped_grad_norm = reg_clipped_grad_norm
 
                 train_loss += loss.item()
 
@@ -3217,7 +3214,11 @@ def train_model(
                 # 定期的にTensorBoardに予測結果を記録
                 if tensorboard:
                     # stepごとのlossを記録
-                    writer.add_scalar('Train/Step_Loss', loss.item(), epoch * len(train_loader) + i)
+                    writer.add_scalar('Train/Step_Loss', loss.item(), global_step) # Use global_step
+
+                    # クリップ後の勾配ノルムを記録 (zclipが有効な場合)
+                    if use_zclip and clipped_grad_norm is not None:
+                        writer.add_scalar('Train/Clipped_Grad_Norm', clipped_grad_norm, global_step) # Use global_step
 
                     if i % 100 == 0:
                         img_grid = visualize_predictions_for_tensorboard(
@@ -3231,7 +3232,8 @@ def train_model(
                             neg_variance=neg_stats['variance'],  # 陰性群の分散を追加
                             neg_counts=neg_stats['counts']  # 陰性群のサンプル数を追加
                         )
-                        writer.add_image(f'predictions/train_epoch_{epoch}', img_grid, i)
+                        # Use global_step for image logging as well
+                        writer.add_image(f'predictions/train_step_{global_step}', img_grid, global_step)
 
                 if global_step == head_only_train_steps:
                     tqdm.write("ヘッド部分の訓練を終了します")

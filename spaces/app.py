@@ -274,7 +274,8 @@ MODEL_OPTIONS = {
     "cl_eva02_tagger_v1_250427": "cl_eva02_tagger_v1_250427/model.onnx",
     "cl_eva02_tagger_v1_250430": "cl_eva02_tagger_v1_250430/model.onnx",
     "cl_eva02_tagger_v1_250502": "cl_eva02_tagger_v1_250503/model.onnx",
-    "cl_eva02_tagger_v1_250504": "cl_eva02_tagger_v1_250504/model.onnx"
+    "cl_eva02_tagger_v1_250504": "cl_eva02_tagger_v1_250504/model.onnx",
+    "cl_eva02_tagger_v1_250504t2": "cl_eva02_tagger_v1_250504t2/model.onnx"
 }
 DEFAULT_MODEL = "cl_eva02_tagger_v1_250504"
 CACHE_DIR = "./model_cache"
