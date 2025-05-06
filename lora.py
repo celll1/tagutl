@@ -3698,7 +3698,7 @@ def main():
     train_parser.add_argument('--gamma_pos', type=float, default=1, help='ASL: 正例のガンマ値')
     train_parser.add_argument('--clip', type=float, default=0.05, help='ASL: クリップ値')
     # ★サンプル重み付け用引数を追加★
-    train_parser.add_argument('--use_sample_weighting', action='store_true', default=True,
+    train_parser.add_argument('--use_sample_weighting', action='store_true', default=False,
                               help='サンプルごとの学習度合いに基づいて損失の重みを調整する機能を有効化')
     train_parser.add_argument('--sample_weighting_type', type=str, default='variance_mean_penalty',
                               choices=['variance_mean_penalty'],
