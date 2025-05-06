@@ -28,6 +28,7 @@ import torch
 from torch import Tensor, nn
 from torch.nn import functional as F
 from torchvision import transforms
+from torch.optim.lr_scheduler import LinearLR, CosineAnnealingLR, SequentialLR, ConstantLR
 import bitsandbytes as bnb
 from huggingface_hub import hf_hub_download
 from huggingface_hub.utils import HfHubHTTPError
@@ -2749,7 +2750,8 @@ def train_model(
     dynamic_threshold=True,
     head_only_train_steps=0,
     cache_dir=None,  # キャッシュディレクトリのパラメータを追加
-    use_zclip=False # zclipを使用するかどうかのフラグを追加
+    use_zclip=False, # zclipを使用するかどうかのフラグを追加
+    warmup_steps=0 # <-- 引数追加 (デフォルト 0)
 ):
     """モデルをトレーニングする関数"""
     # 出力ディレクトリの作成
@@ -2933,12 +2935,34 @@ def train_model(
     # オプティマイザの設定
     optimizer = setup_optimizer(model, learning_rate, weight_decay, optimizer_type) # ★引数変更★
     
-    # 学習率スケジューラの設定
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-        optimizer,
-        T_max=num_epochs
-    )
-    
+    # --- スケジューラ設定の変更 ---
+    def create_scheduler(optimizer, warmup_steps, total_steps, current_step=0):
+        """ウォームアップ付きCosineAnnealingLRスケジューラを作成する関数"""
+        effective_total_steps = max(1, total_steps - current_step) # 残りステップ数
+        effective_warmup_steps = min(warmup_steps, effective_total_steps) # ウォームアップは残りステップ数を超えない
+
+        if effective_warmup_steps > 0:
+            print(f"Setting up scheduler with {effective_warmup_steps} warmup steps and {effective_total_steps - effective_warmup_steps} cosine annealing steps.")
+            warmup_scheduler = LinearLR(optimizer, start_factor=1e-6, end_factor=1.0, total_iters=effective_warmup_steps)
+            main_scheduler = CosineAnnealingLR(optimizer, T_max=effective_total_steps - effective_warmup_steps, eta_min=1e-7) # ステップベース
+            scheduler = SequentialLR(optimizer, schedulers=[warmup_scheduler, main_scheduler], milestones=[effective_warmup_steps])
+        elif effective_total_steps > 0:
+             print(f"Setting up scheduler with CosineAnnealingLR for {effective_total_steps} steps (no warmup).")
+             scheduler = CosineAnnealingLR(optimizer, T_max=effective_total_steps, eta_min=1e-7) # ステップベース
+        else:
+             print("No steps remaining for scheduler. Using ConstantLR.")
+             scheduler = ConstantLR(optimizer, factor=1.0, total_iters=1) # ダミー
+        return scheduler
+
+    # 総ステップ数を計算
+    total_steps = len(train_loader) * num_epochs
+    print(f"Total training steps: {total_steps}")
+
+    # 初期スケジューラを作成
+    scheduler = create_scheduler(optimizer, warmup_steps, total_steps)
+    # --- スケジューラ設定の変更ここまで ---
+
+
     # 混合精度トレーニングのスケーラー
     scaler = torch.amp.GradScaler(device=device) if mixed_precision else None
     
@@ -3125,8 +3149,7 @@ def train_model(
             train_preds = []
             train_targets = []
             
-            progress_bar = tqdm(train_loader, desc=f"Training")
-            # ★ データローダーから loss_mask を受け取る ★
+            progress_bar = tqdm(train_loader, desc=f"Training Epoch {epoch+1}/{num_epochs}", leave=False)
             for i, (images, targets, loss_masks) in enumerate(progress_bar):
                 global_step += 1
                 images = images.to(device)
@@ -3466,18 +3489,22 @@ def train_model(
                 save_model(output_dir, f'checkpoint_epoch_{epoch+1}', base_model, save_format, model, optimizer, scheduler, epoch, threshold, val_loss, val_metrics['f1'], tag_to_idx, idx_to_tag, tag_to_category)
                 print(f"Checkpoint saved at epoch {epoch+1}")
 
-            if merge_every_n_epochs is not None and (epoch + 1) % merge_every_n_epochs == 0:
+            if merge_every_n_epochs is not None and (epoch + 1) % merge_every_n_epochs == 0 and (epoch + 1) < num_epochs: # 最後のEpochではリセット不要
+                print(f"\nEpoch {epoch+1}: Merging LoRA weights and resetting optimizer/scheduler...")
                 model.merge_lora_to_base_model(
                     scale=1.0,
-                    new_lora_rank=None,
-                    new_lora_alpha=None,
-                    new_lora_dropout=None
+                    new_lora_rank=model.lora_rank, # Use existing rank/alpha/dropout
+                    new_lora_alpha=model.lora_alpha,
+                    new_lora_dropout=model.lora_dropout
                 )
                 model.to(device)
-                # optimizer, schedulerをリセット
+                # optimizerをリセット
                 optimizer = setup_optimizer(model, learning_rate, weight_decay, optimizer_type)
-                # schedulerは通常、warmupをやり直すが、ここでは未実装
-                
+
+                # スケジューラをリセット (残りのステップで再作成)
+                scheduler = create_scheduler(optimizer, warmup_steps, total_steps, current_step=global_step)
+                print("Optimizer and Scheduler have been reset.")
+        
     except Exception as e:
         print(f"エラーが発生しました: {e}")
         # ★★★ 割り込み時やエラー時にもモデルを保存 ★★★
@@ -3645,6 +3672,8 @@ def main():
     train_parser.add_argument('--optimizer', type=str, default='adamw8bit',
                               choices=['adamw', 'adamw8bit', 'lion', 'lion8bit'],
                               help='使用するオプティマイザの種類') # ★追加★
+    train_parser.add_argument('--warmup_steps', type=int, default=0,
+                              help='学習率のウォームアップステップ数 (デフォルト: 0, ウォームアップなし)') # <-- 引数追加
     train_parser.add_argument('--use_zclip', action='store_true', help='ZClipによる勾配クリッピングを使用する') # ZClip引数を追加
 
     train_parser.add_argument('--tags_to_remove', type=str, default=None, help='削除するタグのファイルパス')
@@ -4127,8 +4156,9 @@ def main():
             initial_threshold=args.initial_threshold,
             dynamic_threshold=args.dynamic_threshold,
             head_only_train_steps=args.head_only_train_steps,
-            cache_dir=False, # args.cache_dir を渡す
-            use_zclip=args.use_zclip
+            cache_dir=args.cache_dir, # <-- cache_dir を渡すように修正 (以前はFalseになっていた)
+            use_zclip=args.use_zclip,
+            warmup_steps=args.warmup_steps # <-- 引数追加
         )
         print("トレーニングが完了しました！")
 
