@@ -3325,14 +3325,14 @@ def train_model(
                         # Use global_step for image logging as well
                         writer.add_image(f'predictions/train_step', img_grid, global_step)
 
+                # 学習率のスケジューリング
+                scheduler.step()
+                if tensorboard:
+                    writer.add_scalar('Train/Learning_Rate', optimizer.param_groups[0]['lr'], global_step)
+
                 if global_step == head_only_train_steps:
                     tqdm.write("ヘッド部分の訓練を終了します")
                     model.freeze_non_lora_parameters()
-            
-            # 学習率のスケジューリング
-            scheduler.step()
-            if tensorboard:
-                writer.add_scalar('Learning_Rate', optimizer.param_groups[0]['lr'], epoch)
             
             # トレーニングメトリクスの計算
             train_loss /= len(train_loader)
@@ -3721,6 +3721,7 @@ def main():
                               help='学習済みと判断されたサンプルの最小損失重み (0.0-1.0)')
 
     # その他のオプション
+    train_parser.add_argument('--tf32', action='store_true', help='tf32 matmulを使用する')
     train_parser.add_argument('--mixed_precision', action='store_true', help='混合精度トレーニングを使用する')
     train_parser.add_argument('--tensorboard', default=True, action='store_true', help='TensorBoardを使用する')
     train_parser.add_argument('--tensorboard_port', type=int, default=6006, help='TensorBoardのポート番号')
@@ -3912,8 +3913,12 @@ def main():
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         print(f"使用デバイス: {device}")
 
-        if args.sageattention and sageattention_available:
-            print("SageAttentionを使用します。")
+        if args.tf32:
+            print("tf32 matmulを使用します。mixed precisionは無効化されます。")
+            torch.backends.cuda.matmul.allow_tf32 = True
+            torch.backends.cudnn.allow_tf32 = True
+        else:
+            print("tf32 matmulを使用しません。")
 
         print(f"モデルを読み込んでいます...")
         model, labels = load_model(args.model_path, args.metadata_path, base_model=args.base_model, lora_rank=args.lora_rank, lora_alpha=args.lora_alpha, lora_dropout=args.lora_dropout, device=device, use_xformers=args.xformers, use_sageattention=args.sageattention, use_flashattention=args.flashattention)
