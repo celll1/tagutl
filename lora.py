@@ -3305,9 +3305,9 @@ def train_model(
 
                     # 勾配ノルムを記録
                     if use_zclip and clipped_grad_norm is not None:
-                        writer.add_scalar('Train/Clipped_Grad_Norm', clipped_grad_norm, global_step) # Use global_step
+                        writer.add_scalar('Train/Grad_Norm', clipped_grad_norm, global_step) # Use global_step
                     elif not use_zclip and unclipped_grad_norm is not None: # zclip OFF かつノルム計算済み
-                        writer.add_scalar('Train/Unclipped_Grad_Norm', unclipped_grad_norm, global_step)
+                        writer.add_scalar('Train/Grad_Norm', unclipped_grad_norm, global_step)
 
 
                     if i % 100 == 0:
