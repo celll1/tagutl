@@ -2222,6 +2222,7 @@ def prepare_dataset(
     main_tags_list = []
 
     for image_dir in tqdm(image_dirs, desc="メインディレクトリを処理中"):
+        valid_images_found = False  # ディレクトリごとに有効な画像が見つかったかを追跡
         for root, _, files in os.walk(image_dir):
             for file in files:
                 if file.lower().endswith(('.jpg', '.jpeg', '.png', '.webp')):
@@ -2235,8 +2236,13 @@ def prepare_dataset(
                         if tags:  # タグが存在する場合のみ追加
                             main_image_paths.append(image_path)
                             main_tags_list.append(tags)
+                            valid_images_found = True  # 有効な画像が見つかった
                     except Exception as e:
                         print(f"画像 {image_path} の処理中にエラーが発生: {e}")
+        
+        # ディレクトリ内に有効な画像が1枚も見つからなかった場合、例外を発生させる
+        if not valid_images_found:
+            raise Exception(f"ディレクトリ '{image_dir}' に有効な画像とタグのセットが見つかりませんでした。")
 
     print(f"メインデータセットの画像数: {len(main_image_paths)}")
 
@@ -2246,6 +2252,8 @@ def prepare_dataset(
 
     if reg_image_dirs:
         for image_dir in tqdm(reg_image_dirs, desc="正則化ディレクトリを処理中"):
+            valid_images_found = False  # ディレクトリごとに有効な画像が見つかったかを追跡
+            
             for root, _, files in os.walk(image_dir):
                 for file in files:
                     if file.lower().endswith(('.jpg', '.jpeg', '.png', '.webp')):
@@ -2259,8 +2267,13 @@ def prepare_dataset(
                             if tags:  # タグが存在する場合のみ追加
                                 reg_image_paths.append(image_path)
                                 reg_tags_list.append(tags)
+                                valid_images_found = True  # 有効な画像が見つかった
                         except Exception as e:
                             print(f"画像 {image_path} の処理中にエラーが発生: {e}")
+
+            # ディレクトリ内に有効な画像が1枚も見つからなかった場合、例外を発生させる
+            if not valid_images_found:
+                raise Exception(f"ディレクトリ '{image_dir}' に有効な画像とタグのセットが見つかりませんでした。")
 
         print(f"正則化データセットの画像数: {len(reg_image_paths)}")
 
@@ -3172,7 +3185,8 @@ def train_model(
                     scaler.unscale_(optimizer)
 
                     if zclip:
-                        clipped_grad_norm = zclip.step(model) # 勾配クリッピングを適用し、クリップ後のノルムを取得
+                        zclip.step(model) # 勾配クリッピングを適用し、クリップ後のノルムを取得
+                        clipped_grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=infinity_norm)
                     else:
                         # Calculate norm without applying zclip clipping
                         unclipped_grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=infinity_norm)
@@ -3698,7 +3712,7 @@ def main():
     train_parser.add_argument('--gamma_pos', type=float, default=1, help='ASL: 正例のガンマ値')
     train_parser.add_argument('--clip', type=float, default=0.05, help='ASL: クリップ値')
     # ★サンプル重み付け用引数を追加★
-    train_parser.add_argument('--use_sample_weighting', action='store_true', default=False,
+    train_parser.add_argument('--use_sample_weighting', action='store_true',
                               help='サンプルごとの学習度合いに基づいて損失の重みを調整する機能を有効化')
     train_parser.add_argument('--sample_weighting_type', type=str, default='variance_mean_penalty',
                               choices=['variance_mean_penalty'],
