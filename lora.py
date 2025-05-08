@@ -1047,48 +1047,30 @@ class EVA02WithModuleLoRA(nn.Module):
         merged_count = 0
         for name, module in tqdm(self.lora_layers.items(), desc="LoRAレイヤーのマージ", leave=True):
             if isinstance(module, LoRALinear):
-                # LoRAの計算: x @ (A @ B) * scale
-                # ベースの重みに A @ B * scale を加算
-
-                # debug(コメントを消さない)
-                # tqdm.write(f"マージ中のモジュール: {name}")
-
                 with torch.no_grad():
-                    # 行列のサイズを確認
-                    base_weight_shape = module.base_layer.weight.shape
-                    lora_a_shape = module.lora.lora_A.shape
-                    lora_b_shape = module.lora.lora_B.shape
+                    # LoRA A と B を取得
+                    lora_A = module.lora.lora_A
+                    lora_B = module.lora.lora_B
                     
-                    # debug(コメントを消さない)
-                    # tqdm.write(f"base_weight: {base_weight_shape}, lora_A: {lora_a_shape}, lora_B: {lora_b_shape}")
+                    # ベースレイヤーの重み形状 [out_features, in_features]
+                    # lora_A の形状 [in_features, rank]
+                    # lora_B の形状 [rank, out_features]
                     
-                    # 行列の掛け算と転置を適切に行う
-                    if base_weight_shape[0] == lora_b_shape[1] and base_weight_shape[1] == lora_a_shape[0]:
-                        # ケース1: base_weight が out_features x in_features で
-                        # lora_A が in_features x rank, lora_B が rank x out_features の場合
-                        # (B.T @ A.T).T = A @ B を計算
-                        lora_weight = (module.lora.lora_B.t() @ module.lora.lora_A.t()).t()
-                    elif base_weight_shape[0] == lora_a_shape[0] and base_weight_shape[1] == lora_b_shape[1]:
-                        # ケース2: base_weight が out_features x in_features で
-                        # lora_A が out_features x rank, lora_B が rank x in_features の場合
-                        # A @ B を計算
-                        lora_weight = module.lora.lora_A @ module.lora.lora_B
-                    else:
-                        # tqdm.write(f"  警告: 行列のサイズが一致しません。このモジュールはスキップします。")
-                        continue
+                    # delta_W = A @ B の計算 (結果の形状: [in_features, out_features])
+                    delta_W_intermediate = lora_A @ lora_B
+                    
+                    # ベースの重みに加算するために転置 (結果の形状: [out_features, in_features])
+                    delta_W = delta_W_intermediate.t()
                     
                     # スケーリングを適用
-                    lora_weight = lora_weight * (module.lora.scale * scale)
-                    
-                    # 行列のサイズを確認
-                    # debug(コメントを消さない)
-                    # tqdm.write(f"  計算されたlora_weight: {lora_weight.shape}")
-                    
-                    # ベースの重みに加算する前に次元が一致するか確認
-                    if lora_weight.shape == base_weight_shape:
-                        module.base_layer.weight.data += lora_weight.to(module.base_layer.weight.data.device)
+                    scaled_delta_W = delta_W * module.lora.scale # module.lora.scale は alpha / rank
+                                        
+                    # ベースの重みに加算 (デバイスを合わせる)
+                    if scaled_delta_W.shape == module.base_layer.weight.shape:
+                        module.base_layer.weight.data += scaled_delta_W.to(module.base_layer.weight.data.device)
                         merged_count += 1
                     else:
+                        tqdm.write(f"  警告: モジュール {name} で計算されたLoRA重みのサイズ({scaled_delta_W.shape})がベース重みのサイズ({module.base_layer.weight.shape})と一致しません。スキップします。")
                         # tqdm.write(f"  警告: 計算されたLoRA重みのサイズ({lora_weight.shape})がベース重みのサイズ({base_weight_shape})と一致しません。")
                         # 転置して試してみる
                         if lora_weight.t().shape == base_weight_shape:
