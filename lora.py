@@ -1031,6 +1031,19 @@ class EVA02WithModuleLoRA(nn.Module):
             print("マージするLoraレイヤーがありません。")
             return 0
         
+        # --- デバッグ用: マージ前の出力比較 ---
+        self.eval() # 評価モードに設定
+        # ダミー入力を作成 (実際の入力形式に合わせて調整が必要な場合があります)
+        # 画像サイズはモデルから取得することを想定
+        img_height, img_width = self.img_size if hasattr(self, 'img_size') and self.img_size else (448, 448)
+        example_input_for_merge_debug = torch.randn(1, 3, img_height, img_width).to(next(self.parameters()).device) # モデルと同じデバイスへ
+
+        # マージ前のLoRA適用済みモデルの出力を取得
+        with torch.no_grad():
+            output_before_merge = self(example_input_for_merge_debug)
+        print(f"Debug: Output shape before merge: {output_before_merge.shape}")
+        # --- デバッグ用ここまで ---
+        
         merged_count = 0
         for name, module in tqdm(self.lora_layers.items(), desc="LoRAレイヤーのマージ", leave=True):
             if isinstance(module, LoRALinear):
@@ -1094,6 +1107,24 @@ class EVA02WithModuleLoRA(nn.Module):
         
         gc.collect()
         torch.cuda.empty_cache()
+
+        # --- デバッグ用: マージ後の出力比較 ---
+        self.eval() # 評価モードに設定
+        # マージ後のモデルの出力を取得
+        with torch.no_grad():
+            output_after_merge = self(example_input_for_merge_debug) # LoRAが削除されたベースモデルで推論
+        print(f"Debug: Output shape after merge: {output_after_merge.shape}")
+
+        # 出力の比較
+        if torch.allclose(output_before_merge, output_after_merge, rtol=1e-03, atol=1e-05):
+            print("Debug: LoRAマージ前後の出力は一致しています。")
+        else:
+            print("Debug: LoRAマージ前後の出力が一致しません。")
+            # 差分を詳細に表示 (オプション)
+            diff = torch.abs(output_before_merge - output_after_merge)
+            print(f"  最大差分: {torch.max(diff).item()}")
+            print(f"  平均差分: {torch.mean(diff).item()}")
+        # --- デバッグ用ここまで ---
 
         if new_lora_rank is not None:
             self.lora_rank = new_lora_rank
@@ -4275,7 +4306,7 @@ def main():
                 keep_initializers=False,
                 check_forward=True,
                 training=False,
-                verbose=True,
+                verbose=False,
                 use_dynamo=False,
                 input_size=(3, 448, 448),
                 batch_size=1,
