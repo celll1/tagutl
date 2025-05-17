@@ -271,13 +271,15 @@ REPO_ID = "celstk/wd-eva02-lora-onnx"
 # Model options
 MODEL_OPTIONS = {
     "cl_eva02_tagger_v1_250426": "cl_eva02_tagger_v1_250426/model.onnx",
-    "cl_eva02_tagger_v1_250427": "cl_eva02_tagger_v1_250427/model.onnx",
-    "cl_eva02_tagger_v1_250430": "cl_eva02_tagger_v1_250430/model.onnx",
     "cl_eva02_tagger_v1_250502": "cl_eva02_tagger_v1_250503/model.onnx",
-    "cl_eva02_tagger_v1_250504": "cl_eva02_tagger_v1_250504/model.onnx",
-    "cl_eva02_tagger_v1_250508": "cl_eva02_tagger_v1_250508/model.onnx"
+    "cl_eva02_tagger_v1_250509": "cl_eva02_tagger_v1_250509/model.onnx",
+    "cl_eva02_tagger_v1_250511": "cl_eva02_tagger_v1_250511/model.onnx",
+    "cl_eva02_tagger_v1_250512": "cl_eva02_tagger_v1_250512/model.onnx",
+    "cl_eva02_tagger_v1_250513": "cl_eva02_tagger_v1_250513/model.onnx",
+    "cl_eva02_tagger_v1_250516": "cl_eva02_tagger_v1_250516/model.onnx",
+    "cl_eva02_tagger_v1_250517": "cl_eva02_tagger_v1_250517/model.onnx"
 }
-DEFAULT_MODEL = "cl_eva02_tagger_v1_250504"
+DEFAULT_MODEL = "cl_eva02_tagger_v1_250517"
 CACHE_DIR = "./model_cache"
 
 # --- Global variables for paths (initialized at startup) ---

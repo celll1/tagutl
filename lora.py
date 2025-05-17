@@ -1032,16 +1032,16 @@ class EVA02WithModuleLoRA(nn.Module):
             return 0
         
         # --- デバッグ用: マージ前の出力比較 ---
-        self.eval() # 評価モードに設定
-        # ダミー入力を作成 (実際の入力形式に合わせて調整が必要な場合があります)
-        # 画像サイズはモデルから取得することを想定
-        img_height, img_width = self.img_size if hasattr(self, 'img_size') and self.img_size else (448, 448)
-        example_input_for_merge_debug = torch.randn(1, 3, img_height, img_width).to(next(self.parameters()).device) # モデルと同じデバイスへ
+        # self.eval() # 評価モードに設定
+        # # ダミー入力を作成 (実際の入力形式に合わせて調整が必要な場合があります)
+        # # 画像サイズはモデルから取得することを想定
+        # img_height, img_width = self.img_size if hasattr(self, 'img_size') and self.img_size else (448, 448)
+        # example_input_for_merge_debug = torch.randn(1, 3, img_height, img_width).to(next(self.parameters()).device) # モデルと同じデバイスへ
 
-        # マージ前のLoRA適用済みモデルの出力を取得
-        with torch.no_grad():
-            output_before_merge = self(example_input_for_merge_debug)
-        print(f"Debug: Output shape before merge: {output_before_merge.shape}")
+        # # マージ前のLoRA適用済みモデルの出力を取得
+        # with torch.no_grad():
+        #     output_before_merge = self(example_input_for_merge_debug)
+        # print(f"Debug: Output shape before merge: {output_before_merge.shape}")
         # --- デバッグ用ここまで ---
         
         merged_count = 0
@@ -1091,21 +1091,21 @@ class EVA02WithModuleLoRA(nn.Module):
         torch.cuda.empty_cache()
 
         # --- デバッグ用: マージ後の出力比較 ---
-        self.eval() # 評価モードに設定
-        # マージ後のモデルの出力を取得
-        with torch.no_grad():
-            output_after_merge = self(example_input_for_merge_debug) # LoRAが削除されたベースモデルで推論
-        print(f"Debug: Output shape after merge: {output_after_merge.shape}")
+        # self.eval() # 評価モードに設定
+        # # マージ後のモデルの出力を取得
+        # with torch.no_grad():
+        #     output_after_merge = self(example_input_for_merge_debug) # LoRAが削除されたベースモデルで推論
+        # print(f"Debug: Output shape after merge: {output_after_merge.shape}")
 
-        # 出力の比較
-        if torch.allclose(output_before_merge, output_after_merge, rtol=1e-03, atol=1e-05):
-            print("Debug: LoRAマージ前後の出力は一致しています。")
-        else:
-            print("Debug: LoRAマージ前後の出力が一致しません。")
-            # 差分を詳細に表示 (オプション)
-            diff = torch.abs(output_before_merge - output_after_merge)
-            print(f"  最大差分: {torch.max(diff).item()}")
-            print(f"  平均差分: {torch.mean(diff).item()}")
+        # # 出力の比較
+        # if torch.allclose(output_before_merge, output_after_merge, rtol=1e-03, atol=1e-05):
+        #     print("Debug: LoRAマージ前後の出力は一致しています。")
+        # else:
+        #     print("Debug: LoRAマージ前後の出力が一致しません。")
+        #     # 差分を詳細に表示 (オプション)
+        #     diff = torch.abs(output_before_merge - output_after_merge)
+        #     print(f"  最大差分: {torch.max(diff).item()}")
+        #     print(f"  平均差分: {torch.mean(diff).item()}")
         # --- デバッグ用ここまで ---
 
         if new_lora_rank is not None:
@@ -2770,6 +2770,7 @@ def train_model(
     save_best='f1',  # 'f1', 'loss', 'both'
     checkpoint_interval=1,
     merge_every_n_epochs=None,
+    merge_every_n_steps=None,
     mixed_precision=False,
     tensorboard=False,
     initial_threshold=0.35,
@@ -3342,6 +3343,23 @@ def train_model(
                 scheduler.step()
                 if tensorboard:
                     writer.add_scalar('Train/Learning_Rate', optimizer.param_groups[0]['lr'], global_step)
+                    
+                if merge_every_n_steps is not None and global_step % merge_every_n_steps == 0:
+                    print(f"Epoch {epoch+1} ステップ {global_step} でモデルをマージします")
+                    model.merge_lora_to_base_model(
+                        scale=1.0,
+                        new_lora_rank=model.lora_rank, # Use existing rank/alpha/dropout
+                        new_lora_alpha=model.lora_alpha,
+                        new_lora_dropout=model.lora_dropout
+                    )
+                    model.to(device)
+
+                    # optimizerをリセット
+                    optimizer = setup_optimizer(model, optimizer.param_groups[0]['lr'], weight_decay, optimizer_type)
+
+                    # スケジューラをリセット (残りのステップで再作成)
+                    scheduler = create_scheduler(optimizer, warmup_steps, total_steps, current_step=global_step)
+                    print("Optimizer and Scheduler have been reset.")
 
                 if global_step == head_only_train_steps:
                     tqdm.write("ヘッド部分の訓練を終了します")
@@ -3525,8 +3543,9 @@ def train_model(
                     new_lora_dropout=model.lora_dropout
                 )
                 model.to(device)
+
                 # optimizerをリセット
-                optimizer = setup_optimizer(model, learning_rate, weight_decay, optimizer_type)
+                optimizer = setup_optimizer(model, optimizer.param_groups[0]['lr'], weight_decay, optimizer_type)
 
                 # スケジューラをリセット (残りのステップで再作成)
                 scheduler = create_scheduler(optimizer, warmup_steps, total_steps, current_step=global_step)
@@ -3673,7 +3692,8 @@ def main():
     train_parser.add_argument('--merge_before_train', nargs='?', const=1, type=float, default=None, 
                          help='トレーニング前にLoRAの重みをベースモデルにマージする。数値を指定するとスケーリング係数として使用（デフォルト: 1.0）')
     train_parser.add_argument('--merge_every_n_epochs', type=int, default=None, help='トレーニング中にマージするエポック数')
-
+    train_parser.add_argument('--merge_every_n_steps', type=int, default=None, help='トレーニング中にマージするステップ数')
+    
     # データセット関連の引数
     train_parser.add_argument('--image_dirs', type=str, nargs='+', required=True, help='トレーニング画像のディレクトリ（複数指定可）')
     train_parser.add_argument('--val_split', type=float, default=0.1, help='検証データの割合')
@@ -4183,6 +4203,7 @@ def main():
             save_best=args.save_best,
             checkpoint_interval=args.checkpoint_interval,
             merge_every_n_epochs=args.merge_every_n_epochs,
+            merge_every_n_steps=args.merge_every_n_steps,
             mixed_precision=args.mixed_precision,
             tensorboard=args.tensorboard, # args.tensorboard を渡す
             initial_threshold=args.initial_threshold,
