@@ -33,6 +33,7 @@ class LabelData:
     copyright: list[np.int64]
     meta: list[np.int64]
     quality: list[np.int64]
+    model: list[np.int64]
 
 def pil_ensure_rgb(image: Image.Image) -> Image.Image:
     if image.mode not in ["RGB", "RGBA"]:
@@ -71,7 +72,7 @@ def load_tag_mapping(mapping_path):
         raise ValueError("Unsupported tag mapping format: Expected a dictionary.")
 
     names = [None] * (max(idx_to_tag.keys()) + 1)
-    rating, general, artist, character, copyright, meta, quality = [], [], [], [], [], [], []
+    rating, general, artist, character, copyright, meta, quality, model_name = [], [], [], [], [], [], [], []
     for idx, tag in idx_to_tag.items():
         if idx >= len(names): names.extend([None] * (idx - len(names) + 1))
         names[idx] = tag
@@ -84,9 +85,10 @@ def load_tag_mapping(mapping_path):
         elif category == 'Copyright': copyright.append(idx_int)
         elif category == 'Meta': meta.append(idx_int)
         elif category == 'Quality': quality.append(idx_int)
+        elif category == 'Model': model_name.append(idx_int)
 
     return LabelData(names=names, rating=np.array(rating, dtype=np.int64), general=np.array(general, dtype=np.int64), artist=np.array(artist, dtype=np.int64),
-                     character=np.array(character, dtype=np.int64), copyright=np.array(copyright, dtype=np.int64), meta=np.array(meta, dtype=np.int64), quality=np.array(quality, dtype=np.int64)), idx_to_tag, tag_to_category
+                     character=np.array(character, dtype=np.int64), copyright=np.array(copyright, dtype=np.int64), meta=np.array(meta, dtype=np.int64), quality=np.array(quality, dtype=np.int64), model=np.array(model_name, dtype=np.int64)), idx_to_tag, tag_to_category
 
 def preprocess_image(image: Image.Image, target_size=(448, 448)):
     # Adapted from onnx_predict.py's version
@@ -112,7 +114,8 @@ def get_tags(probs, labels: LabelData, gen_threshold, char_threshold):
         "copyright": [],
         "artist": [],
         "meta": [],
-        "quality": []
+        "quality": [],
+        "model": []
     }
     # Rating (select max)
     if len(labels.rating) > 0:
@@ -160,7 +163,8 @@ def get_tags(probs, labels: LabelData, gen_threshold, char_threshold):
         "character": (labels.character, char_threshold),
         "copyright": (labels.copyright, char_threshold),
         "artist": (labels.artist, char_threshold),
-        "meta": (labels.meta, gen_threshold) # Use gen_threshold for meta as per original code
+        "meta": (labels.meta, gen_threshold),
+        "model": (labels.model, gen_threshold)
     }
     for category, (indices, threshold) in category_map.items():
         if len(indices) > 0:
@@ -205,7 +209,7 @@ def visualize_predictions(image: Image.Image, predictions: Dict, threshold: floa
     all_tags, all_probs, all_colors = [], [], []
     color_map = {
         'rating': 'red', 'character': 'blue', 'copyright': 'purple',
-        'artist': 'orange', 'general': 'green', 'meta': 'gray', 'quality': 'yellow'
+        'artist': 'orange', 'general': 'green', 'meta': 'gray', 'quality': 'yellow', 'model': 'cyan'
     }
 
     # Aggregate tags from predictions dictionary
@@ -213,7 +217,7 @@ def visualize_predictions(image: Image.Image, predictions: Dict, threshold: floa
         ('rating', 'R', color_map['rating']), ('quality', 'Q', color_map['quality']),
         ('character', 'C', color_map['character']), ('copyright', '©', color_map['copyright']),
         ('artist', 'A', color_map['artist']), ('general', 'G', color_map['general']),
-        ('meta', 'M', color_map['meta'])
+        ('meta', 'M', color_map['meta']), ('model', 'M', color_map['model'])
     ]:
         sorted_tags = sorted(predictions.get(cat, []), key=lambda x: x[1], reverse=True)
         for tag, prob in sorted_tags:
@@ -276,10 +280,13 @@ MODEL_OPTIONS = {
     "cl_eva02_tagger_v1_250511": "cl_eva02_tagger_v1_250511/model.onnx",
     "cl_eva02_tagger_v1_250512": "cl_eva02_tagger_v1_250512/model.onnx",
     "cl_eva02_tagger_v1_250513": "cl_eva02_tagger_v1_250513/model.onnx",
-    "cl_eva02_tagger_v1_250516": "cl_eva02_tagger_v1_250516/model.onnx",
-    "cl_eva02_tagger_v1_250517": "cl_eva02_tagger_v1_250517/model.onnx"
+    "cl_eva02_tagger_v1_250517": "cl_eva02_tagger_v1_250517/model.onnx",
+    "cl_eva02_tagger_v1_250518": "cl_eva02_tagger_v1_250518/model.onnx",
+    "cl_eva02_tagger_v1_250520": "cl_eva02_tagger_v1_250520/model.onnx",
+    "cl_eva02_tagger_v1_250522": "cl_eva02_tagger_v1_250522/model.onnx",
+    "cl_eva02_tagger_v1_250523": "cl_eva02_tagger_v1_250523/model.onnx"
 }
-DEFAULT_MODEL = "cl_eva02_tagger_v1_250517"
+DEFAULT_MODEL = "cl_eva02_tagger_v1_250523"
 CACHE_DIR = "./model_cache"
 
 # --- Global variables for paths (initialized at startup) ---
@@ -459,7 +466,7 @@ def predict_onnx(image_input, model_choice, gen_threshold, char_threshold, outpu
         if predictions.get("rating"): output_tags.append(predictions["rating"][0][0].replace("_", " "))
         if predictions.get("quality"): output_tags.append(predictions["quality"][0][0].replace("_", " "))
         # Add other categories, respecting order and filtering meta if needed
-        for category in ["artist", "character", "copyright", "general", "meta"]:
+        for category in ["artist", "character", "copyright", "general", "meta", "model"]:
             tags_in_category = predictions.get(category, [])
             for tag, prob in tags_in_category:
                 # Basic meta tag filtering for text output
@@ -509,7 +516,7 @@ with gr.Blocks(css=css) as demo:
                 label="Model Version",
                 interactive=True
             )
-            gen_threshold = gr.Slider(minimum=0.0, maximum=1.0, step=0.05, value=0.55, label="General/Meta Tag Threshold")
+            gen_threshold = gr.Slider(minimum=0.0, maximum=1.0, step=0.05, value=0.55, label="General/Meta/Model Tag Threshold")
             char_threshold = gr.Slider(minimum=0.0, maximum=1.0, step=0.05, value=0.60, label="Character/Copyright/Artist Tag Threshold")
             output_mode = gr.Radio(choices=["Tags Only", "Tags + Visualization"], value="Tags + Visualization", label="Output Mode")
             predict_button = gr.Button("Predict", variant="primary")

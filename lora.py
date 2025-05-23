@@ -540,7 +540,7 @@ class LabelData:
     copyright: list[np.int64]
     meta: list[np.int64]
     quality: list[np.int64]
-
+    model: list[np.int64]
 
 def pil_ensure_rgb(image: Image.Image) -> Image.Image:
     # convert to RGB/RGBA if not already (deals with palette images etc.)
@@ -587,6 +587,7 @@ def load_labels_hf(
         copyright=list(np.where(df["category"] == 3)[0]),
         meta=list(np.where(df["category"] == 5)[0]),
         quality=[],
+        model=[],
     )
 
     return tag_data
@@ -622,6 +623,9 @@ def get_tags(
     # Quality labels with all probabilities
     quality_labels = dict([probs_list[i] for i in labels.quality])
 
+    # Model labels with all probabilities
+    all_model_labels = dict([probs_list[i] for i in labels.model])
+
     # Filtered general labels (above threshold)
     gen_labels = {k: v for k, v in all_gen_labels.items() if v > gen_threshold}
     gen_labels = dict(sorted(gen_labels.items(), key=lambda item: item[1], reverse=True))
@@ -642,6 +646,10 @@ def get_tags(
     meta_labels = {k: v for k, v in all_meta_labels.items() if v > gen_threshold}
     meta_labels = dict(sorted(meta_labels.items(), key=lambda item: item[1], reverse=True))
 
+    # Filtered model labels (above threshold)
+    model_labels = {k: v for k, v in all_model_labels.items() if v > gen_threshold}
+    model_labels = dict(sorted(model_labels.items(), key=lambda item: item[1], reverse=True))
+
     # Combine general and character labels for caption
     combined_names = list(gen_labels.keys())
     combined_names.extend(list(char_labels.keys()))
@@ -650,7 +658,7 @@ def get_tags(
     caption = ", ".join(combined_names)
     taglist = caption.replace("_", " ").replace("(", "\(").replace(")", "\)")
 
-    return caption, taglist, rating_labels, gen_labels, artist_labels, char_labels, quality_labels, copyright_labels, meta_labels, all_gen_labels, all_artist_labels, all_char_labels, all_copyright_labels, all_meta_labels
+    return caption, taglist, rating_labels, gen_labels, artist_labels, char_labels, quality_labels, copyright_labels, meta_labels, model_labels, all_gen_labels, all_artist_labels, all_char_labels, all_copyright_labels, all_meta_labels
 
 
 # EVA02モデルにモジュールごとのLoRAを適用するクラス
@@ -1168,7 +1176,7 @@ def load_model(model_path=None,
         idx_to_tag = {i: name for i, name in enumerate(labels.names)}
         tag_to_idx = {name: i for i, name in enumerate(labels.names)}
         tag_to_category = {name: 'Rating' if i in labels.rating else 'Character' if i in labels.character else 'General' for i, name in enumerate(labels.names)}
-        print(f"カテゴリごとのタグ数: Rating: {len(labels.rating)}, Character: {len(labels.character)}, General: {len(labels.general)}, Artist: {len(labels.artist)}, Copyright: {len(labels.copyright)}, Meta: {len(labels.meta)}")
+        print(f"カテゴリごとのタグ数: Rating: {len(labels.rating)}, Character: {len(labels.character)}, General: {len(labels.general)}, Artist: {len(labels.artist)}, Copyright: {len(labels.copyright)}, Meta: {len(labels.meta)}, Model: {len(labels.model)}")
 
         print(f"初期化されたLoRAモデルを使用します（ベースモデル: {base_model}, lora_rank: {lora_rank}, lora_alpha: {lora_alpha}, lora_dropout: {lora_dropout}")
 
@@ -1209,7 +1217,7 @@ def load_model(model_path=None,
         idx_to_tag = checkpoint.get('idx_to_tag', None)
         tag_to_category = checkpoint.get('tag_to_category', None)
 
-        labels = LabelData(names=[], rating=[], general=[], character=[], artist=[], copyright=[], meta=[], quality=[])
+        labels = LabelData(names=[], rating=[], general=[], character=[], artist=[], copyright=[], meta=[], quality=[], model=[])
 
         if idx_to_tag is not None:
             num_classes = len(idx_to_tag)
@@ -1233,7 +1241,7 @@ def load_model(model_path=None,
             # labels.rating.extend([i for i, name in enumerate(labels.names) if name not in tag_to_category and name in ['general', 'sensitive', 'questionable', 'explicit']])
             # labels.general.extend([i for i, name in enumerate(labels.names) if name not in tag_to_category and name not in ['general', 'sensitive', 'questionable', 'explicit']])  
 
-        print(f"カテゴリごとのタグ数: Rating: {len(labels.rating)}, Character: {len(labels.character)}, General: {len(labels.general)}, Artist: {len(labels.artist)}, Copyright: {len(labels.copyright)}, Meta: {len(labels.meta)}")
+        print(f"カテゴリごとのタグ数: Rating: {len(labels.rating)}, Character: {len(labels.character)}, General: {len(labels.general)}, Artist: {len(labels.artist)}, Copyright: {len(labels.copyright)}, Meta: {len(labels.meta)}, Model: {len(labels.model)}")
         
         # モデルを作成
         model = EVA02WithModuleLoRA(
@@ -1291,7 +1299,7 @@ def load_model(model_path=None,
                 print(f"チェックポイントからtarget_modulesが見つかりません...")
                 target_modules = None
 
-            labels = LabelData(names=[], rating=[], general=[], character=[], artist=[], copyright=[], meta=[], quality=[])
+            labels = LabelData(names=[], rating=[], general=[], character=[], artist=[], copyright=[], meta=[], quality=[], model=[])
 
             try:
                 idx_to_tag = ast.literal_eval(metadata['idx_to_tag'])
@@ -1326,7 +1334,7 @@ def load_model(model_path=None,
                 tag_to_idx = {name: i for i, name in enumerate(labels.names)}
                 tag_to_category = {name: 'Rating' if i in labels.rating else 'Character' if i in labels.character else 'General' for i, name in enumerate(labels.names)}
 
-            print(f"カテゴリごとのタグ数: Rating: {len(labels.rating)}, Character: {len(labels.character)}, General: {len(labels.general)}, Artist: {len(labels.artist)}, Copyright: {len(labels.copyright)}, Meta: {len(labels.meta)}, Quality: {len(labels.quality)}")
+            print(f"カテゴリごとのタグ数: Rating: {len(labels.rating)}, Character: {len(labels.character)}, General: {len(labels.general)}, Artist: {len(labels.artist)}, Copyright: {len(labels.copyright)}, Meta: {len(labels.meta)}, Quality: {len(labels.quality)}, Model: {len(labels.model)}")
 
             # モデルの読み込み
             from safetensors.torch import load_file
@@ -1386,7 +1394,7 @@ def load_model(model_path=None,
         tag_to_category = {name: 'Rating' if i in labels.rating else
                                   'Character' if i in labels.character else
                                   'General' for i, name in enumerate(labels.names)}
-        print(f"カテゴリごとのタグ数: Rating: {len(labels.rating)}, Character: {len(labels.character)}, General: {len(labels.general)}, Artist: {len(labels.artist)}, Copyright: {len(labels.copyright)}, Meta: {len(labels.meta)}, Quality: {len(labels.quality)}")
+        print(f"カテゴリごとのタグ数: Rating: {len(labels.rating)}, Character: {len(labels.character)}, General: {len(labels.general)}, Artist: {len(labels.artist)}, Copyright: {len(labels.copyright)}, Meta: {len(labels.meta)}, Quality: {len(labels.quality)}, Model: {len(labels.model)}")
 
         print(f"初期化されたLoRAモデルを使用します（ベースモデル: {base_model}, lora_rank: {lora_rank}, lora_alpha: {lora_alpha}, lora_dropout: {lora_dropout}")
 
@@ -1510,14 +1518,14 @@ def predict_image(image_path, model, labels, gen_threshold = None, char_threshol
             outputs = outputs.to("cpu")
     
     # タグの取得
-    caption, taglist, ratings, general, artist, character, copyright, meta, quality, all_general, all_artist, all_character, all_copyright, all_meta = get_tags(
+    caption, taglist, ratings, general, artist, character, copyright, meta, quality, model_labels, all_general, all_artist, all_character, all_copyright, all_meta = get_tags(
         probs=outputs.squeeze(0),
         labels=labels,
         gen_threshold=gen_threshold if gen_threshold is not None else model.threshold,
         char_threshold=char_threshold if char_threshold is not None else model.threshold,
     )
     
-    return img_input, caption, taglist, ratings, general, artist, character, copyright, meta, quality, all_general, all_artist, all_character, all_copyright, all_meta
+    return img_input, caption, taglist, ratings, general, artist, character, copyright, meta, quality, model_labels, all_general, all_artist, all_character, all_copyright, all_meta
 
 
 def visualize_predictions(image, tags, predictions, threshold=0.35, output_path=None, max_tags=50):
@@ -1532,7 +1540,7 @@ def visualize_predictions(image, tags, predictions, threshold=0.35, output_path=
         output_path: 出力ファイルパス（Noneの場合は表示のみ）
         max_tags: 表示する最大タグ数
     """
-    caption, taglist, ratings, character, general, meta, quality, all_character, all_general = predictions
+    caption, taglist, ratings, character, general, meta, quality, model_labels, all_character, all_general = predictions
     
     # タグの正規化（スペースを_に変換、エスケープされた括弧を通常の括弧に変換）
     normalized_tags = [normalize_tag(tag) for tag in tags]
@@ -3601,7 +3609,7 @@ def load_tag_categories():
         dict: タグからカテゴリへのマッピング辞書
     """
     tag_to_category = {}
-    categories = ['Artist', 'Character', 'Copyright', 'General', 'Meta']
+    categories = ['Artist', 'Character', 'Copyright', 'General', 'Meta', 'Model']
     
     for category in categories:
         json_path = os.path.join('taggroup', f'{category}.json')
@@ -3802,7 +3810,7 @@ def main():
         print(f"読み込まれたタグ: {len(actual_tags)}個")
         
         # 予測を実行
-        img, caption, taglist, ratings, general, artist, character, copyright, meta, quality, all_general, all_artist, all_character, all_copyright, all_meta = predict_image(
+        img, caption, taglist, ratings, general, artist, character, copyright, meta, quality, model_labels, all_general, all_artist, all_character, all_copyright, all_meta = predict_image(
             args.image, 
             model, 
             labels, 
@@ -3839,6 +3847,11 @@ def main():
         print("--------")
         print(f"General tags (threshold={args.gen_threshold if args.gen_threshold is not None else model.threshold}):")
         for k, v in general.items():
+            print(f"  {k}: {v:.3f}")
+
+        print("--------")
+        print(f"Model tags (threshold={args.gen_threshold if args.gen_threshold is not None else model.threshold}):")
+        for k, v in model_labels.items():
             print(f"  {k}: {v:.3f}")
 
         print("--------")
@@ -3894,7 +3907,7 @@ def main():
                 actual_tags = read_tags_from_file(image_file)
                 
                 # 予測
-                img, caption, taglist, ratings, character, general, meta, quality, all_character, all_general = predict_image(
+                img, caption, taglist, ratings, character, general, meta, quality, model_labels, all_character, all_general = predict_image(
                     image_file, 
                     model, 
                     labels, 
@@ -3911,7 +3924,7 @@ def main():
                 visualize_predictions(
                     image=img, 
                     tags=actual_tags, 
-                    predictions=(caption, taglist, ratings, character, general, meta, quality, all_character, all_general),
+                    predictions=(caption, taglist, ratings, character, general, meta, quality, model_labels, all_character, all_general),
                     threshold=args.gen_threshold,
                     output_path=output_path
                 )
