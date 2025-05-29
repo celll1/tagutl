@@ -24,6 +24,10 @@ PERSON_COUNT_TAG_PATTERNS = [
     re.compile(r"^solo$")   # solo も人数関連
 ]
 
+# 特殊ケースの定義
+DOUBLE_BACKSLASH_SLASH = "\\//"
+PLACEHOLDER = "__DOUBLE_BACKSLASH_SLASH_PLACEHOLDER__"
+
 def is_person_count_tag(normalized_tag_for_sd: str) -> bool:
     """指定されたタグが人数関連タグかどうかを判定する。
     判定は normalize_tag_for_sd で正規化された後のタグに対して行う。
@@ -42,12 +46,39 @@ def is_person_count_tag(normalized_tag_for_sd: str) -> bool:
             return True
     return False
 
-def normalize_tag_for_sd(tag: str) -> str:
+def normalize_tag_for_sd(tag: str, debug_print: bool = False) -> str:
     """Stable Diffusion用のタグ形式に正規化する関数。
     括弧をエスケープし、すべて小文字にする。スペースは維持。
+    エスケープは必ず1回だけ行われるようにする。'\\//' は保護する。
     """
+    original_tag_for_debug = tag # デバッグ用に元のタグを保持
+    tag_changed_in_step2 = False
+    tag_changed_in_step3 = False
+
     tag = tag.lower()
-    tag = tag.replace('(', '\\(').replace(')', '\\)')
+
+    tag = tag.replace(DOUBLE_BACKSLASH_SLASH, PLACEHOLDER)
+
+    # ステップ2: 過剰なエスケープの修正
+    before_step2 = tag
+    tag = re.sub(r'\\{2,}\(', r'\\(', tag)
+    tag = re.sub(r'\\{2,}\)', r'\\)', tag)
+    if before_step2 != tag:
+        tag_changed_in_step2 = True
+
+    # ステップ3: 未エスケープの括弧のエスケープ
+    before_step3 = tag
+    tag = re.sub(r'(?<!\\)\(', r'\\(', tag)
+    tag = re.sub(r'(?<!\\)\)', r'\\)', tag)
+    if before_step3 != tag:
+        tag_changed_in_step3 = True
+    
+    tag = tag.replace(PLACEHOLDER, DOUBLE_BACKSLASH_SLASH)
+
+    # デバッグ表示 (ステップ2または3で変更があった場合のみ)
+    if debug_print and (tag_changed_in_step2 or tag_changed_in_step3):
+        print(f"  [DEBUG] Tag normalized: '{original_tag_for_debug}' -> '{tag.replace('_', ' ')}' (Step2Change: {tag_changed_in_step2}, Step3Change: {tag_changed_in_step3})")
+
     tag = tag.replace('_', ' ')
     return tag.strip()
 
@@ -87,7 +118,9 @@ def load_categories_from_tag_groups(tag_group_dir: str) -> dict:
             if isinstance(data, dict):
                 for tag_name_from_file in data.keys():
                     # ファイルから読み込んだタグ名も検索キーとして正規化
-                    normalized_key = tag_name_from_file.lower().replace('_', ' ')
+                    # タグファイル処理時と同じ正規化を適用（括弧エスケープ除去を含む）
+                    search_key = tag_name_from_file.lower().replace('_', ' ')
+                    normalized_key = search_key.replace('\\(', '(').replace('\\)', ')')
                     # 既にRating/Qualityで登録されていなければ、ファイル由来のカテゴリを登録
                     if normalized_key not in tag_to_category: 
                         tag_to_category[normalized_key] = category_name_code
@@ -104,7 +137,7 @@ def load_categories_from_tag_groups(tag_group_dir: str) -> dict:
             
     return tag_to_category
 
-def process_tag_file(file_path: str, tag_to_category: dict):
+def process_tag_file(file_path: str, tag_to_category: dict, debug_normalization: bool = False):
     """単一のタグファイルを処理し、カテゴリ順にソート後、正規化する。"""
     try:
         with open(file_path, 'r', encoding='utf-8') as f:
@@ -114,27 +147,31 @@ def process_tag_file(file_path: str, tag_to_category: dict):
         if not tags_in_file:
             return
 
+        if debug_normalization:
+            print(f"Processing file for debug: {file_path}")
+
         categorized_tags = {cat: [] for cat in CATEGORY_ORDER}
-        unknown_tags = []
+        # unknown_tags リストは不要になる
+        # unknown_tags = [] 
 
         for tag_str_from_file in tags_in_file:
             search_key = tag_str_from_file.lower().replace('_', ' ')
             search_key_no_escape_no_sd_norm = search_key.replace('\\(', '(').replace('\\)', ')')
             category = tag_to_category.get(search_key_no_escape_no_sd_norm)
-            final_normalized_tag = normalize_tag_for_sd(tag_str_from_file)
+            # normalize_tag_for_sd にデバッグフラグを渡す
+            final_normalized_tag = normalize_tag_for_sd(tag_str_from_file, debug_print=debug_normalization)
 
             if category and category in categorized_tags:
                 categorized_tags[category].append(final_normalized_tag)
             else:
-                unknown_tags.append(final_normalized_tag)
+                # カテゴリ不明のタグは general カテゴリに追加
+                categorized_tags['general'].append(final_normalized_tag)
         
-        # 各カテゴリ内をソート (general カテゴリは特別扱い)
         for cat in categorized_tags:
             if cat == 'general':
                 person_tags = []
                 other_general_tags = []
-                for tag in categorized_tags[cat]:
-                    # is_person_count_tag は normalize_tag_for_sd 適用後のタグで判定
+                for tag in categorized_tags[cat]: # ここには元々の general と unknown が混ざっている
                     if is_person_count_tag(tag):
                         person_tags.append(tag)
                     else:
@@ -144,12 +181,12 @@ def process_tag_file(file_path: str, tag_to_category: dict):
                 categorized_tags[cat] = person_tags + other_general_tags
             else:
                 categorized_tags[cat].sort()
-        unknown_tags.sort()
+        # unknown_tags.sort() # 不要
 
         sorted_normalized_tags = []
         for cat_name in CATEGORY_ORDER:
             sorted_normalized_tags.extend(categorized_tags[cat_name])
-        sorted_normalized_tags.extend(unknown_tags)
+        # sorted_normalized_tags.extend(unknown_tags) # 不要
         
         new_content = ", ".join(sorted_normalized_tags)
 
@@ -166,6 +203,7 @@ def main():
     parser.add_argument('directories', nargs='+', help='One or more directories to process recursively.')
     # parser.add_argument('--tag_mapping', type=str, required=True, help='Path to the tag_mapping.json file for category information.')
     parser.add_argument('--tag_group_dir', type=str, required=True, help='Path to the directory containing category JSON files (e.g., Character.json, General.json).')
+    parser.add_argument('--debug_normalization', action='store_true', help='Print debug information for tags whose normalization changed due to escaping.')
 
     args = parser.parse_args()
 
@@ -186,7 +224,7 @@ def main():
             for file in files:
                 if file.lower().endswith('.txt'):
                     file_path = os.path.join(root, file)
-                    process_tag_file(file_path, tag_categories)
+                    process_tag_file(file_path, tag_categories, args.debug_normalization)
         print(f"Finished processing directory: {directory}")
 
 if __name__ == '__main__':
