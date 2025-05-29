@@ -185,13 +185,19 @@ def get_tags(probs, labels, gen_threshold, char_threshold):
         quality_conf = float(quality_probs[quality_idx])
         result["quality"].append((quality_name, quality_conf))
 
-    # モデルタグ（最大値を選択）
+    # モデルタグ（閾値超えの中から最大値を選択）
     if len(labels.model) > 0:
-        model_probs = probs[labels.model]
-        model_idx = np.argmax(model_probs)
-        model_name = labels.names[labels.model[model_idx]]
-        model_conf = float(model_probs[model_idx])
-        result["model"].append((model_name, model_conf))
+        model_probs_all = probs[labels.model] # Modelカテゴリ全体の確率
+        candidate_indices = np.where(model_probs_all >= gen_threshold)[0]
+        if len(candidate_indices) > 0:
+            # 閾値を超えた候補の中から、最も確率の高いものを選択
+            candidate_probs = model_probs_all[candidate_indices]
+            best_candidate_local_idx = np.argmax(candidate_probs)
+            best_candidate_global_idx_in_model_category = candidate_indices[best_candidate_local_idx]
+            
+            model_name = labels.names[labels.model[best_candidate_global_idx_in_model_category]]
+            model_conf = float(candidate_probs[best_candidate_local_idx])
+            result["model"].append((model_name, model_conf))
     
     # 確率の降順でソート
     for k in result:

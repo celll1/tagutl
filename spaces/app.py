@@ -276,17 +276,19 @@ REPO_ID = "celstk/wd-eva02-lora-onnx"
 MODEL_OPTIONS = {
     "cl_eva02_tagger_v1_250426": "cl_eva02_tagger_v1_250426/model.onnx",
     "cl_eva02_tagger_v1_250502": "cl_eva02_tagger_v1_250503/model.onnx",
-    "cl_eva02_tagger_v1_250509": "cl_eva02_tagger_v1_250509/model.onnx",
+    # "cl_eva02_tagger_v1_250509": "cl_eva02_tagger_v1_250509/model.onnx",
     "cl_eva02_tagger_v1_250511": "cl_eva02_tagger_v1_250511/model.onnx",
-    "cl_eva02_tagger_v1_250512": "cl_eva02_tagger_v1_250512/model.onnx",
-    "cl_eva02_tagger_v1_250513": "cl_eva02_tagger_v1_250513/model.onnx",
-    "cl_eva02_tagger_v1_250517": "cl_eva02_tagger_v1_250517/model.onnx",
-    "cl_eva02_tagger_v1_250518": "cl_eva02_tagger_v1_250518/model.onnx",
-    "cl_eva02_tagger_v1_250520": "cl_eva02_tagger_v1_250520/model.onnx",
-    "cl_eva02_tagger_v1_250522": "cl_eva02_tagger_v1_250522/model.onnx",
-    "cl_eva02_tagger_v1_250523": "cl_eva02_tagger_v1_250523/model.onnx"
+    # "cl_eva02_tagger_v1_250512": "cl_eva02_tagger_v1_250512/model.onnx",
+    # "cl_eva02_tagger_v1_250513": "cl_eva02_tagger_v1_250513/model.onnx",
+    # "cl_eva02_tagger_v1_250517": "cl_eva02_tagger_v1_250517/model.onnx",
+    # "cl_eva02_tagger_v1_250518": "cl_eva02_tagger_v1_250518/model.onnx",
+    # "cl_eva02_tagger_v1_250520": "cl_eva02_tagger_v1_250520/model.onnx",
+    # "cl_eva02_tagger_v1_250522": "cl_eva02_tagger_v1_250522/model.onnx",
+    # "cl_eva02_tagger_v1_250523": "cl_eva02_tagger_v1_250523/model.onnx",
+    "cl_eva02_tagger_v1_250525": "cl_eva02_tagger_v1_250525/model.onnx",
+    "cl_eva02_tagger_v1_250529": "cl_eva02_tagger_v1_250529/model.onnx"
 }
-DEFAULT_MODEL = "cl_eva02_tagger_v1_250523"
+DEFAULT_MODEL = "cl_eva02_tagger_v1_250529"
 CACHE_DIR = "./model_cache"
 
 # --- Global variables for paths (initialized at startup) ---
