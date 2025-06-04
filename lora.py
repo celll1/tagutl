@@ -570,7 +570,11 @@ def pil_random_rotate(image: Image.Image, max_angle: float = 0.0) -> Image.Image
     
     # ランダムな回転角度を生成（-max_angle から +max_angle）
     import random
-    angle = random.uniform(-max_angle, max_angle)
+    sigma = max_angle / 3.0
+    angle = random.gauss(0, sigma)
+
+    # 範囲外の場合はクリッピング
+    angle = max(-max_angle, min(max_angle, angle))
     
     # 元画像のサイズを保存
     orig_w, orig_h = image.size
@@ -2151,6 +2155,7 @@ class TagImageDataset(torch.utils.data.Dataset):
         transform=None,
         cache_dir=None,
         force_recache=False,
+        rotation_range=0.0,
     ):
         """
         画像とタグのデータセット
@@ -2171,8 +2176,10 @@ class TagImageDataset(torch.utils.data.Dataset):
         self.transform = transform
         self.cache_dir = cache_dir
         self.force_recache = force_recache
+        self.rotation_range = rotation_range
 
         print(f"データセットのタグ数: {len(self.tag_to_idx)}")
+        print(f"ランダム回転の最大角度: {self.rotation_range}度")
 
         # ★ Rating と Quality タグのインデックスを特定 ★
         self.rating_indices = []
@@ -2236,6 +2243,7 @@ class TagImageDataset(torch.utils.data.Dataset):
                 image = Image.open(img_path)
                 image = pil_ensure_rgb(image)
                 image = pil_pad_square(image)
+                # キャッシュの際は、ランダム回転を適用しない
 
                 if self.transform:
                     image = self.transform(image)
@@ -2304,6 +2312,8 @@ class TagImageDataset(torch.utils.data.Dataset):
             try:
                 image = Image.open(img_path)
                 image = pil_ensure_rgb(image)
+                if self.rotation_range > 0:
+                    image = pil_random_rotate(image, self.rotation_range)
                 image = pil_pad_square(image)
 
                 if self.transform:
@@ -3904,6 +3914,7 @@ def main():
     train_parser.add_argument('--reg_image_dirs', type=str, nargs='+', default=None, help='正則化画像のディレクトリ（複数指定可）')
     train_parser.add_argument('--min_tag_freq', type=int, default=10, help='タグの最小出現頻度')
     train_parser.add_argument('--remove_special_prefix', default="omit", choices=["remove", "omit"], help='特殊プレフィックス（例：a@、g@など）を除去する')
+    train_parser.add_argument('--random_rotate', type=float, default=0.0, help='データ拡張用のランダム回転の最大角度（度数、0の場合は回転なし）')
 
     # train_parser.add_argument('--image_size', type=int, default=224, help='画像サイズ')
     train_parser.add_argument('--batch_size', type=int, default=4, help='バッチサイズ')
@@ -4267,6 +4278,7 @@ def main():
             transform=model.transform,
             cache_dir=None if args.cache_dir is None else os.path.join(args.cache_dir, 'train'),  # トレーニング用キャッシュディレクトリ
             force_recache=False,  # キャッシュを強制的に再作成するフラグ
+            rotation_range=args.random_rotate
         )
 
         val_dataset = TagImageDataset(
@@ -4277,6 +4289,7 @@ def main():
             transform=model.transform,
             cache_dir=None if args.cache_dir is None else os.path.join(args.cache_dir, 'val'),  # 検証用キャッシュディレクトリ
             force_recache=False,  # キャッシュを強制的に再作成するフラグ
+            rotation_range=args.random_rotate
         )
 
         if args.reg_image_dirs:
@@ -4288,6 +4301,7 @@ def main():
                 transform=model.transform,
                 cache_dir=None if args.cache_dir is None else os.path.join(args.cache_dir, 'reg'),  # 正則化用キャッシュディレクトリ
                 force_recache=False,  # キャッシュを強制的に再作成するフラグ
+                rotation_range=args.random_rotate
             )
         
         # データローダーの作成
