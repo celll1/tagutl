@@ -1,10 +1,10 @@
-import os
 import re
 import json
 import ast
 import copy
 import argparse
 import requests
+import os
 
 from dataclasses import dataclass
 from pathlib import Path
@@ -1594,12 +1594,8 @@ def apply_tag_aliases(tags: List[str], tag_aliases: Dict[str, str]) -> List[str]
             converted_tag = tag_aliases[tag]
             converted_tags.append(converted_tag)
             conversion_count += 1
-            print(f"タグ変換: {tag} → {converted_tag}")
         else:
             converted_tags.append(tag)
-    
-    if conversion_count > 0:
-        print(f"合計 {conversion_count} 個のタグが変換されました")
     
     return converted_tags
 
@@ -2417,9 +2413,26 @@ def prepare_dataset(
 
     for image_dir in tqdm(image_dirs, desc="メインディレクトリを処理中"):
         valid_images_found = False  # ディレクトリごとに有効な画像が見つかったかを追跡
+        
+        # 事前に画像ファイル数をカウント（オプション：全体の進捗を表示したい場合）
+        total_images = 0
         for root, _, files in os.walk(image_dir):
-            for file in files:
-                if file.lower().endswith(('.jpg', '.jpeg', '.png', '.webp')):
+            total_images += len([f for f in files if f.lower().endswith(('.jpg', '.jpeg', '.png', '.webp'))])
+        
+        # 処理済み画像数のカウンター
+        processed_count = 0
+        
+        for root, _, files in os.walk(image_dir):
+            # 画像ファイルのみをフィルタリング
+            image_files = [f for f in files if f.lower().endswith(('.jpg', '.jpeg', '.png', '.webp'))]
+            
+            if image_files:  # 画像ファイルがある場合のみ進捗バーを表示
+                # サブディレクトリ名を取得（表示用）
+                subdir_name = os.path.relpath(root, image_dir) if root != image_dir else "root"
+                
+                for file in tqdm(image_files, 
+                               desc=f"  {subdir_name} ({processed_count + 1}-{processed_count + len(image_files)}/{total_images})",
+                               leave=False):  # leave=Falseで完了後に進捗バーを消去
                     image_path = os.path.join(root, file)
                     try:
                         tags = read_tags_from_file(image_path, remove_special_prefix, tag_aliases)
@@ -2433,6 +2446,8 @@ def prepare_dataset(
                             valid_images_found = True  # 有効な画像が見つかった
                     except Exception as e:
                         print(f"画像 {image_path} の処理中にエラーが発生: {e}")
+                    
+                    processed_count += 1
         
         # ディレクトリ内に有効な画像が1枚も見つからなかった場合、例外を発生させる
         if not valid_images_found:
@@ -2445,31 +2460,39 @@ def prepare_dataset(
     reg_tags_list = []
 
     if reg_image_dirs:
-        for image_dir in tqdm(reg_image_dirs, desc="正則化ディレクトリを処理中"):
-            valid_images_found = False  # ディレクトリごとに有効な画像が見つかったかを追跡
-            
-            for root, _, files in os.walk(image_dir):
-                for file in files:
-                    if file.lower().endswith(('.jpg', '.jpeg', '.png', '.webp')):
-                        image_path = os.path.join(root, file)
-                        try:
-                            tags = read_tags_from_file(image_path, remove_special_prefix, tag_aliases)
-                            if tags_to_remove_set:
-                                # 削除対象タグを除外
-                                tags = [tag for tag in tags if tag not in tags_to_remove_set]
+            for image_dir in tqdm(reg_image_dirs, desc="正則化ディレクトリを処理中"):
+                valid_images_found = False  # ディレクトリごとに有効な画像が見つかったかを追跡
+                
+                for root, _, files in os.walk(image_dir):
+                    # 画像ファイルのみをフィルタリング
+                    image_files = [f for f in files if f.lower().endswith(('.jpg', '.jpeg', '.png', '.webp'))]
+                    
+                    if image_files:  # 画像ファイルがある場合のみ進捗バーを表示
+                        # サブディレクトリ名を取得（表示用）
+                        subdir_name = os.path.relpath(root, image_dir) if root != image_dir else "."
+                        
+                        for file in tqdm(image_files, 
+                                    desc=f"  正則化:{subdir_name}",
+                                    leave=False):  # leave=Falseで完了後に進捗バーを消去
+                            image_path = os.path.join(root, file)
+                            try:
+                                tags = read_tags_from_file(image_path, remove_special_prefix, tag_aliases)
+                                if tags_to_remove_set:
+                                    # 削除対象タグを除外
+                                    tags = [tag for tag in tags if tag not in tags_to_remove_set]
 
-                            if tags:  # タグが存在する場合のみ追加
-                                reg_image_paths.append(image_path)
-                                reg_tags_list.append(tags)
-                                valid_images_found = True  # 有効な画像が見つかった
-                        except Exception as e:
-                            print(f"画像 {image_path} の処理中にエラーが発生: {e}")
+                                if tags:  # タグが存在する場合のみ追加
+                                    reg_image_paths.append(image_path)
+                                    reg_tags_list.append(tags)
+                                    valid_images_found = True  # 有効な画像が見つかった
+                            except Exception as e:
+                                print(f"正則化画像 {image_path} の処理中にエラーが発生: {e}")
+                
+                # ディレクトリ内に有効な画像が1枚も見つからなかった場合、例外を発生させる
+                if not valid_images_found:
+                    raise Exception(f"正則化ディレクトリ '{image_dir}' に有効な画像とタグのセットが見つかりませんでした。")
 
-            # ディレクトリ内に有効な画像が1枚も見つからなかった場合、例外を発生させる
-            if not valid_images_found:
-                raise Exception(f"ディレクトリ '{image_dir}' に有効な画像とタグのセットが見つかりませんでした。")
-
-        print(f"正則化データセットの画像数: {len(reg_image_paths)}")
+            print(f"正則化データセットの画像数: {len(reg_image_paths)}")
 
     # 全てのタグを収集してモデルを拡張 (タグ削除後のデータから収集)
     all_tags = []
