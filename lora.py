@@ -554,6 +554,63 @@ def pil_ensure_rgb(image: Image.Image) -> Image.Image:
     return image
 
 
+def pil_random_rotate(image: Image.Image, max_angle: float = 0.0) -> Image.Image:
+    """
+    画像をランダムに回転させ、四隅の欠けを防ぐために適切にクロップする
+    
+    Args:
+        image: 入力画像
+        max_angle: 回転の最大角度（度数）。0の場合は回転しない
+    
+    Returns:
+        回転・クロップ処理済みの画像
+    """
+    if max_angle == 0.0:
+        return image
+    
+    # ランダムな回転角度を生成（-max_angle から +max_angle）
+    import random
+    angle = random.uniform(-max_angle, max_angle)
+    
+    # 元画像のサイズを保存
+    orig_w, orig_h = image.size
+    
+    # 回転時に画像全体が見えるように expand=True で回転
+    rotated = image.rotate(angle, expand=True, fillcolor=(255, 255, 255))
+    
+    # 回転後のサイズ
+    rotated_w, rotated_h = rotated.size
+    
+    # 元のサイズに収まるようなスケールを計算
+    scale = min(orig_w / rotated_w, orig_h / rotated_h)
+    
+    # スケーリング実行
+    if scale < 1.0:
+        new_w = int(rotated_w * scale)
+        new_h = int(rotated_h * scale)
+        rotated = rotated.resize((new_w, new_h), Image.LANCZOS)
+        rotated_w, rotated_h = new_w, new_h
+    
+    # 元のサイズにクロップするための開始位置を計算
+    # 中央からのランダムオフセット（正規分布）
+    import random
+    offset_x = int((rotated_w - orig_w) * random.gauss(0, 0.25))
+    offset_y = int((rotated_h - orig_h) * random.gauss(0, 0.25))
+    
+    # クロップ開始位置（中央 + オフセット）
+    start_x = (rotated_w - orig_w) // 2 + offset_x
+    start_y = (rotated_h - orig_h) // 2 + offset_y
+    
+    # 境界内に収まるよう調整
+    start_x = max(0, min(start_x, rotated_w - orig_w))
+    start_y = max(0, min(start_y, rotated_h - orig_h))
+    
+    # 元のサイズにクロップ
+    cropped = rotated.crop((start_x, start_y, start_x + orig_w, start_y + orig_h))
+    
+    return cropped
+
+
 def pil_pad_square(image: Image.Image) -> Image.Image:
     w, h = image.size
     # get the largest dimension so we can pad to a square
@@ -1441,7 +1498,112 @@ def normalize_tag(tag):
     
     return tag
 
-def read_tags_from_file(image_path, remove_special_prefix="remove"):
+def load_tag_aliases(alias_file_path: str) -> Dict[str, str]:
+    """
+    エイリアスファイルを読み込んでタグの変換マップを作成する
+    
+    Args:
+        alias_file_path: エイリアスファイルのパス (.txt または .json)
+    
+    Returns:
+        dict: 旧タグから新タグへのマッピング辞書
+    """
+    tag_aliases = {}
+    
+    if not os.path.exists(alias_file_path):
+        print(f"エイリアスファイルが見つかりません: {alias_file_path}")
+        return tag_aliases
+    
+    try:
+        # ファイル拡張子をチェックしてJSONかテキストかを判定
+        if alias_file_path.lower().endswith('.json'):
+            # JSON形式の読み込み
+            import json
+            with open(alias_file_path, 'r', encoding='utf-8') as f:
+                data = json.load(f)
+                
+            if isinstance(data, dict):
+                # 辞書形式の場合、そのまま使用
+                tag_aliases = data
+            else:
+                print(f"警告: JSONファイルが辞書形式ではありません: {alias_file_path}")
+                
+        else:
+            # テキスト形式の読み込み（従来の方式）
+            with open(alias_file_path, 'r', encoding='utf-8') as f:
+                for line_num, line in enumerate(f, 1):
+                    line = line.strip()
+                    if not line or line.startswith('#'):  # 空行やコメント行をスキップ
+                        continue
+                    
+                    # カンマで分割
+                    if ',' in line:
+                        parts = [part.strip() for part in line.split(',')]
+                        if len(parts) >= 2:
+                            old_tag = parts[0]
+                            new_tag = parts[1]
+                            if old_tag and new_tag:
+                                tag_aliases[old_tag] = new_tag
+                            else:
+                                print(f"警告: エイリアスファイルの行 {line_num} に空のタグがあります: {line}")
+                        else:
+                            print(f"警告: エイリアスファイルの行 {line_num} のフォーマットが正しくありません: {line}")
+                    else:
+                        print(f"警告: エイリアスファイルの行 {line_num} にカンマが見つかりません: {line}")
+        
+        print(f"エイリアスファイルから {len(tag_aliases)} 個のタグ変換を読み込みました")
+        
+        # 読み込んだエイリアスの例を表示
+        if tag_aliases:
+            print("エイリアス例:")
+            for i, (old_tag, new_tag) in enumerate(tag_aliases.items()):
+                if i < 3:  # 最初の3個だけ表示
+                    print(f"  {old_tag} → {new_tag}")
+                else:
+                    break
+            if len(tag_aliases) > 3:
+                print(f"  ... および他 {len(tag_aliases) - 3} 個")
+        
+    except json.JSONDecodeError as e:
+        print(f"JSONファイルの解析中にエラーが発生しました: {e}")
+    except Exception as e:
+        print(f"エイリアスファイルの読み込み中にエラーが発生しました: {e}")
+    
+    return tag_aliases
+
+
+def apply_tag_aliases(tags: List[str], tag_aliases: Dict[str, str]) -> List[str]:
+    """
+    タグのリストにエイリアス変換を適用する
+    
+    Args:
+        tags: 元のタグのリスト
+        tag_aliases: エイリアス変換辞書
+    
+    Returns:
+        list: エイリアス変換後のタグのリスト
+    """
+    if not tag_aliases:
+        return tags
+    
+    converted_tags = []
+    conversion_count = 0
+    
+    for tag in tags:
+        if tag in tag_aliases:
+            converted_tag = tag_aliases[tag]
+            converted_tags.append(converted_tag)
+            conversion_count += 1
+            print(f"タグ変換: {tag} → {converted_tag}")
+        else:
+            converted_tags.append(tag)
+    
+    if conversion_count > 0:
+        print(f"合計 {conversion_count} 個のタグが変換されました")
+    
+    return converted_tags
+
+def read_tags_from_file(image_path, remove_special_prefix="remove", tag_aliases=None):
     """画像に紐づくタグファイルを読み込む関数"""
     # 画像パスからタグファイルのパスを生成
     tag_path = os.path.splitext(image_path)[0] + '.txt'
@@ -1465,6 +1627,10 @@ def read_tags_from_file(image_path, remove_special_prefix="remove"):
 
     # タグを正規化
     tags = [normalize_tag(tag) for tag in tags]
+    
+    # エイリアス変換を適用
+    if tag_aliases:
+        tags = apply_tag_aliases(tags, tag_aliases)
 
     # タグを処理
     processed_tags = []
@@ -2205,7 +2371,8 @@ def prepare_dataset(
     remove_special_prefix="remove",
     seed=42,
     cache_dir=None,  # キャッシュディレクトリのパラメータを追加
-    tags_to_remove=None # 削除対象のタグリストを追加
+    tags_to_remove=None, # 削除対象のタグリストを追加
+    alias_file_path=None # エイリアスファイルのパスを追加
 ):
     """
     データセットを準備し、必要に応じてモデルのヘッドを拡張します。
@@ -2214,6 +2381,7 @@ def prepare_dataset(
 
     Args:
         tags_to_remove: データセットとモデルから削除するタグのリスト
+        alias_file_path: エイリアスファイルのパス
 
     Returns:
         train_image_paths: 訓練用画像パスのリスト
@@ -2232,6 +2400,11 @@ def prepare_dataset(
     random.seed(seed)
     np.random.seed(seed)
 
+    # エイリアスファイルを読み込み
+    tag_aliases = {}
+    if alias_file_path:
+        tag_aliases = load_tag_aliases(alias_file_path)
+
     print("画像とタグを収集しています...")
     tags_to_remove_set = set()
     if tags_to_remove:
@@ -2249,7 +2422,7 @@ def prepare_dataset(
                 if file.lower().endswith(('.jpg', '.jpeg', '.png', '.webp')):
                     image_path = os.path.join(root, file)
                     try:
-                        tags = read_tags_from_file(image_path, remove_special_prefix)
+                        tags = read_tags_from_file(image_path, remove_special_prefix, tag_aliases)
                         if tags_to_remove_set:
                             # 削除対象タグを除外
                             tags = [tag for tag in tags if tag not in tags_to_remove_set]
@@ -2280,7 +2453,7 @@ def prepare_dataset(
                     if file.lower().endswith(('.jpg', '.jpeg', '.png', '.webp')):
                         image_path = os.path.join(root, file)
                         try:
-                            tags = read_tags_from_file(image_path, remove_special_prefix)
+                            tags = read_tags_from_file(image_path, remove_special_prefix, tag_aliases)
                             if tags_to_remove_set:
                                 # 削除対象タグを除外
                                 tags = [tag for tag in tags if tag not in tags_to_remove_set]
@@ -3708,6 +3881,7 @@ def main():
     train_parser.add_argument('--reg_image_dirs', type=str, nargs='+', default=None, help='正則化画像のディレクトリ（複数指定可）')
     train_parser.add_argument('--min_tag_freq', type=int, default=10, help='タグの最小出現頻度')
     train_parser.add_argument('--remove_special_prefix', default="omit", choices=["remove", "omit"], help='特殊プレフィックス（例：a@、g@など）を除去する')
+
     # train_parser.add_argument('--image_size', type=int, default=224, help='画像サイズ')
     train_parser.add_argument('--batch_size', type=int, default=4, help='バッチサイズ')
     train_parser.add_argument('--num_workers', type=int, default=4, help='データローダーのワーカー数')
@@ -3732,6 +3906,7 @@ def main():
     train_parser.add_argument('--use_zclip', action='store_true', help='ZClipによる勾配クリッピングを使用する') # ZClip引数を追加
 
     train_parser.add_argument('--tags_to_remove', type=str, default=None, help='削除するタグのファイルパス')
+    train_parser.add_argument('--alias_file', type=str, default=None, help='タグエイリアスファイルのパス')
 
     train_parser.add_argument('--head_only_train_steps', type=int, default=0,
                       help='最初のN回のステップでヘッド部分のみを学習し、他のパラメータをフリーズします')
@@ -4010,7 +4185,8 @@ def main():
             min_tag_freq=args.min_tag_freq,
             remove_special_prefix=args.remove_special_prefix,
             seed=args.seed,
-            tags_to_remove=tags_to_remove_list # 読み込んだリストを渡す
+            tags_to_remove=tags_to_remove_list, # 読み込んだリストを渡す
+            alias_file_path=args.alias_file # エイリアスファイルのパスを渡す
         )
 
         # トレーニング前にLoRAをマージ（指定された場合）
