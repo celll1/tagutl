@@ -568,11 +568,12 @@ def pil_random_rotate(image: Image.Image, max_angle: float = 0.0) -> Image.Image
     if max_angle == 0.0:
         return image
     
-    # ランダムな回転角度を生成（-max_angle から +max_angle）
     import random
+    
+    # ★ 正規分布でランダムな回転角度を生成（0度付近により多く集中）★
     sigma = max_angle / 3.0
     angle = random.gauss(0, sigma)
-
+    
     # 範囲外の場合はクリッピング
     angle = max(-max_angle, min(max_angle, angle))
     
@@ -581,36 +582,42 @@ def pil_random_rotate(image: Image.Image, max_angle: float = 0.0) -> Image.Image
     
     # 回転時に画像全体が見えるように expand=True で回転
     rotated = image.rotate(angle, expand=True, fillcolor=(255, 255, 255))
-    
-    # 回転後のサイズ
     rotated_w, rotated_h = rotated.size
     
-    # 元のサイズに収まるようなスケールを計算
-    scale = min(orig_w / rotated_w, orig_h / rotated_h)
+    # ★ 参照コードと同じロジック：元画像サイズに収まる最大スケールを計算 ★
+    scale = min(orig_h / rotated_h, orig_w / rotated_w)
     
-    # スケーリング実行
+    # スケールに基づいてリサイズ
+    new_w = int(rotated_w * scale)
+    new_h = int(rotated_h * scale)
+    
+    # ★ リサイズが必要な場合のみ実行 ★
     if scale < 1.0:
-        new_w = int(rotated_w * scale)
-        new_h = int(rotated_h * scale)
         rotated = rotated.resize((new_w, new_h), Image.LANCZOS)
-        rotated_w, rotated_h = new_w, new_h
+    else:
+        new_w, new_h = rotated_w, rotated_h
     
-    # 元のサイズにクロップするための開始位置を計算
-    # 中央からのランダムオフセット（正規分布）
-    import random
-    offset_x = int((rotated_w - orig_w) * random.gauss(0, 0.25))
-    offset_y = int((rotated_h - orig_h) * random.gauss(0, 0.25))
+    # ★ ランダムオフセット計算（参照コードと同じ） ★
+    offset_x = int((new_w - orig_w) * random.normalvariate(0, 0.25))
+    offset_y = int((new_h - orig_h) * random.normalvariate(0, 0.25))
     
     # クロップ開始位置（中央 + オフセット）
-    start_x = (rotated_w - orig_w) // 2 + offset_x
-    start_y = (rotated_h - orig_h) // 2 + offset_y
+    start_x = (new_w - orig_w) // 2 + offset_x
+    start_y = (new_h - orig_h) // 2 + offset_y
     
-    # 境界内に収まるよう調整
-    start_x = max(0, min(start_x, rotated_w - orig_w))
-    start_y = max(0, min(start_y, rotated_h - orig_h))
+    # ★ 境界チェック（参照コードと同じ） ★
+    start_x = max(0, min(start_x, new_w - orig_w)) if new_w > orig_w else 0
+    start_y = max(0, min(start_y, new_h - orig_h)) if new_h > orig_h else 0
     
     # 元のサイズにクロップ
-    cropped = rotated.crop((start_x, start_y, start_x + orig_w, start_y + orig_h))
+    end_x = min(start_x + orig_w, new_w)
+    end_y = min(start_y + orig_h, new_h)
+    
+    cropped = rotated.crop((start_x, start_y, end_x, end_y))
+    
+    # ★ 最終サイズ調整（クロップ結果が元サイズと異なる場合） ★
+    if cropped.size != (orig_w, orig_h):
+        cropped = cropped.resize((orig_w, orig_h), Image.LANCZOS)
     
     return cropped
 
