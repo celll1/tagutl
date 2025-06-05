@@ -553,10 +553,53 @@ def pil_ensure_rgb(image: Image.Image) -> Image.Image:
         image = canvas.convert("RGB")
     return image
 
+def pil_random_crop_edges(image: Image.Image, max_crop_px: int = 0) -> Image.Image:
+    """
+    画像の上下左右からランダムに数ピクセルずつクロップする（過学習防止用）
+    
+    Args:
+        image: 入力画像
+        max_crop_px: 各辺からクロップする最大ピクセル数。0の場合はクロップしない
+    
+    Returns:
+        クロップ処理済みの画像
+    """
+    if max_crop_px == 0:
+        return image
+    
+    import random
+    
+    # 現在の画像サイズ
+    orig_w, orig_h = image.size
+    
+    # 各辺からクロップするピクセル数をランダムに決定
+    crop_top = random.randint(0, max_crop_px)
+    crop_bottom = random.randint(0, max_crop_px)  
+    crop_left = random.randint(0, max_crop_px)
+    crop_right = random.randint(0, max_crop_px)
+    
+    # クロップ後のサイズが最低限確保されるかチェック
+    min_size = 64  # 最小画像サイズ
+    new_w = orig_w - crop_left - crop_right
+    new_h = orig_h - crop_top - crop_bottom
+    
+    if new_w < min_size or new_h < min_size:
+        # サイズが小さすぎる場合はクロップしない
+        return image
+    
+    # クロップ実行
+    cropped = image.crop((
+        crop_left,              # left
+        crop_top,               # top  
+        orig_w - crop_right,    # right
+        orig_h - crop_bottom    # bottom
+    ))
+    
+    return cropped
 
 def pil_random_rotate(image: Image.Image, max_angle: float = 0.0) -> Image.Image:
     """
-    画像をランダムに回転させ、四隅の欠けを防ぐために適切にクロップする
+    画像をランダムに回転させ、四隅の欠けを防ぐために数学的に正確にクロップする
     
     Args:
         image: 入力画像
@@ -569,6 +612,9 @@ def pil_random_rotate(image: Image.Image, max_angle: float = 0.0) -> Image.Image
         return image
     
     import random
+    import math
+    import torchvision.transforms.functional as F
+    from torchvision.transforms import InterpolationMode
     
     # ★ 正規分布でランダムな回転角度を生成（0度付近により多く集中）★
     sigma = max_angle / 3.0
@@ -577,49 +623,64 @@ def pil_random_rotate(image: Image.Image, max_angle: float = 0.0) -> Image.Image
     # 範囲外の場合はクリッピング
     angle = max(-max_angle, min(max_angle, angle))
     
-    # 元画像のサイズを保存
-    orig_w, orig_h = image.size
+    # PIL画像をTensorに変換 (C, H, W)
+    img_tensor = F.to_tensor(image)
     
-    # 回転時に画像全体が見えるように expand=True で回転
-    rotated = image.rotate(angle, expand=True, fillcolor=(255, 255, 255))
-    rotated_w, rotated_h = rotated.size
+    # 元画像のサイズを保存 (H, W)
+    orig_h, orig_w = img_tensor.shape[1:3]
     
-    # ★ 参照コードと同じロジック：元画像サイズに収まる最大スケールを計算 ★
-    scale = min(orig_h / rotated_h, orig_w / rotated_w)
+    # ★ torchvision.transforms.functional.rotate を使用して回転 ★
+    rotated = F.rotate(
+        img_tensor, 
+        angle, 
+        interpolation=InterpolationMode.BILINEAR, 
+        expand=True,
+        fill=1.0  # ★ 白で余白を埋める
+    )
     
-    # スケールに基づいてリサイズ
-    new_w = int(rotated_w * scale)
-    new_h = int(rotated_h * scale)
+    # 回転後のサイズ取得
+    rotated_h, rotated_w = rotated.shape[1:3]
     
-    # ★ リサイズが必要な場合のみ実行 ★
-    if scale < 1.0:
-        rotated = rotated.resize((new_w, new_h), Image.LANCZOS)
+    # ★ 数学的に正確な内接矩形計算 ★
+    # 角度をラジアンに変換
+    theta = math.radians(abs(angle))
+    
+    # 連立方程式の解
+    # new_w * sin(θ) + new_h * cos(θ) = orig_h
+    # new_w * cos(θ) + new_h * sin(θ) = orig_w
+    cos_theta = math.cos(theta)
+    sin_theta = math.sin(theta)
+    cos_2theta = math.cos(2 * theta)
+    
+    # cos(2θ) = cos²(θ) - sin²(θ)
+    # ゼロ除算を避けるため、最小値を設定
+    if abs(cos_2theta) < 1e-6:
+        # 45度に近い場合は単純な計算
+        new_w = int(orig_w * cos_theta)
+        new_h = int(orig_h * cos_theta)
     else:
-        new_w, new_h = rotated_w, rotated_h
+        new_w = int((orig_w * cos_theta - orig_h * sin_theta) / cos_2theta)
+        new_h = int((orig_h * cos_theta - orig_w * sin_theta) / cos_2theta)
     
-    # ★ ランダムオフセット計算（参照コードと同じ） ★
-    offset_x = int((new_w - orig_w) * random.normalvariate(0, 0.25))
-    offset_y = int((new_h - orig_h) * random.normalvariate(0, 0.25))
+    # サイズが正の値であることを確認
+    new_w = max(1, min(new_w, orig_w))
+    new_h = max(1, min(new_h, orig_h))
     
-    # クロップ開始位置（中央 + オフセット）
-    start_x = (new_w - orig_w) // 2 + offset_x
-    start_y = (new_h - orig_h) // 2 + offset_y
+    # ★ 中央から計算されたサイズでクロップ ★
+    crop_left = (rotated_w - new_w) // 2
+    crop_top = (rotated_h - new_h) // 2
     
-    # ★ 境界チェック（参照コードと同じ） ★
-    start_x = max(0, min(start_x, new_w - orig_w)) if new_w > orig_w else 0
-    start_y = max(0, min(start_y, new_h - orig_h)) if new_h > orig_h else 0
+    # クロップ実行
+    cropped = rotated[:, 
+                      crop_top:crop_top + new_h,
+                      crop_left:crop_left + new_w]
     
-    # 元のサイズにクロップ
-    end_x = min(start_x + orig_w, new_w)
-    end_y = min(start_y + orig_h, new_h)
+    # # ★ 元のサイズにリサイズ（必要に応じて） ★
+    # if cropped.shape[1] != orig_h or cropped.shape[2] != orig_w:
+    #     cropped = F.resize(cropped, (orig_h, orig_w), interpolation=InterpolationMode.BILINEAR)
     
-    cropped = rotated.crop((start_x, start_y, end_x, end_y))
-    
-    # ★ 最終サイズ調整（クロップ結果が元サイズと異なる場合） ★
-    if cropped.size != (orig_w, orig_h):
-        cropped = cropped.resize((orig_w, orig_h), Image.LANCZOS)
-    
-    return cropped
+    # TensorをPIL画像に変換して返す
+    return F.to_pil_image(cropped)
 
 
 def pil_pad_square(image: Image.Image) -> Image.Image:
@@ -2163,6 +2224,7 @@ class TagImageDataset(torch.utils.data.Dataset):
         cache_dir=None,
         force_recache=False,
         rotation_range=0.0,
+        crop_range=0
     ):
         """
         画像とタグのデータセット
@@ -2184,9 +2246,11 @@ class TagImageDataset(torch.utils.data.Dataset):
         self.cache_dir = cache_dir
         self.force_recache = force_recache
         self.rotation_range = rotation_range
+        self.crop_range = crop_range
 
         print(f"データセットのタグ数: {len(self.tag_to_idx)}")
         print(f"ランダム回転の最大角度: {self.rotation_range}度")
+        print(f"ランダムクロップの最大ピクセル: {self.crop_range}px")
 
         # ★ Rating と Quality タグのインデックスを特定 ★
         self.rating_indices = []
@@ -2319,6 +2383,8 @@ class TagImageDataset(torch.utils.data.Dataset):
             try:
                 image = Image.open(img_path)
                 image = pil_ensure_rgb(image)
+                if self.crop_range > 0:
+                    image = pil_random_crop_edges(image, self.crop_range)
                 if self.rotation_range > 0:
                     image = pil_random_rotate(image, self.rotation_range)
                 image = pil_pad_square(image)
@@ -3922,6 +3988,7 @@ def main():
     train_parser.add_argument('--min_tag_freq', type=int, default=10, help='タグの最小出現頻度')
     train_parser.add_argument('--remove_special_prefix', default="omit", choices=["remove", "omit"], help='特殊プレフィックス（例：a@、g@など）を除去する')
     train_parser.add_argument('--random_rotate', type=float, default=0.0, help='データ拡張用のランダム回転の最大角度（度数、0の場合は回転なし）')
+    train_parser.add_argument('--random_crop', type=int, default=0, help='データ拡張用のランダムクロップの最大角度（度数、0の場合はクロップなし）')
 
     # train_parser.add_argument('--image_size', type=int, default=224, help='画像サイズ')
     train_parser.add_argument('--batch_size', type=int, default=4, help='バッチサイズ')
@@ -4285,7 +4352,8 @@ def main():
             transform=model.transform,
             cache_dir=None if args.cache_dir is None else os.path.join(args.cache_dir, 'train'),  # トレーニング用キャッシュディレクトリ
             force_recache=False,  # キャッシュを強制的に再作成するフラグ
-            rotation_range=args.random_rotate
+            rotation_range=args.random_rotate,
+            crop_range=args.random_crop
         )
 
         val_dataset = TagImageDataset(
@@ -4296,7 +4364,8 @@ def main():
             transform=model.transform,
             cache_dir=None if args.cache_dir is None else os.path.join(args.cache_dir, 'val'),  # 検証用キャッシュディレクトリ
             force_recache=False,  # キャッシュを強制的に再作成するフラグ
-            rotation_range=args.random_rotate
+            rotation_range=args.random_rotate,
+            crop_range=args.random_crop
         )
 
         if args.reg_image_dirs:
@@ -4308,7 +4377,8 @@ def main():
                 transform=model.transform,
                 cache_dir=None if args.cache_dir is None else os.path.join(args.cache_dir, 'reg'),  # 正則化用キャッシュディレクトリ
                 force_recache=False,  # キャッシュを強制的に再作成するフラグ
-                rotation_range=args.random_rotate
+                rotation_range=args.random_rotate,
+                crop_range=args.random_crop
             )
         
         # データローダーの作成
