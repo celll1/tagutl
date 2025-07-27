@@ -275,7 +275,7 @@ REPO_ID = "celstk/wd-eva02-lora-onnx"
 # Model options
 MODEL_OPTIONS = {
     "cl_eva02_tagger_v1_250426": "cl_eva02_tagger_v1_250426/model.onnx",
-    "cl_eva02_tagger_v1_250502": "cl_eva02_tagger_v1_250503/model.onnx",
+    # "cl_eva02_tagger_v1_250502": "cl_eva02_tagger_v1_250503/model.onnx",
     # "cl_eva02_tagger_v1_250509": "cl_eva02_tagger_v1_250509/model.onnx",
     "cl_eva02_tagger_v1_250511": "cl_eva02_tagger_v1_250511/model.onnx",
     # "cl_eva02_tagger_v1_250512": "cl_eva02_tagger_v1_250512/model.onnx",
@@ -285,10 +285,18 @@ MODEL_OPTIONS = {
     # "cl_eva02_tagger_v1_250520": "cl_eva02_tagger_v1_250520/model.onnx",
     # "cl_eva02_tagger_v1_250522": "cl_eva02_tagger_v1_250522/model.onnx",
     # "cl_eva02_tagger_v1_250523": "cl_eva02_tagger_v1_250523/model.onnx",
-    "cl_eva02_tagger_v1_250525": "cl_eva02_tagger_v1_250525/model.onnx",
-    "cl_eva02_tagger_v1_250529": "cl_eva02_tagger_v1_250529/model.onnx"
+    # "cl_eva02_tagger_v1_250702": "cl_eva02_tagger_v1_250702/model.onnx",
+    # "cl_eva02_tagger_v1_250704": "cl_eva02_tagger_v1_250704/model.onnx",
+    # "cl_eva02_tagger_v1_250705": "cl_eva02_tagger_v1_250705/model.onnx",
+    # "cl_eva02_tagger_v1_250706": "cl_eva02_tagger_v1_250706/model.onnx",
+    "cl_eva02_tagger_v1_250707": "cl_eva02_tagger_v1_250707/model.onnx",
+    # "cl_eva02_tagger_v1_250708": "cl_eva02_tagger_v1_250708/model.onnx",
+    "cl_eva02_tagger_v1_250717": "cl_eva02_tagger_v1_250717/model.onnx",
+    "cl_eva02_tagger_v1_250719": "cl_eva02_tagger_v1_250719/model.onnx",
+    "cl_eva02_tagger_v1_250720": "cl_eva02_tagger_v1_250720/model.onnx",
+    "cl_eva02_tagger_v1_250725": "cl_eva02_tagger_v1_250725/model.onnx"
 }
-DEFAULT_MODEL = "cl_eva02_tagger_v1_250529"
+DEFAULT_MODEL = "cl_eva02_tagger_v1_250725"
 CACHE_DIR = "./model_cache"
 
 # --- Global variables for paths (initialized at startup) ---
@@ -536,10 +544,10 @@ with gr.Blocks(css=css) as demo:
     
     gr.Examples(
         examples=[
-            ["https://pbs.twimg.com/media/GXBXsRvbQAAg1kp.jpg", DEFAULT_MODEL, 0.55, 0.70, "Tags + Visualization"],
-            ["https://pbs.twimg.com/media/GjlX0gibcAA4EJ4.jpg", DEFAULT_MODEL, 0.55, 0.70, "Tags Only"],
-            ["https://pbs.twimg.com/media/Gj4nQbjbEAATeoH.jpg", DEFAULT_MODEL, 0.55, 0.70, "Tags + Visualization"],
-            ["https://pbs.twimg.com/media/GkbtX0GaoAMlUZt.jpg", DEFAULT_MODEL, 0.55, 0.70, "Tags + Visualization"]
+            ["https://pbs.twimg.com/media/GXBXsRvbQAAg1kp.jpg", DEFAULT_MODEL, 0.55, 0.55, "Tags + Visualization"],
+            ["https://pbs.twimg.com/media/GjlX0gibcAA4EJ4.jpg", DEFAULT_MODEL, 0.55, 0.55, "Tags Only"],
+            ["https://pbs.twimg.com/media/Gj4nQbjbEAATeoH.jpg", DEFAULT_MODEL, 0.55, 0.55, "Tags + Visualization"],
+            ["https://pbs.twimg.com/media/GkbtX0GaoAMlUZt.jpg", DEFAULT_MODEL, 0.55, 0.55, "Tags + Visualization"]
         ],
         inputs=[image_input, model_choice, gen_threshold, char_threshold, output_mode],
         outputs=[output_tags, output_visualization],

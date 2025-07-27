@@ -683,6 +683,31 @@ def pil_random_rotate(image: Image.Image, max_angle: float = 0.0) -> Image.Image
     return F.to_pil_image(cropped)
 
 
+def pil_resize_max_side(image: Image.Image, max_side: int = 4096) -> Image.Image:
+    """
+    画像の長辺が指定サイズを超える場合、アスペクト比を保ちながら縮小する
+    
+    Args:
+        image: 入力画像
+        max_side: 長辺の最大サイズ（デフォルト: 4096）
+    
+    Returns:
+        リサイズ処理済みの画像
+    """
+    w, h = image.size
+    max_dim = max(w, h)
+    
+    # 長辺がmax_sideを超えている場合のみリサイズ
+    if max_dim > max_side:
+        scale = max_side / max_dim
+        new_w = int(w * scale)
+        new_h = int(h * scale)
+        # Lanczos補間を使用してリサイズ
+        image = image.resize((new_w, new_h), Image.Resampling.LANCZOS)
+    
+    return image
+
+
 def pil_pad_square(image: Image.Image) -> Image.Image:
     w, h = image.size
     # get the largest dimension so we can pad to a square
@@ -2383,6 +2408,8 @@ class TagImageDataset(torch.utils.data.Dataset):
             try:
                 image = Image.open(img_path)
                 image = pil_ensure_rgb(image)
+                # 大きすぎる画像をリサイズ（メモリ節約）
+                image = pil_resize_max_side(image, max_side=4096)
                 if self.crop_range > 0:
                     image = pil_random_crop_edges(image, self.crop_range)
                 if self.rotation_range > 0:
@@ -2534,7 +2561,8 @@ def prepare_dataset(
         
         # ディレクトリ内に有効な画像が1枚も見つからなかった場合、例外を発生させる
         if not valid_images_found:
-            raise Exception(f"ディレクトリ '{image_dir}' に有効な画像とタグのセットが見つかりませんでした。")
+            # raise Exception(f"ディレクトリ '{image_dir}' に有効な画像とタグのセットが見つかりませんでした。")
+            print(f"ディレクトリ '{image_dir}' に有効な画像とタグのセットが見つかりませんでした。")
 
     print(f"メインデータセットの画像数: {len(main_image_paths)}")
 
@@ -2573,7 +2601,8 @@ def prepare_dataset(
                 
                 # ディレクトリ内に有効な画像が1枚も見つからなかった場合、例外を発生させる
                 if not valid_images_found:
-                    raise Exception(f"正則化ディレクトリ '{image_dir}' に有効な画像とタグのセットが見つかりませんでした。")
+                    # raise Exception(f"正則化ディレクトリ '{image_dir}' に有効な画像とタグのセットが見つかりませんでした。")
+                    print(f"正則化ディレクトリ '{image_dir}' に有効な画像とタグのセットが見つかりませんでした。")
 
             print(f"正則化データセットの画像数: {len(reg_image_paths)}")
 

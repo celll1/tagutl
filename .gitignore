@@ -49,3 +49,4 @@ SageAttention/
 *.jpeg
 batch_results.json
 result*
+.claude/settings.local.json

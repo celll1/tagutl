@@ -82,6 +82,25 @@ def normalize_tag_for_sd(tag: str, debug_print: bool = False) -> str:
     tag = tag.replace('_', ' ')
     return tag.strip()
 
+def load_tag_aliases(alias_file_path: str) -> dict:
+    """タグエイリアスを読み込む。古いタグ名をキー、新しいタグ名を値とする辞書を返す。"""
+    if not os.path.isfile(alias_file_path):
+        return {}
+    
+    try:
+        with open(alias_file_path, 'r', encoding='utf-8') as f:
+            aliases = json.load(f)
+        if not isinstance(aliases, dict):
+            print(f"Warning: Expected a dictionary in {alias_file_path}, but got {type(aliases)}.")
+            return {}
+        return aliases
+    except json.JSONDecodeError:
+        print(f"Warning: Could not decode JSON from {alias_file_path}.")
+        return {}
+    except Exception as e:
+        print(f"Warning: Error loading aliases from {alias_file_path}: {e}")
+        return {}
+
 def load_categories_from_tag_groups(tag_group_dir: str) -> dict:
     """taggroupディレクトリからカテゴリ情報を読み込む。"""
     tag_to_category = {}
@@ -137,7 +156,27 @@ def load_categories_from_tag_groups(tag_group_dir: str) -> dict:
             
     return tag_to_category
 
-def process_tag_file(file_path: str, tag_to_category: dict, debug_normalization: bool = False):
+def apply_tag_aliases(tag: str, tag_aliases: dict) -> str:
+    """タグエイリアスを適用する。エイリアスが見つかればそれを返し、なければ元のタグを返す。"""
+    # タグを小文字に変換してエイリアスを検索
+    lower_tag = tag.lower()
+    if lower_tag in tag_aliases:
+        return tag_aliases[lower_tag]
+    
+    # スペースとアンダースコアを考慮した検索
+    # アンダースコアをスペースに変換して検索
+    tag_with_spaces = lower_tag.replace('_', ' ')
+    if tag_with_spaces in tag_aliases:
+        return tag_aliases[tag_with_spaces]
+    
+    # スペースをアンダースコアに変換して検索
+    tag_with_underscores = lower_tag.replace(' ', '_')
+    if tag_with_underscores in tag_aliases:
+        return tag_aliases[tag_with_underscores]
+    
+    return tag
+
+def process_tag_file(file_path: str, tag_to_category: dict, tag_aliases: dict = None, apply_aliases: bool = False, debug_normalization: bool = False):
     """単一のタグファイルを処理し、カテゴリ順にソート後、正規化する。"""
     try:
         with open(file_path, 'r', encoding='utf-8') as f:
@@ -155,6 +194,13 @@ def process_tag_file(file_path: str, tag_to_category: dict, debug_normalization:
         # unknown_tags = [] 
 
         for tag_str_from_file in tags_in_file:
+            # エイリアスを適用（オプションが有効な場合）
+            if apply_aliases and tag_aliases:
+                tag_str_after_alias = apply_tag_aliases(tag_str_from_file, tag_aliases)
+                if tag_str_after_alias != tag_str_from_file and debug_normalization:
+                    print(f"  [DEBUG] Alias applied: '{tag_str_from_file}' -> '{tag_str_after_alias}'")
+                tag_str_from_file = tag_str_after_alias
+            
             search_key = tag_str_from_file.lower().replace('_', ' ')
             search_key_no_escape_no_sd_norm = search_key.replace('\\(', '(').replace('\\)', ')')
             category = tag_to_category.get(search_key_no_escape_no_sd_norm)
@@ -203,6 +249,8 @@ def main():
     parser.add_argument('directories', nargs='+', help='One or more directories to process recursively.')
     # parser.add_argument('--tag_mapping', type=str, required=True, help='Path to the tag_mapping.json file for category information.')
     parser.add_argument('--tag_group_dir', type=str, required=True, help='Path to the directory containing category JSON files (e.g., Character.json, General.json).')
+    parser.add_argument('--tag_aliases', type=str, help='Path to the tag_aliases.json file for converting old tags to current tags.')
+    parser.add_argument('--apply_aliases', action='store_true', help='Apply tag aliases to convert old tags to current tags.')
     parser.add_argument('--debug_normalization', action='store_true', help='Print debug information for tags whose normalization changed due to escaping.')
 
     args = parser.parse_args()
@@ -214,6 +262,18 @@ def main():
     # else:
         # print(f"Loaded {len(tag_categories)} tag-category mappings.") # デバッグ用
 
+    # タグエイリアスの読み込み
+    tag_aliases = {}
+    if args.apply_aliases:
+        if not args.tag_aliases:
+            print("Error: --apply_aliases flag is set but --tag_aliases path is not provided.")
+            return
+        tag_aliases = load_tag_aliases(args.tag_aliases)
+        if tag_aliases:
+            print(f"Loaded {len(tag_aliases)} tag aliases.")
+        else:
+            print("Warning: No tag aliases loaded or file not found.")
+
     for directory in args.directories:
         if not os.path.isdir(directory):
             print(f"Error: {directory} is not a valid directory. Skipping.")
@@ -224,7 +284,7 @@ def main():
             for file in files:
                 if file.lower().endswith('.txt'):
                     file_path = os.path.join(root, file)
-                    process_tag_file(file_path, tag_categories, args.debug_normalization)
+                    process_tag_file(file_path, tag_categories, tag_aliases, args.apply_aliases, args.debug_normalization)
         print(f"Finished processing directory: {directory}")
 
 if __name__ == '__main__':
