@@ -50,3 +50,4 @@ SageAttention/
 batch_results.json
 result*
 .claude/settings.local.json
+.serena/project.yml

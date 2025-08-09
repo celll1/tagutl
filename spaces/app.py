@@ -290,13 +290,17 @@ MODEL_OPTIONS = {
     # "cl_eva02_tagger_v1_250705": "cl_eva02_tagger_v1_250705/model.onnx",
     # "cl_eva02_tagger_v1_250706": "cl_eva02_tagger_v1_250706/model.onnx",
     "cl_eva02_tagger_v1_250707": "cl_eva02_tagger_v1_250707/model.onnx",
-    # "cl_eva02_tagger_v1_250708": "cl_eva02_tagger_v1_250708/model.onnx",
-    "cl_eva02_tagger_v1_250717": "cl_eva02_tagger_v1_250717/model.onnx",
-    "cl_eva02_tagger_v1_250719": "cl_eva02_tagger_v1_250719/model.onnx",
-    "cl_eva02_tagger_v1_250720": "cl_eva02_tagger_v1_250720/model.onnx",
-    "cl_eva02_tagger_v1_250725": "cl_eva02_tagger_v1_250725/model.onnx"
+    # # "cl_eva02_tagger_v1_250708": "cl_eva02_tagger_v1_250708/model.onnx",
+    # "cl_eva02_tagger_v1_250717": "cl_eva02_tagger_v1_250717/model.onnx",
+    # "cl_eva02_tagger_v1_250719": "cl_eva02_tagger_v1_250719/model.onnx",
+    # "cl_eva02_tagger_v1_250720": "cl_eva02_tagger_v1_250720/model.onnx",
+    # "cl_eva02_tagger_v1_250725": "cl_eva02_tagger_v1_250725/model.onnx",
+    # "cl_eva02_tagger_v1_250729": "cl_eva02_tagger_v1_250729/model.onnx",
+    # "cl_eva02_tagger_v1_250801": "cl_eva02_tagger_v1_250801/model.onnx",
+    "cl_eva02_tagger_v1_250804": "cl_eva02_tagger_v1_250804/model.onnx",
+    "cl_eva02_tagger_v1_250807": "cl_eva02_tagger_v1_250807/model.onnx"
 }
-DEFAULT_MODEL = "cl_eva02_tagger_v1_250725"
+DEFAULT_MODEL = "cl_eva02_tagger_v1_250807"
 CACHE_DIR = "./model_cache"
 
 # --- Global variables for paths (initialized at startup) ---
@@ -566,4 +570,4 @@ if __name__ == "__main__":
     # Initialize paths and labels at startup (with default model)
     initialize_onnx_paths(DEFAULT_MODEL)
     # Launch Gradio app
-    demo.launch(share=True)
+    demo.launch()

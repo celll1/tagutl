@@ -50,6 +50,12 @@ except ImportError:
 torch_device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 Image.MAX_IMAGE_PIXELS = None
 
+# Quality tagグループの定義
+QUALITY_TAG_GROUPS = {
+    'high_quality_group': ['best_quality', 'high_quality', 'normal_quality', 'medium_quality'],
+    'low_quality_group': ['low_quality', 'bad_quality', 'worst_quality']
+}
+
 # xformersのインポート（オプション引数が有効な場合のみ）
 def import_xformers():
     try:
@@ -2280,6 +2286,15 @@ class TagImageDataset(torch.utils.data.Dataset):
         # ★ Rating と Quality タグのインデックスを特定 ★
         self.rating_indices = []
         self.quality_indices = []
+        
+        # Quality tagグループのインデックスを特定
+        self.quality_group_indices = {}
+        for group_name, tags in QUALITY_TAG_GROUPS.items():
+            self.quality_group_indices[group_name] = []
+            for tag in tags:
+                if tag in self.tag_to_idx:
+                    self.quality_group_indices[group_name].append(self.tag_to_idx[tag])
+        
         for tag, idx in self.tag_to_idx.items():
             category = self.tag_to_category.get(tag) # タグに対応するカテゴリを取得
             if category == 'Rating':
@@ -2288,6 +2303,7 @@ class TagImageDataset(torch.utils.data.Dataset):
                 self.quality_indices.append(idx)
         print(f"Rating indices identified: {len(self.rating_indices)}")
         print(f"Quality indices identified: {len(self.quality_indices)}")
+        print(f"Quality group indices: {[(name, len(indices)) for name, indices in self.quality_group_indices.items()]}")
         # ★ ここまで追加 ★
 
         # キャッシュ関連の初期化
@@ -2353,6 +2369,10 @@ class TagImageDataset(torch.utils.data.Dataset):
                 loss_mask = torch.ones(num_classes) # デフォルトは全て1
                 has_rating_tag = False
                 has_quality_tag = False
+                
+                # Quality tagグループごとに存在するタグを記録
+                present_quality_groups = set()
+                
                 for tag in tags:
                     if tag in self.tag_to_idx:
                         label[self.tag_to_idx[tag]] = 1.0
@@ -2362,11 +2382,23 @@ class TagImageDataset(torch.utils.data.Dataset):
                             has_rating_tag = True
                         elif category == 'Quality':
                             has_quality_tag = True
+                            # どのquality groupに属するかチェック
+                            for group_name, group_indices in self.quality_group_indices.items():
+                                if self.tag_to_idx[tag] in group_indices:
+                                    present_quality_groups.add(group_name)
 
                 if not has_rating_tag and self.rating_indices:
                     loss_mask[self.rating_indices] = 0.0 # Ratingタグがなければマスク
                 if not has_quality_tag and self.quality_indices:
                     loss_mask[self.quality_indices] = 0.0 # Qualityタグがなければマスク
+                
+                # Quality tagグループ内の相互排他処理（同一グループ内の他タグをマスク）
+                for group_name in present_quality_groups:
+                    group_indices = self.quality_group_indices[group_name]
+                    # このグループ内の現在ラベルがついていないタグをマスク
+                    for idx in group_indices:
+                        if label[idx] == 0.0:  # ラベルがついていないタグをマスク
+                            loss_mask[idx] = 0.0
                 # ★★★ ここまで ★★★
 
                 cache_path = self._get_cache_path(idx)
@@ -2428,6 +2460,10 @@ class TagImageDataset(torch.utils.data.Dataset):
                 # ★★★ ラベルとマスクの同時生成 ★★★
                 has_rating_tag = False
                 has_quality_tag = False
+                
+                # Quality tagグループごとに存在するタグを記録
+                present_quality_groups = set()
+                
                 for tag in tags:
                     # ★ 正規化は不要 (prepare_datasetで既に実施済み想定)
                     if tag in self.tag_to_idx:
@@ -2439,12 +2475,24 @@ class TagImageDataset(torch.utils.data.Dataset):
                             has_rating_tag = True
                         elif category == 'Quality':
                             has_quality_tag = True
+                            # どのquality groupに属するかチェック
+                            for group_name, group_indices in self.quality_group_indices.items():
+                                if tag_idx in group_indices:
+                                    present_quality_groups.add(group_name)
 
                 # ★ マスクの設定 ★
                 if not has_rating_tag and self.rating_indices: # rating_indicesが空でないことも確認
                     loss_mask[self.rating_indices] = 0.0 # Ratingタグがなければマスク
                 if not has_quality_tag and self.quality_indices: # quality_indicesが空でないことも確認
                     loss_mask[self.quality_indices] = 0.0 # Qualityタグがなければマスク
+                
+                # Quality tagグループ内の相互排他処理（同一グループ内の他タグをマスク）
+                for group_name in present_quality_groups:
+                    group_indices = self.quality_group_indices[group_name]
+                    # このグループ内の現在ラベルがついていないタグをマスク
+                    for idx in group_indices:
+                        if label[idx] == 0.0:  # ラベルがついていないタグをマスク
+                            loss_mask[idx] = 0.0
                 # ★★★ ここまで ★★★
 
                 # キャッシュが有効でファイルが存在しない場合は、遅延キャッシュを作成
