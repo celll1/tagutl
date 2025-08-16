@@ -298,9 +298,10 @@ MODEL_OPTIONS = {
     # "cl_eva02_tagger_v1_250729": "cl_eva02_tagger_v1_250729/model.onnx",
     # "cl_eva02_tagger_v1_250801": "cl_eva02_tagger_v1_250801/model.onnx",
     "cl_eva02_tagger_v1_250804": "cl_eva02_tagger_v1_250804/model.onnx",
-    "cl_eva02_tagger_v1_250807": "cl_eva02_tagger_v1_250807/model.onnx"
+    "cl_eva02_tagger_v1_250807": "cl_eva02_tagger_v1_250807/model.onnx",
+    "cl_eva02_tagger_v1_250812": "cl_eva02_tagger_v1_250812/model.onnx"
 }
-DEFAULT_MODEL = "cl_eva02_tagger_v1_250807"
+DEFAULT_MODEL = "cl_eva02_tagger_v1_250812"
 CACHE_DIR = "./model_cache"
 
 # --- Global variables for paths (initialized at startup) ---

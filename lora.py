@@ -4143,6 +4143,7 @@ def main():
     merge_parser.add_argument('--scale', type=float, default=1.0, help='マージ時のスケーリング係数（デフォルト: 1.0）')
     merge_parser.add_argument('--save_format', type=str, default='safetensors', choices=['safetensors', 'pytorch', 'onnx'], help='モデルの保存形式')
     merge_parser.add_argument('--fp16', action='store_true', help='FP16モデルを保存する')
+    merge_parser.add_argument('--onnx_opset', type=int, default=14, choices=[14, 17, 18, 19, 20], help='ONNXのopsetバージョン（デフォルト: 14、18以降推奨）')
 
     merge_parser.add_argument('--merge_type', type=str, default='lora', choices=['lora'], help='マージするモデルの種類')
     """
@@ -4661,7 +4662,7 @@ def main():
                 torch.save(checkpoint, os.path.join(output_dir, f'{filename}.pt'))
                 print(f"Model saved as {os.path.join(output_dir, f'{filename}.pt')}")
 
-        def export_onnx(model, output_dir, filename, fp16=False ,simplify=True, optimize_for_gpu=True):
+        def export_onnx(model, output_dir, filename, fp16=False ,simplify=True, optimize_for_gpu=True, opset=14):
             # ONNX形式で保存
             from timm.utils.model import reparameterize_model
             from timm.utils.onnx import onnx_export
@@ -4677,13 +4678,18 @@ def main():
             # モデルをCPUに移動
             model.to("cpu")
 
-            print(f"ONNX形式で保存します: {onnx_path}")
+            print(f"ONNX形式で保存します: {onnx_path} (opset={opset})")
+            
+            # FP16使用時の警告
+            if fp16 and opset < 18:
+                print("警告: FP16とOpset < 18の組み合わせはLayerNormalizationでオーバーフローを起こす可能性があります。")
+                print("      Opset 18以降の使用を推奨します。正規化層はFP32で保持されます。")
             
             # timmのonnx_exportを使用
             onnx_export(
                 model,
                 onnx_path,
-                opset=14,
+                opset=opset,
                 dynamic_size=True,
                 aten_fallback=False,
                 keep_initializers=False,
@@ -4705,10 +4711,12 @@ def main():
                 # FP16変換
                 if fp16:
                     from onnxconverter_common import float16
+                    # LayerNormalizationをFP32に保持してオーバーフローを防ぐ
+                    # Opset 18以降ではINormalizationLayerが使用され、この問題が改善される
                     model_onnx =  float16.convert_float_to_float16(
                         model_onnx,
                         keep_io_types=True,
-                        op_block_list=['Sigmoid']  # Sigmoidなど特定の演算子はfloat32のまま
+                        op_block_list=['Sigmoid', 'LayerNormalization', 'InstanceNormalization', 'BatchNormalization']  # 正規化層はfloat32のまま
                     )
                 
                 # モデルの簡略化
@@ -4819,7 +4827,7 @@ def main():
                 )
 
             elif args.save_format == 'onnx':
-                export_onnx(model, args.output_dir, filename, fp16=args.fp16)
+                export_onnx(model, args.output_dir, filename, fp16=args.fp16, opset=args.onnx_opset)
 
             # タグマッピングの保存
             save_tag_mapping(args.output_dir, model.idx_to_tag, model.tag_to_category)

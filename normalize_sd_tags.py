@@ -17,11 +17,14 @@ PERSON_COUNT_TAG_PATTERNS = [
     re.compile(r"^\d+girls?$"),
     re.compile(r"^\d+boys?$"),
     re.compile(r"^\d+others?$"),
+    re.compile(r"^no_humans$"),
     re.compile(r"^multiple_girls$"),
     re.compile(r"^multiple_boys$"),
     re.compile(r"^multiple_others$"),
     re.compile(r"^group$"), # group タグも人数関連として扱う
-    re.compile(r"^solo$")   # solo も人数関連
+    re.compile(r"^solo$"),   # solo も人数関連
+    re.compile(r"^solo_focus$"),
+    re.compile(r"^male_focus$")
 ]
 
 # 特殊ケースの定義
