@@ -192,9 +192,8 @@ def process_tag_file(file_path: str, tag_to_category: dict, tag_aliases: dict = 
         if debug_normalization:
             print(f"Processing file for debug: {file_path}")
 
-        categorized_tags = {cat: [] for cat in CATEGORY_ORDER}
-        # unknown_tags リストは不要になる
-        # unknown_tags = [] 
+        categorized_tags = {cat: set() for cat in CATEGORY_ORDER}  # リストではなくセットを使用
+        duplicate_count = 0  # 重複カウント用
 
         for tag_str_from_file in tags_in_file:
             # エイリアスを適用（オプションが有効な場合）
@@ -210,17 +209,21 @@ def process_tag_file(file_path: str, tag_to_category: dict, tag_aliases: dict = 
             # normalize_tag_for_sd にデバッグフラグを渡す
             final_normalized_tag = normalize_tag_for_sd(tag_str_from_file, debug_print=debug_normalization)
 
-            if category and category in categorized_tags:
-                categorized_tags[category].append(final_normalized_tag)
+            # 重複チェック（すでに同じ正規化タグが存在するかチェック）
+            category_to_add = category if category and category in categorized_tags else 'general'
+            if final_normalized_tag in categorized_tags[category_to_add]:
+                duplicate_count += 1
+                if debug_normalization:
+                    print(f"  [DEBUG] Duplicate tag skipped: '{final_normalized_tag}' (category: {category_to_add})")
             else:
-                # カテゴリ不明のタグは general カテゴリに追加
-                categorized_tags['general'].append(final_normalized_tag)
+                categorized_tags[category_to_add].add(final_normalized_tag)
         
+        # セットをリストに変換してソート
         for cat in categorized_tags:
             if cat == 'general':
                 person_tags = []
                 other_general_tags = []
-                for tag in categorized_tags[cat]: # ここには元々の general と unknown が混ざっている
+                for tag in categorized_tags[cat]: # セットから取得
                     if is_person_count_tag(tag):
                         person_tags.append(tag)
                     else:
@@ -229,8 +232,7 @@ def process_tag_file(file_path: str, tag_to_category: dict, tag_aliases: dict = 
                 other_general_tags.sort()
                 categorized_tags[cat] = person_tags + other_general_tags
             else:
-                categorized_tags[cat].sort()
-        # unknown_tags.sort() # 不要
+                categorized_tags[cat] = sorted(list(categorized_tags[cat]))  # セットをソート済みリストに変換
 
         sorted_normalized_tags = []
         for cat_name in CATEGORY_ORDER:
@@ -238,6 +240,9 @@ def process_tag_file(file_path: str, tag_to_category: dict, tag_aliases: dict = 
         # sorted_normalized_tags.extend(unknown_tags) # 不要
         
         new_content = ", ".join(sorted_normalized_tags)
+
+        if duplicate_count > 0:
+            print(f"  Removed {duplicate_count} duplicate tag(s) in {file_path}")
 
         if content.strip() != new_content.strip():
             with open(file_path, 'w', encoding='utf-8') as f:

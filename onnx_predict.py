@@ -713,36 +713,45 @@ def save_tags_as_csv(predictions, # これは閾値などでフィルタリン�
             normalized_final_tags = {normalize_tag(tag) for tag in final_tags}
 
             # ★★★ 既存タグにRating/Qualityがあるかチェック (正規化してカテゴリ判定) ★★★
-            existing_has_rating = any(tag_to_category.get(normalize_tag(tag)) == 'Rating' for tag in final_tags)
-            existing_has_quality = any(tag_to_category.get(normalize_tag(tag)) == 'Quality' for tag in final_tags)
+            existing_rating_tags = [tag for tag in final_tags if tag_to_category.get(normalize_tag(tag)) == 'Rating']
+            existing_quality_tags = [tag for tag in final_tags if tag_to_category.get(normalize_tag(tag)) == 'Quality']
 
+            # ★★★ Rating/Qualityタグがある場合は既存タグを除去してから新しいタグを追加 ★★★
             unique_new_tags_added = []
-            skipped_rating_quality_count = 0 # ★ スキップカウント用
+            replaced_rating_quality_count = 0 # ★ 置き換えカウント用
             for tag in predicted_tags_to_save: # skip適用済みのリスト
                 # ★ 追加するタグも正規化してチェック
                 normalized_tag = normalize_tag(tag)
+                tag_category = tag_to_category.get(normalized_tag)
+                
+                # Rating/Qualityタグの場合は既存の同カテゴリタグを除去
+                if tag_category == 'Rating' and existing_rating_tags:
+                    # 既存のRatingタグを除去
+                    for existing_tag in existing_rating_tags:
+                        if existing_tag in final_tags:
+                            final_tags.remove(existing_tag)
+                            normalized_final_tags.discard(normalize_tag(existing_tag))
+                    existing_rating_tags = []  # 除去済みなのでクリア
+                    replaced_rating_quality_count += 1
+                    print(f"Replaced existing Rating tag(s) with: {tag}")
+                
+                elif tag_category == 'Quality' and existing_quality_tags:
+                    # 既存のQualityタグを除去
+                    for existing_tag in existing_quality_tags:
+                        if existing_tag in final_tags:
+                            final_tags.remove(existing_tag)
+                            normalized_final_tags.discard(normalize_tag(existing_tag))
+                    existing_quality_tags = []  # 除去済みなのでクリア
+                    replaced_rating_quality_count += 1
+                    print(f"Replaced existing Quality tag(s) with: {tag}")
+
+                # 重複チェックして追加
                 if normalized_tag not in normalized_final_tags:
-                    # ★★★ Rating/Quality タグの追加条件チェック ★★★
-                    # カテゴリ判定は正規化後のタグで行う
-                    tag_category = tag_to_category.get(normalized_tag)
-
-                    # remove_threshold が None の場合のみ、この追加制限を適用
-                    if remove_threshold is None:
-                        if tag_category == 'Rating' and existing_has_rating:
-                            # 既存ファイルにRatingタグがあり、追加しようとしているのもRatingタグならスキップ
-                            skipped_rating_quality_count += 1
-                            continue # ★ 次の予測タグへ
-                        if tag_category == 'Quality' and existing_has_quality:
-                            # 既存ファイルにQualityタグがあり、追加しようとしているのもQualityタグならスキップ
-                            skipped_rating_quality_count += 1
-                            continue # ★ 次の予測タグへ
-
-                    # 上記条件に当てはまらない場合、または remove_threshold が設定されている場合は追加
                     unique_new_tags_added.append(tag) # ★ 元のタグ名を追加
                     normalized_final_tags.add(normalized_tag) # セットも更新 (正規化済み)
 
-            if skipped_rating_quality_count > 0:
-                 print(f"Skipped adding {skipped_rating_quality_count} Rating/Quality tag(s) because tags from the same category already exist in the file and remove_threshold is not set.") # ★ スキップ情報をログ出力
+            if replaced_rating_quality_count > 0:
+                 print(f"Replaced {replaced_rating_quality_count} Rating/Quality tag(s) in add mode.")
 
             print(f"Adding {len(unique_new_tags_added)} new unique tags.")
             final_tags.extend(unique_new_tags_added)
