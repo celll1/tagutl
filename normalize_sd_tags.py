@@ -2,6 +2,7 @@ import os
 import argparse
 import re
 import json
+import random
 
 CATEGORY_ORDER = [
     'rating', 'quality', 'character', 'copyright', 'artist', 'general', 'meta', 'model'
@@ -23,8 +24,8 @@ PERSON_COUNT_TAG_PATTERNS = [
     re.compile(r"^multiple_others$"),
     re.compile(r"^group$"), # group タグも人数関連として扱う
     re.compile(r"^solo$"),   # solo も人数関連
-    re.compile(r"^solo_focus$"),
-    re.compile(r"^male_focus$")
+    re.compile(r"^.*_focus$"),  # 任意の*_focusタグ（solo_focus, male_focus等）
+    re.compile(r"^still_life$")  # still_life も人数関連として扱う
 ]
 
 # 特殊ケースの定義
@@ -179,7 +180,7 @@ def apply_tag_aliases(tag: str, tag_aliases: dict) -> str:
     
     return tag
 
-def process_tag_file(file_path: str, tag_to_category: dict, tag_aliases: dict = None, apply_aliases: bool = False, debug_normalization: bool = False):
+def process_tag_file(file_path: str, tag_to_category: dict, tag_aliases: dict = None, apply_aliases: bool = False, debug_normalization: bool = False, randomize_categories: list = None):
     """単一のタグファイルを処理し、カテゴリ順にソート後、正規化する。"""
     try:
         with open(file_path, 'r', encoding='utf-8') as f:
@@ -218,9 +219,10 @@ def process_tag_file(file_path: str, tag_to_category: dict, tag_aliases: dict = 
             else:
                 categorized_tags[category_to_add].add(final_normalized_tag)
         
-        # セットをリストに変換してソート
+        # セットをリストに変換してソート（またはランダム化）
         for cat in categorized_tags:
             if cat == 'general':
+                # generalカテゴリは特別処理（人数タグを先頭に）
                 person_tags = []
                 other_general_tags = []
                 for tag in categorized_tags[cat]: # セットから取得
@@ -228,9 +230,20 @@ def process_tag_file(file_path: str, tag_to_category: dict, tag_aliases: dict = 
                         person_tags.append(tag)
                     else:
                         other_general_tags.append(tag)
-                person_tags.sort()
-                other_general_tags.sort()
+                
+                # generalカテゴリでランダム化が指定されている場合は人数タグとその他を別々にシャッフル
+                if randomize_categories and 'general' in randomize_categories:
+                    random.shuffle(person_tags)
+                    random.shuffle(other_general_tags)
+                else:
+                    person_tags.sort()
+                    other_general_tags.sort()
                 categorized_tags[cat] = person_tags + other_general_tags
+            elif randomize_categories and cat in randomize_categories:
+                # general以外でランダム化が指定されたカテゴリの場合
+                tag_list = list(categorized_tags[cat])
+                random.shuffle(tag_list)
+                categorized_tags[cat] = tag_list
             else:
                 categorized_tags[cat] = sorted(list(categorized_tags[cat]))  # セットをソート済みリストに変換
 
@@ -260,6 +273,7 @@ def main():
     parser.add_argument('--tag_aliases', type=str, help='Path to the tag_aliases.json file for converting old tags to current tags.')
     parser.add_argument('--apply_aliases', action='store_true', help='Apply tag aliases to convert old tags to current tags.')
     parser.add_argument('--debug_normalization', action='store_true', help='Print debug information for tags whose normalization changed due to escaping.')
+    parser.add_argument('--randomize', type=str, nargs='*', help='Randomize tags within specified categories. Use "all" for all categories, or specify category names (e.g., general character)')
 
     args = parser.parse_args()
 
@@ -281,6 +295,22 @@ def main():
             print(f"Loaded {len(tag_aliases)} tag aliases.")
         else:
             print("Warning: No tag aliases loaded or file not found.")
+    
+    # ランダム化するカテゴリの設定
+    randomize_categories = None
+    if args.randomize is not None:
+        if len(args.randomize) == 0 or 'all' in args.randomize:
+            # --randomize または --randomize all の場合、全カテゴリをランダム化
+            randomize_categories = CATEGORY_ORDER
+            print("Randomizing tags in all categories.")
+        else:
+            # 指定されたカテゴリのみランダム化
+            randomize_categories = [cat for cat in args.randomize if cat in CATEGORY_ORDER]
+            invalid_cats = [cat for cat in args.randomize if cat not in CATEGORY_ORDER]
+            if invalid_cats:
+                print(f"Warning: Invalid category names ignored: {invalid_cats}")
+            if randomize_categories:
+                print(f"Randomizing tags in categories: {randomize_categories}")
 
     for directory in args.directories:
         if not os.path.isdir(directory):
@@ -292,7 +322,7 @@ def main():
             for file in files:
                 if file.lower().endswith('.txt'):
                     file_path = os.path.join(root, file)
-                    process_tag_file(file_path, tag_categories, tag_aliases, args.apply_aliases, args.debug_normalization)
+                    process_tag_file(file_path, tag_categories, tag_aliases, args.apply_aliases, args.debug_normalization, randomize_categories)
         print(f"Finished processing directory: {directory}")
 
 if __name__ == '__main__':

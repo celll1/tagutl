@@ -775,6 +775,220 @@ def save_tags_as_csv(predictions, # これは閾値などでフィルタリン�
 
     return formatted_tags
 
+def save_tags_as_json(predictions,
+                     output_path,
+                     tag_to_category,
+                     all_probs_or_logits,
+                     labels,
+                     threshold=0.45,
+                     mode="overwrite",
+                     remove_threshold=None,
+                     skip_rating=False,
+                     skip_quality=False):
+    """
+    予測されたタグをJSON形式で保存する
+    
+    Args:
+        predictions: 選択されたタグの辞書 (get_tags の結果)
+        output_path: 出力ファイルパス
+        tag_to_category: タグからカテゴリへのマッピング辞書
+        all_probs_or_logits (np.ndarray): 全タグの予測値 (logitまたは確率)
+        labels (LabelData): タグ名とインデックスのマッピング情報
+        threshold: タグの閾値 (参考情報)
+        mode: 保存モード ("overwrite"=上書き, "add"=既存タグに追加)
+        remove_threshold: 既存タグを除去する閾値（Noneの場合は除去しない）
+        skip_rating (bool): Rating タグの保存をスキップするかどうか
+        skip_quality (bool): Quality タグの保存をスキップするかどうか
+    """
+    # 1. 保存対象の「新規」タグリストを作成 (skipフラグ適用済み)
+    predicted_tags_to_save = []
+    # Rating (スキップチェック)
+    if not skip_rating and predictions["rating"]:
+        tag, _ = predictions["rating"][0]
+        predicted_tags_to_save.append(tag)
+    # Quality (スキップチェック)
+    if not skip_quality and predictions["quality"]:
+        tag, _ = predictions["quality"][0]
+        predicted_tags_to_save.append(tag)
+    # Others (閾値超え)
+    for category in ["character", "copyright", "artist", "general", "meta", "model"]:
+        for tag, prob in predictions[category]:
+            if category == "meta" and any(pattern in tag.lower() for pattern in ['id', 'commentary', 'mismatch']):
+                continue
+            predicted_tags_to_save.append(tag)
+
+    # 2. 既存タグの読み込みとフィルタリング
+    final_tags = []
+    existing_json_data = {}  # 既存のJSON全体を保持
+    
+    # まず既存のJSONファイルを読み込む（他の属性も保持するため）
+    json_path = output_path.replace('.txt', '.json')
+    txt_path = output_path.replace('.json', '.txt')
+    
+    # JSONファイルが存在する場合、全体を読み込む
+    if os.path.exists(json_path):
+        try:
+            with open(json_path, 'r', encoding='utf-8') as f:
+                existing_json_data = json.load(f)
+            print(f"Existing JSON file loaded with {len(existing_json_data)} attributes.")
+        except Exception as e:
+            print(f"Error reading JSON file {json_path}: {e}")
+            existing_json_data = {}
+    
+    if mode == "add":
+        existing_tags_raw = []
+        
+        # JSONファイルからタグを読み込む
+        if existing_json_data and 'tags' in existing_json_data:
+            # JSONのtagsをカンマ区切り文字列から配列に変換
+            if isinstance(existing_json_data['tags'], str):
+                existing_tags_raw = [t.strip() for t in existing_json_data['tags'].split(',') if t.strip()]
+            elif isinstance(existing_json_data['tags'], list):
+                existing_tags_raw = existing_json_data['tags']
+            print(f"Existing tags from JSON: {len(existing_tags_raw)} tags.")
+        
+        # JSONが無くてTXTファイルが存在する場合
+        if not existing_tags_raw and os.path.exists(txt_path):
+            try:
+                with open(txt_path, 'r', encoding='utf-8') as f:
+                    content = f.read().strip()
+                    existing_tags_raw = [t.strip() for t in content.split(',') if t.strip()]
+                print(f"Existing tags from TXT: {len(existing_tags_raw)} tags.")
+            except Exception as e:
+                print(f"Error reading TXT file {txt_path}: {e}")
+
+        if existing_tags_raw:
+            # タグ名からインデックスへの逆引きマップを作成
+            name_to_idx = {name: i for i, name in enumerate(labels.names) if name is not None}
+
+            # remove_threshold 適用
+            if remove_threshold is not None:
+                print(f"--- Applying remove_threshold: {remove_threshold} ---")
+                filtered_existing_tags = []
+                removed_tags_info = []
+                kept_tags_info = []
+
+                def stable_sigmoid(x):
+                    x = np.clip(x, -50, 50)
+                    return np.where(
+                        x >= 0,
+                        1 / (1 + np.exp(-x)),
+                        np.exp(x) / (1 + np.exp(x))
+                    )
+
+                if all_probs_or_logits.ndim > 1:
+                    print(f"Warning: Received multi-dimensional array ({all_probs_or_logits.shape}) in save_tags_as_json.")
+
+                # 値が0-1の範囲外なら sigmoid を適用
+                if np.any(all_probs_or_logits < -0.1) or np.any(all_probs_or_logits > 1.1):
+                    print("Applying sigmoid inside save_tags_as_json as input seems to be logits.")
+                    all_probs_calculated = stable_sigmoid(all_probs_or_logits)
+                else:
+                    all_probs_calculated = all_probs_or_logits
+
+                for tag in existing_tags_raw:
+                    normalized_tag = normalize_tag(tag)
+                    tag_index = name_to_idx.get(normalized_tag)
+
+                    if tag_index is not None and tag_index < len(all_probs_calculated):
+                        current_prob = all_probs_calculated[tag_index]
+                        if current_prob >= remove_threshold:
+                            filtered_existing_tags.append(tag)
+                            kept_tags_info.append((tag, current_prob))
+                        else:
+                            removed_tags_info.append((tag, current_prob))
+                    else:
+                        # モデルの語彙にない既存タグはそのまま保持
+                        filtered_existing_tags.append(tag)
+                        kept_tags_info.append((tag, None))
+
+                # デバッグ出力
+                if kept_tags_info:
+                    kept_tags_info.sort(key=lambda x: x[1] if x[1] is not None else -1, reverse=True)
+                    print(f"Kept {len(kept_tags_info)} existing tags")
+
+                if removed_tags_info:
+                    removed_tags_info.sort(key=lambda x: x[1])
+                    print(f"Removing {len(removed_tags_info)} existing tags below threshold")
+
+                final_tags = filtered_existing_tags
+            else:
+                final_tags = existing_tags_raw
+
+            # 3. 新規タグの追加 (重複排除 + Rating/Quality重複チェック)
+            normalized_final_tags = {normalize_tag(tag) for tag in final_tags}
+
+            # 既存タグにRating/Qualityがあるかチェック
+            existing_rating_tags = [tag for tag in final_tags if tag_to_category.get(normalize_tag(tag)) == 'Rating']
+            existing_quality_tags = [tag for tag in final_tags if tag_to_category.get(normalize_tag(tag)) == 'Quality']
+
+            # Rating/Qualityタグがある場合は既存タグを除去してから新しいタグを追加
+            unique_new_tags_added = []
+            replaced_rating_quality_count = 0
+
+            for tag in predicted_tags_to_save:
+                normalized_tag = normalize_tag(tag)
+                tag_category = tag_to_category.get(normalized_tag)
+                
+                # Rating/Qualityタグの場合は既存の同カテゴリタグを除去
+                if tag_category == 'Rating' and existing_rating_tags:
+                    for existing_tag in existing_rating_tags:
+                        if existing_tag in final_tags:
+                            final_tags.remove(existing_tag)
+                            normalized_final_tags.discard(normalize_tag(existing_tag))
+                    existing_rating_tags = []
+                    replaced_rating_quality_count += 1
+                    print(f"Replaced existing Rating tag(s) with: {tag}")
+                
+                elif tag_category == 'Quality' and existing_quality_tags:
+                    for existing_tag in existing_quality_tags:
+                        if existing_tag in final_tags:
+                            final_tags.remove(existing_tag)
+                            normalized_final_tags.discard(normalize_tag(existing_tag))
+                    existing_quality_tags = []
+                    replaced_rating_quality_count += 1
+                    print(f"Replaced existing Quality tag(s) with: {tag}")
+
+                # 重複チェックして追加
+                if normalized_tag not in normalized_final_tags:
+                    unique_new_tags_added.append(tag)
+                    normalized_final_tags.add(normalized_tag)
+
+            if replaced_rating_quality_count > 0:
+                print(f"Replaced {replaced_rating_quality_count} Rating/Quality tag(s) in add mode.")
+
+            print(f"Adding {len(unique_new_tags_added)} new unique tags.")
+            final_tags.extend(unique_new_tags_added)
+
+    else:
+        # 上書きモードまたは既存ファイルがない場合
+        final_tags = predicted_tags_to_save
+
+    # 4. 出力フォーマットして保存
+    formatted_tags = [standardize_tag_format(tag) for tag in final_tags if tag]
+
+    # JSON形式で保存（既存の属性を保持）
+    if mode == "overwrite" and existing_json_data:
+        # overwriteモードでも他の属性は保持
+        output_data = existing_json_data.copy()
+        output_data["tags"] = ", ".join(formatted_tags)
+    else:
+        # addモードまたは新規作成の場合
+        if existing_json_data:
+            output_data = existing_json_data.copy()
+        else:
+            output_data = {}
+        output_data["tags"] = ", ".join(formatted_tags)
+
+    try:
+        with open(output_path, 'w', encoding='utf-8') as f:
+            json.dump(output_data, f, ensure_ascii=False, indent=2)
+        print(f"Tags saved to {output_path} (Mode: {mode}, Total tags: {len(formatted_tags)}, Total attributes: {len(output_data)})")
+    except Exception as e:
+        print(f"Error writing tags to {output_path}: {e}")
+
+    return formatted_tags
+
 def extract_frames_from_video(video_path, num_frames):
     """
     動画ファイルから等間隔でフレームを抽出する
@@ -1027,11 +1241,12 @@ def predict_with_onnx(
         tag_output_path = None
     else:
         # タグのみの出力の場合
+        ext = ".json" if output_mode == "json" else ".txt"
         if output_path:
             # 出力ディレクトリが指定されている場合はそこに保存
             tag_output_dir = output_path
             os.makedirs(tag_output_dir, exist_ok=True)
-            tag_output_path = os.path.join(tag_output_dir, f"{base_filename}.txt")
+            tag_output_path = os.path.join(tag_output_dir, f"{base_filename}{ext}")
         else:
             # 出力ディレクトリが指定されていない場合
             # バッチ推論時は画像と同じディレクトリ、単一推論時はカレントディレクトリ
@@ -1039,7 +1254,7 @@ def predict_with_onnx(
                 tag_output_dir = os.path.dirname(image_path)
             else:
                 tag_output_dir = "."
-            tag_output_path = os.path.join(tag_output_dir, f"{base_filename}.txt")
+            tag_output_path = os.path.join(tag_output_dir, f"{base_filename}{ext}")
 
     # 結果の保存
     if output_mode == "visualization":
@@ -1051,8 +1266,22 @@ def predict_with_onnx(
             threshold=gen_threshold,
             output_path=viz_output_path
         )
-    else:
+    elif output_mode == "txt":
         save_tags_as_csv(
+            predictions,
+            tag_output_path,
+            tag_to_category,
+            all_probs_or_logits=outputs[0],
+            labels=labels,
+            threshold=gen_threshold,
+            mode=tag_mode,
+            remove_threshold=remove_threshold,
+            skip_rating=skip_rating,
+            skip_quality=skip_quality
+        )
+    elif output_mode == "json":
+        # tag_output_pathは既に.jsonとして設定されている
+        save_tags_as_json(
             predictions,
             tag_output_path,
             tag_to_category,
@@ -1292,10 +1521,14 @@ def batch_predict(dirs, model_path, tag_mapping_path, gen_threshold=0.45, char_t
                             prediction_dir = "prediction"
                             os.makedirs(prediction_dir, exist_ok=True)
                             output_path = os.path.join(prediction_dir, f"{base_filename}.png")
-                        else:
-                            # タグのみの出力の場合、画像と同じディレクトリに保存
+                        elif output_mode == "txt":
+                            # TXTモードの場合、画像と同じディレクトリに保存
                             tag_output_dir = os.path.dirname(image_path)
                             output_path = os.path.join(tag_output_dir, f"{base_filename}.txt")
+                        elif output_mode == "json":
+                            # JSONモードの場合、画像と同じディレクトリに保存
+                            tag_output_dir = os.path.dirname(image_path)
+                            output_path = os.path.join(tag_output_dir, f"{base_filename}.json")
                         
                         # 結果の保存
                         if output_mode == "visualization":
@@ -1307,12 +1540,26 @@ def batch_predict(dirs, model_path, tag_mapping_path, gen_threshold=0.45, char_t
                                 threshold=gen_threshold,
                                 output_path=output_path
                             )
-                        else:
+                        elif output_mode == "txt":
                             save_tags_as_csv(
                                 predictions,
                                 output_path,
                                 tag_to_category,
-                                all_probs_or_logits=outputs[0],
+                                all_probs_or_logits=outputs[idx],
+                                labels=labels,
+                                threshold=gen_threshold,
+                                mode=tag_mode,
+                                remove_threshold=remove_threshold,
+                                skip_rating=skip_rating,
+                                skip_quality=skip_quality
+                            )
+                        elif output_mode == "json":
+                            # output_pathは既に.jsonとして設定されている
+                            save_tags_as_json(
+                                predictions,
+                                output_path,
+                                tag_to_category,
+                                all_probs_or_logits=outputs[idx],
                                 labels=labels,
                                 threshold=gen_threshold,
                                 mode=tag_mode,
@@ -1423,10 +1670,14 @@ def batch_predict(dirs, model_path, tag_mapping_path, gen_threshold=0.45, char_t
                     prediction_dir = "prediction"
                     os.makedirs(prediction_dir, exist_ok=True)
                     output_path = os.path.join(prediction_dir, f"{base_filename}.png")
-                else:
-                    # タグのみの出力の場合、動画と同じディレクトリに保存
+                elif output_mode == "txt":
+                    # TXTモードの場合、動画と同じディレクトリに保存
                     tag_output_dir = os.path.dirname(video_path)
                     output_path = os.path.join(tag_output_dir, f"{base_filename}.txt")
+                elif output_mode == "json":
+                    # JSONモードの場合、動画と同じディレクトリに保存
+                    tag_output_dir = os.path.dirname(video_path)
+                    output_path = os.path.join(tag_output_dir, f"{base_filename}.json")
                 
                 # 結果の保存
                 if output_mode == "visualization":
@@ -1438,8 +1689,22 @@ def batch_predict(dirs, model_path, tag_mapping_path, gen_threshold=0.45, char_t
                         threshold=gen_threshold,
                         output_path=output_path
                     )
-                else:
+                elif output_mode == "txt":
                     save_tags_as_csv(
+                        combined_predictions,
+                        output_path,
+                        tag_to_category,
+                        all_probs_or_logits=np.mean(np.stack([frame_predictions[category] for frame_predictions in all_frame_predictions], axis=0), axis=0),
+                        labels=labels,
+                        threshold=gen_threshold,
+                        mode=tag_mode,
+                        remove_threshold=remove_threshold,
+                        skip_rating=skip_rating,
+                        skip_quality=skip_quality
+                    )
+                elif output_mode == "json":
+                    # output_pathは既に.jsonとして設定されている
+                    save_tags_as_json(
                         combined_predictions,
                         output_path,
                         tag_to_category,
@@ -1554,7 +1819,8 @@ def combine_frame_predictions(frame_predictions, gen_threshold=0.45, char_thresh
     return result
 
 def predict_video_with_onnx(video_path, model_path, tag_mapping_path, gen_threshold=0.45, char_threshold=0.45, 
-                           output_path=None, use_gpu=False, output_mode="visualization", video_frames=3, tag_mode="add", remove_threshold=None):
+                           output_path=None, use_gpu=False, output_mode="visualization", video_frames=3, tag_mode="add", 
+                           remove_threshold=None, skip_rating=False, skip_quality=False):
     """
     単一の動画ファイルに対して推論を実行する
     
@@ -1790,10 +2056,28 @@ def predict_video_with_onnx(video_path, model_path, tag_mapping_path, gen_thresh
             threshold=gen_threshold,
             output_path=output_path
         )
-    else:
+    elif output_mode == "txt":
         save_tags_as_csv(
             combined_predictions,
             output_path,
+            tag_to_category,
+            all_probs_or_logits=np.mean(np.stack([frame_predictions[category] for frame_predictions in all_frame_predictions], axis=0), axis=0),
+            labels=labels,
+            threshold=gen_threshold,
+            mode=tag_mode,
+            remove_threshold=remove_threshold,
+            skip_rating=skip_rating,
+            skip_quality=skip_quality
+        )
+    elif output_mode == "json":
+        # JSONモードの場合、出力パスの拡張子を.jsonに変更
+        if not output_path.endswith('.json'):
+            json_output_path = os.path.splitext(output_path)[0] + '.json'
+        else:
+            json_output_path = output_path
+        save_tags_as_json(
+            combined_predictions,
+            json_output_path,
             tag_to_category,
             all_probs_or_logits=np.mean(np.stack([frame_predictions[category] for frame_predictions in all_frame_predictions], axis=0), axis=0),
             labels=labels,
@@ -1823,8 +2107,8 @@ def main():
     
     # 出力関連の引数
     parser.add_argument('--output', type=str, default=None, help='結果の出力パス（単一画像/動画モードのみ）')
-    parser.add_argument('--output_mode', type=str, choices=['visualization', 'tags'], default='visualization',
-                        help='出力モード: visualization=可視化画像, tags=カンマ区切りタグ')
+    parser.add_argument('--output_mode', type=str, choices=['visualization', 'txt', 'json'], default='visualization',
+                        help='出力モード: visualization=可視化画像, txt=カンマ区切りタグ, json=JSON形式')
     
     # 閾値関連の引数
     parser.add_argument('--gen_threshold', type=float, default=0.45, help='一般タグの閾値')
