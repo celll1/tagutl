@@ -383,6 +383,158 @@ def sort_tags_from_predictions(predictions, formatted_tags, debug=False):
     
     return sorted_tags
 
+def sort_tags_using_predictions(predictions, tags_to_sort, debug=False):
+    """
+    get_tagsの予測結果のカテゴリ情報を使ってタグを整列する
+    
+    Args:
+        predictions: カテゴリ別の予測結果辞書 (get_tags の結果)
+        tags_to_sort: ソートする必要があるタグのリスト（アンダースコア形式）
+        debug: デバッグ出力フラグ
+
+    Returns:
+        整列されたタグのリスト
+    """
+    import re
+    
+    # タグを正規化してセットに変換（重複チェック用）
+    tags_to_sort_normalized = {normalize_tag(tag): tag for tag in tags_to_sort}
+    
+    # 人数関連タグを識別するための正規表現パターン
+    PERSON_COUNT_TAG_PATTERNS = [
+        re.compile(r"^\d+girls?$"),
+        re.compile(r"^\d+boys?$"),
+        re.compile(r"^\d+others?$"),
+        re.compile(r"^no_humans$"),
+        re.compile(r"^multiple_girls$"),
+        re.compile(r"^multiple_boys$"),
+        re.compile(r"^multiple_others$"),
+        re.compile(r"^group$"),
+        re.compile(r"^solo$"),
+        re.compile(r"^.*_focus$"),
+        re.compile(r"^still_life$")
+    ]
+    
+    def is_person_count_tag(tag: str) -> bool:
+        """指定されたタグが人数関連タグかどうかを判定する。"""
+        for pattern in PERSON_COUNT_TAG_PATTERNS:
+            if pattern.match(tag):
+                return True
+        return False
+    
+    # カテゴリ別にタグを整理
+    categorized_tags = {
+        'Rating': [],
+        'Quality': [],
+        'Character': [],
+        'Copyright': [],
+        'Artist': [],
+        'General_Special': [],  # a@xxx形式の学習除外タグ
+        'General_Person_Count': [],  # 人数関連タグ
+        'General': [],
+        'Unknown': [],  # 予測結果にないタグ
+        'Meta': [],
+        'Model': []
+    }
+    
+    # 処理済みタグを記録
+    processed_tags = set()
+    
+    # predictionsからカテゴリごとにタグを収集
+    # Rating
+    for tag, _ in predictions.get("rating", []):
+        normalized = normalize_tag(tag)
+        if normalized in tags_to_sort_normalized:
+            categorized_tags['Rating'].append(tags_to_sort_normalized[normalized])
+            processed_tags.add(normalized)
+    
+    # Quality
+    for tag, _ in predictions.get("quality", []):
+        normalized = normalize_tag(tag)
+        if normalized in tags_to_sort_normalized:
+            categorized_tags['Quality'].append(tags_to_sort_normalized[normalized])
+            processed_tags.add(normalized)
+    
+    # Character
+    for tag, _ in predictions.get("character", []):
+        normalized = normalize_tag(tag)
+        if normalized in tags_to_sort_normalized:
+            categorized_tags['Character'].append(tags_to_sort_normalized[normalized])
+            processed_tags.add(normalized)
+    
+    # Copyright
+    for tag, _ in predictions.get("copyright", []):
+        normalized = normalize_tag(tag)
+        if normalized in tags_to_sort_normalized:
+            categorized_tags['Copyright'].append(tags_to_sort_normalized[normalized])
+            processed_tags.add(normalized)
+    
+    # Artist
+    for tag, _ in predictions.get("artist", []):
+        normalized = normalize_tag(tag)
+        if normalized in tags_to_sort_normalized:
+            categorized_tags['Artist'].append(tags_to_sort_normalized[normalized])
+            processed_tags.add(normalized)
+    
+    # General (学習除外タグと人数関連タグを分離)
+    for tag, _ in predictions.get("general", []):
+        normalized = normalize_tag(tag)
+        if normalized in tags_to_sort_normalized:
+            original_tag = tags_to_sort_normalized[normalized]
+            # 学習除外タグかどうかチェック
+            if re.match(r'^[a-zA-Z]@', original_tag):
+                categorized_tags['General_Special'].append(original_tag)
+            # 人数関連タグかどうかチェック
+            elif is_person_count_tag(original_tag):
+                categorized_tags['General_Person_Count'].append(original_tag)
+            else:
+                categorized_tags['General'].append(original_tag)
+            processed_tags.add(normalized)
+    
+    # Meta
+    for tag, _ in predictions.get("meta", []):
+        normalized = normalize_tag(tag)
+        if normalized in tags_to_sort_normalized:
+            categorized_tags['Meta'].append(tags_to_sort_normalized[normalized])
+            processed_tags.add(normalized)
+    
+    # Model
+    for tag, _ in predictions.get("model", []):
+        normalized = normalize_tag(tag)
+        if normalized in tags_to_sort_normalized:
+            categorized_tags['Model'].append(tags_to_sort_normalized[normalized])
+            processed_tags.add(normalized)
+    
+    # 予測結果にないタグ（既存タグなど）はUnknownに分類
+    for normalized, original_tag in tags_to_sort_normalized.items():
+        if normalized not in processed_tags:
+            categorized_tags['Unknown'].append(original_tag)
+    
+    # 各カテゴリ内でアルファベット順に整列
+    for category in categorized_tags:
+        categorized_tags[category].sort()
+    
+    if debug:
+        for category, tags in categorized_tags.items():
+            if tags:
+                print(f"[DEBUG SORT] {category}: {len(tags)} tags - {tags[:3]}{'...' if len(tags) > 3 else ''}")
+    
+    # カテゴリ順で結合
+    sorted_tags = []
+    sorted_tags.extend(categorized_tags['Rating'])
+    sorted_tags.extend(categorized_tags['Quality'])
+    sorted_tags.extend(categorized_tags['Character'])
+    sorted_tags.extend(categorized_tags['Copyright'])
+    sorted_tags.extend(categorized_tags['Artist'])
+    sorted_tags.extend(categorized_tags['General_Special'])
+    sorted_tags.extend(categorized_tags['General_Person_Count'])
+    sorted_tags.extend(categorized_tags['General'])
+    sorted_tags.extend(categorized_tags['Unknown'])
+    sorted_tags.extend(categorized_tags['Meta'])
+    sorted_tags.extend(categorized_tags['Model'])
+    
+    return sorted_tags
+
 def read_tags_from_file(image_path, remove_special_prefix="remove"):
     # 画像ファイルからタグを読み込む
     tags = []
@@ -1063,21 +1215,27 @@ def save_tags_as_csv(predictions, # これは閾値などでフィルタリン�
         # 上書きモードまたは既存ファイルがない場合
         final_tags = predicted_tags_to_save # skipフラグ適用済みのリスト
 
-    # 4. 出力フォーマットして整列保存
-    formatted_tags = [standardize_tag_format(tag) for tag in final_tags if tag] # 空タグを除外
+    # 4. タグをソート（predictionsから直接カテゴリ情報を使用）
+    sorted_tags = sort_tags_using_predictions(predictions, final_tags, debug=debug)
     
-    # タグを整列（カテゴリ順、学習除外タグを考慮）
-    # タグを整列（既にカテゴリ分類済みの情報を活用）
-    sorted_tags = sort_tags_from_predictions(predictions, formatted_tags, debug=debug)
+    # 5. フォーマット変換（TXT用に単一エスケープ）
+    formatted_tags = []
+    for tag in sorted_tags:
+        if tag:
+            # TXT用のフォーマット（単一エスケープ、スペース区切り）
+            formatted_tag = tag.replace('_', ' ')
+            # 括弧をTXT用に単一エスケープ
+            formatted_tag = formatted_tag.replace('(', '\\(').replace(')', '\\)')
+            formatted_tags.append(formatted_tag)
 
     try:
         with open(output_path, 'w', encoding='utf-8') as f:
-            f.write(", ".join(sorted_tags))
-        print(f"Tags saved to {output_path} (Mode: {mode}, Total tags: {len(sorted_tags)})")
+            f.write(", ".join(formatted_tags))
+        print(f"Tags saved to {output_path} (Mode: {mode}, Total tags: {len(formatted_tags)})\")")
     except Exception as e:
         print(f"Error writing tags to {output_path}: {e}")
 
-    return sorted_tags
+    return formatted_tags
 
 def save_tags_as_json(predictions,
                      output_path,
@@ -1110,7 +1268,7 @@ def save_tags_as_json(predictions,
         print(f"[DEBUG JSON] Starting save_tags_as_json, mode: {mode}")
         print(f"[DEBUG JSON] Predictions summary: rating={len(predictions['rating'])}, general={len(predictions['general'])}, character={len(predictions['character'])}")
     
-    # 1. 保存対象の「新規」タグリストを作成 (skipフラグ適用済み)
+    # 1. 保存対象の「新規」タグリストを作成 (skip フラグ適用済み)
     predicted_tags_to_save = []
     # Rating (スキップチェック)
     if not skip_rating and predictions["rating"]:
@@ -1297,43 +1455,40 @@ def save_tags_as_json(predictions,
             print(f"[DEBUG JSON] Overwrite/new mode: final_tags = {len(final_tags)} tags")
 
     if debug:
-        print(f"[DEBUG JSON] Before formatting: final_tags = {len(final_tags)} tags")
-    # 4. 出力フォーマットして整列保存
-    formatted_tags = [standardize_tag_format(tag) for tag in final_tags if tag]
-    if debug:
-        print(f"[DEBUG JSON] After formatting: formatted_tags = {len(formatted_tags)} tags")
+        print(f"[DEBUG JSON] Before sorting: final_tags = {len(final_tags)} tags")
     
-    # タグを整列（既にカテゴリ分類済みの情報を活用）
-    if debug:
-        print(f"[DEBUG JSON] Sorting tags using prediction categories")
+    # 4. タグをカテゴリごとに整列（predictions から直接カテゴリ情報を使用）
+    sorted_tags = sort_tags_using_predictions(predictions, final_tags, debug=debug)
     
-    sorted_tags = sort_tags_from_predictions(predictions, formatted_tags, debug=debug)
     if debug:
         print(f"[DEBUG JSON] After sorting: sorted_tags = {len(sorted_tags)} tags")
-        # ソート後の最初の10個のタグを表示
-        print(f"[DEBUG JSON] First 10 sorted tags: {sorted_tags[:10]}")
+    
+    # 5. フォーマット変換（最後に実行）
+    formatted_tags = [standardize_tag_format(tag) for tag in sorted_tags if tag]
+    if debug:
+        print(f"[DEBUG JSON] After formatting: formatted_tags = {len(formatted_tags)} tags")
 
     # JSON形式で保存（既存の属性を保持）
     if mode == "overwrite" and existing_json_data:
         # overwriteモードでも他の属性は保持
         output_data = existing_json_data.copy()
-        output_data["tags"] = ", ".join(sorted_tags)
+        output_data["tags"] = ", ".join(formatted_tags)
     else:
         # addモードまたは新規作成の場合
         if existing_json_data:
             output_data = existing_json_data.copy()
         else:
             output_data = {}
-        output_data["tags"] = ", ".join(sorted_tags)
+        output_data["tags"] = ", ".join(formatted_tags)
 
     try:
         with open(output_path, 'w', encoding='utf-8') as f:
             json.dump(output_data, f, ensure_ascii=False, indent=2)
-        print(f"Tags saved to {output_path} (Mode: {mode}, Total tags: {len(sorted_tags)}, Total attributes: {len(output_data)})")
+        print(f"Tags saved to {output_path} (Mode: {mode}, Total tags: {len(formatted_tags)}, Total attributes: {len(output_data)})")
     except Exception as e:
         print(f"Error writing tags to {output_path}: {e}")
 
-    return sorted_tags
+    return formatted_tags
 
 def extract_frames_from_video(video_path, num_frames):
     """
