@@ -1703,26 +1703,57 @@ def apply_tag_aliases(tags: List[str], tag_aliases: Dict[str, str]) -> List[str]
     return converted_tags
 
 def read_tags_from_file(image_path, remove_special_prefix="remove", tag_aliases=None):
-    """画像に紐づくタグファイルを読み込む関数"""
-    # 画像パスからタグファイルのパスを生成
-    tag_path = os.path.splitext(image_path)[0] + '.txt'
+    """画像に紐づくタグファイルを読み込む関数（TXT優先、JSONフォールバック）"""
+    base_path = os.path.splitext(image_path)[0]
+    txt_path = base_path + '.txt'
+    json_path = base_path + '.json'
     
-    # タグファイルが存在するか確認
-    if not os.path.exists(tag_path):
-        print(f"Warning: Tag file not found at {tag_path}")
-        return []
+    # TXTファイルを優先的にチェック
+    if os.path.exists(txt_path):
+        # TXTファイルを読み込む
+        with open(txt_path, 'r', encoding='utf-8') as f:
+            content = f.read().strip()
+            
+        # カンマ区切りのタグを処理
+        if ',' in content:
+            # カンマ区切りのタグをリストに変換し、各タグの前後の空白を削除
+            tags = [tag.strip() for tag in content.split(',') if tag.strip()]
+        else:
+            # 行ごとに読み込み
+            tags = [line.strip() for line in content.splitlines() if line.strip()]
     
-    # タグファイルを読み込む
-    with open(tag_path, 'r', encoding='utf-8') as f:
-        content = f.read().strip()
-        
-    # カンマ区切りのタグを処理
-    if ',' in content:
-        # カンマ区切りのタグをリストに変換し、各タグの前後の空白を削除
-        tags = [tag.strip() for tag in content.split(',') if tag.strip()]
+    # TXTがない場合はJSONファイルをチェック
+    elif os.path.exists(json_path):
+        try:
+            with open(json_path, 'r', encoding='utf-8') as f:
+                data = json.load(f)
+                
+            # "tags"フィールドからタグを取得
+            if 'tags' in data:
+                tags_content = data['tags']
+                if isinstance(tags_content, str):
+                    # 文字列の場合はカンマ区切りとして処理
+                    tags = [tag.strip() for tag in tags_content.split(',') if tag.strip()]
+                elif isinstance(tags_content, list):
+                    # リストの場合はそのまま使用
+                    tags = [str(tag).strip() for tag in tags_content if str(tag).strip()]
+                else:
+                    print(f"Warning: Invalid 'tags' field format in {json_path}")
+                    return []
+            else:
+                print(f"Warning: No 'tags' field found in {json_path}")
+                return []
+        except json.JSONDecodeError:
+            print(f"Warning: Invalid JSON format in {json_path}")
+            return []
+        except Exception as e:
+            print(f"Warning: Error reading JSON file {json_path}: {e}")
+            return []
+    
+    # 両方とも存在しない場合
     else:
-        # 行ごとに読み込み
-        tags = [line.strip() for line in content.splitlines() if line.strip()]
+        print(f"Warning: No tag file found (checked {txt_path} and {json_path})")
+        return []
 
     # タグを正規化
     tags = [normalize_tag(tag) for tag in tags]

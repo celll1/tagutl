@@ -5,7 +5,7 @@ import json
 import random
 
 CATEGORY_ORDER = [
-    'rating', 'quality', 'character', 'copyright', 'artist', 'general', 'meta', 'model'
+    'rating', 'quality', 'character', 'copyright', 'artist', 'general_special', 'general_person_count', 'general', 'unknown', 'meta', 'model'
 ]
 
 # Rating と Quality タグのハードコードリスト (仮)
@@ -31,6 +31,10 @@ PERSON_COUNT_TAG_PATTERNS = [
 # 特殊ケースの定義
 DOUBLE_BACKSLASH_SLASH = "\\//"
 PLACEHOLDER = "__DOUBLE_BACKSLASH_SLASH_PLACEHOLDER__"
+
+def is_learning_exclusion_tag(tag: str) -> bool:
+    """指定されたタグが学習除外タグ（a@xxx形式）かどうかを判定する。"""
+    return re.match(r'^[a-zA-Z]@', tag) is not None
 
 def is_person_count_tag(normalized_tag_for_sd: str) -> bool:
     """指定されたタグが人数関連タグかどうかを判定する。
@@ -210,8 +214,19 @@ def process_tag_file(file_path: str, tag_to_category: dict, tag_aliases: dict = 
             # normalize_tag_for_sd にデバッグフラグを渡す
             final_normalized_tag = normalize_tag_for_sd(tag_str_from_file, debug_print=debug_normalization)
 
+            # 学習除外タグかどうかをチェック
+            if is_learning_exclusion_tag(tag_str_from_file):
+                category_to_add = 'general_special'
+            # 人数関連タグの処理（General カテゴリの場合のみ）
+            elif category == 'general' and is_person_count_tag(final_normalized_tag):
+                category_to_add = 'general_person_count'
+            elif category and category in categorized_tags:
+                category_to_add = category
+            else:
+                # カテゴリが不明または存在しない場合はunknownに分類
+                category_to_add = 'unknown'
+            
             # 重複チェック（すでに同じ正規化タグが存在するかチェック）
-            category_to_add = category if category and category in categorized_tags else 'general'
             if final_normalized_tag in categorized_tags[category_to_add]:
                 duplicate_count += 1
                 if debug_normalization:
@@ -221,26 +236,35 @@ def process_tag_file(file_path: str, tag_to_category: dict, tag_aliases: dict = 
         
         # セットをリストに変換してソート（またはランダム化）
         for cat in categorized_tags:
-            if cat == 'general':
-                # generalカテゴリは特別処理（人数タグを先頭に）
-                person_tags = []
-                other_general_tags = []
-                for tag in categorized_tags[cat]: # セットから取得
-                    if is_person_count_tag(tag):
-                        person_tags.append(tag)
-                    else:
-                        other_general_tags.append(tag)
-                
-                # generalカテゴリでランダム化が指定されている場合は人数タグとその他を別々にシャッフル
-                if randomize_categories and 'general' in randomize_categories:
-                    random.shuffle(person_tags)
-                    random.shuffle(other_general_tags)
+            if cat == 'general_special':
+                # 学習除外タグは常にアルファベット順（ランダム化対象外）
+                categorized_tags[cat] = sorted(list(categorized_tags[cat]))
+            elif cat == 'general_person_count':
+                # 人数関連タグの処理
+                if randomize_categories and 'general_person_count' in randomize_categories:
+                    tag_list = list(categorized_tags[cat])
+                    random.shuffle(tag_list)
+                    categorized_tags[cat] = tag_list
                 else:
-                    person_tags.sort()
-                    other_general_tags.sort()
-                categorized_tags[cat] = person_tags + other_general_tags
+                    categorized_tags[cat] = sorted(list(categorized_tags[cat]))
+            elif cat == 'general':
+                # generalカテゴリ（人数タグは既に分離済み）
+                if randomize_categories and 'general' in randomize_categories:
+                    tag_list = list(categorized_tags[cat])
+                    random.shuffle(tag_list)
+                    categorized_tags[cat] = tag_list
+                else:
+                    categorized_tags[cat] = sorted(list(categorized_tags[cat]))
+            elif cat == 'unknown':
+                # unknownカテゴリの処理
+                if randomize_categories and 'unknown' in randomize_categories:
+                    tag_list = list(categorized_tags[cat])
+                    random.shuffle(tag_list)
+                    categorized_tags[cat] = tag_list
+                else:
+                    categorized_tags[cat] = sorted(list(categorized_tags[cat]))
             elif randomize_categories and cat in randomize_categories:
-                # general以外でランダム化が指定されたカテゴリの場合
+                # その他でランダム化が指定されたカテゴリの場合
                 tag_list = list(categorized_tags[cat])
                 random.shuffle(tag_list)
                 categorized_tags[cat] = tag_list
