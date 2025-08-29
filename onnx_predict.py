@@ -85,6 +85,82 @@ def standardize_tag_format(tag):
     tag = tag.replace(' ', '_')
     return tag
 
+def sort_tags(tags, tag_to_category):
+    """
+    タグをカテゴリ順で整列する
+    
+    Args:
+        tags: タグのリスト
+        tag_to_category: タグからカテゴリへのマッピング辞書
+    
+    Returns:
+        整列されたタグのリスト
+    """
+    import re
+    
+    # カテゴリ別にタグを分類
+    categorized_tags = {
+        'Rating': [],
+        'Quality': [],
+        'General_Special': [],  # a@xxx形式の学習除外タグ
+        'General': [],
+        'Character': [],
+        'Copyright': [],
+        'Artist': [],
+        'Meta': [],
+        'Model': [],
+        'Unknown': []  # カテゴリが不明なタグ
+    }
+    
+    for tag in tags:
+        normalized_tag = normalize_tag(tag)
+        category = tag_to_category.get(normalized_tag, 'Unknown')
+        
+        # 学習除外タグ（a@xxx形式）の特別処理
+        if re.match(r'^[a-zA-Z]@', tag):
+            categorized_tags['General_Special'].append(tag)
+        elif category in categorized_tags:
+            categorized_tags[category].append(tag)
+        else:
+            categorized_tags['Unknown'].append(tag)
+    
+    # 各カテゴリ内でアルファベット順に整列
+    for category in categorized_tags:
+        categorized_tags[category].sort()
+    
+    # カテゴリ順で結合（学習除外タグは一般タグの先頭）
+    sorted_tags = []
+    
+    # Rating
+    sorted_tags.extend(categorized_tags['Rating'])
+    
+    # Quality
+    sorted_tags.extend(categorized_tags['Quality'])
+    
+    # Character
+    sorted_tags.extend(categorized_tags['Character'])
+    
+    # Copyright
+    sorted_tags.extend(categorized_tags['Copyright'])
+    
+    # Artist
+    sorted_tags.extend(categorized_tags['Artist'])
+    
+    # General (学習除外タグを先頭に)
+    sorted_tags.extend(categorized_tags['General_Special'])
+    sorted_tags.extend(categorized_tags['General'])
+    
+    # Unknown
+    sorted_tags.extend(categorized_tags['Unknown'])
+    
+    # Meta
+    sorted_tags.extend(categorized_tags['Meta'])
+    
+    # Model
+    sorted_tags.extend(categorized_tags['Model'])
+    
+    return sorted_tags
+
 def read_tags_from_file(image_path, remove_special_prefix="remove"):
     # 画像ファイルからタグを読み込む
     tags = []
@@ -763,17 +839,20 @@ def save_tags_as_csv(predictions, # これは閾値などでフィルタリン�
         # 上書きモードまたは既存ファイルがない場合
         final_tags = predicted_tags_to_save # skipフラグ適用済みのリスト
 
-    # 4. 出力フォーマットして保存
+    # 4. 出力フォーマットして整列保存
     formatted_tags = [standardize_tag_format(tag) for tag in final_tags if tag] # 空タグを除外
+    
+    # タグを整列（カテゴリ順、学習除外タグを考慮）
+    sorted_tags = sort_tags(formatted_tags, tag_to_category)
 
     try:
         with open(output_path, 'w', encoding='utf-8') as f:
-            f.write(", ".join(formatted_tags))
-        print(f"Tags saved to {output_path} (Mode: {mode}, Total tags: {len(formatted_tags)})")
+            f.write(", ".join(sorted_tags))
+        print(f"Tags saved to {output_path} (Mode: {mode}, Total tags: {len(sorted_tags)})")
     except Exception as e:
         print(f"Error writing tags to {output_path}: {e}")
 
-    return formatted_tags
+    return sorted_tags
 
 def save_tags_as_json(predictions,
                      output_path,
@@ -964,30 +1043,33 @@ def save_tags_as_json(predictions,
         # 上書きモードまたは既存ファイルがない場合
         final_tags = predicted_tags_to_save
 
-    # 4. 出力フォーマットして保存
+    # 4. 出力フォーマットして整列保存
     formatted_tags = [standardize_tag_format(tag) for tag in final_tags if tag]
+    
+    # タグを整列（カテゴリ順、学習除外タグを考慮）
+    sorted_tags = sort_tags(formatted_tags, tag_to_category)
 
     # JSON形式で保存（既存の属性を保持）
     if mode == "overwrite" and existing_json_data:
         # overwriteモードでも他の属性は保持
         output_data = existing_json_data.copy()
-        output_data["tags"] = ", ".join(formatted_tags)
+        output_data["tags"] = ", ".join(sorted_tags)
     else:
         # addモードまたは新規作成の場合
         if existing_json_data:
             output_data = existing_json_data.copy()
         else:
             output_data = {}
-        output_data["tags"] = ", ".join(formatted_tags)
+        output_data["tags"] = ", ".join(sorted_tags)
 
     try:
         with open(output_path, 'w', encoding='utf-8') as f:
             json.dump(output_data, f, ensure_ascii=False, indent=2)
-        print(f"Tags saved to {output_path} (Mode: {mode}, Total tags: {len(formatted_tags)}, Total attributes: {len(output_data)})")
+        print(f"Tags saved to {output_path} (Mode: {mode}, Total tags: {len(sorted_tags)}, Total attributes: {len(output_data)})")
     except Exception as e:
         print(f"Error writing tags to {output_path}: {e}")
 
-    return formatted_tags
+    return sorted_tags
 
 def extract_frames_from_video(video_path, num_frames):
     """
