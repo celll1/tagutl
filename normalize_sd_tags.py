@@ -185,12 +185,37 @@ def apply_tag_aliases(tag: str, tag_aliases: dict) -> str:
     return tag
 
 def process_tag_file(file_path: str, tag_to_category: dict, tag_aliases: dict = None, apply_aliases: bool = False, debug_normalization: bool = False, randomize_categories: list = None):
-    """単一のタグファイルを処理し、カテゴリ順にソート後、正規化する。"""
+    """単一のタグファイル（TXTまたはJSON）を処理し、カテゴリ順にソート後、正規化する。"""
+    import json
+    
     try:
-        with open(file_path, 'r', encoding='utf-8') as f:
-            content = f.read()
+        # ファイル形式の判定
+        is_json = file_path.lower().endswith('.json')
         
-        tags_in_file = [tag.strip() for tag in content.split(',') if tag.strip()]
+        if is_json:
+            # JSONファイルの読み込み
+            with open(file_path, 'r', encoding='utf-8') as f:
+                json_data = json.load(f)
+            
+            # tagsフィールドから文字列を取得
+            if 'tags' not in json_data:
+                if debug_normalization:
+                    print(f"No 'tags' field found in JSON file: {file_path}")
+                return
+            
+            tags_string = json_data['tags']
+            if isinstance(tags_string, list):
+                # リスト形式の場合
+                tags_in_file = [tag.strip() for tag in tags_string if tag.strip()]
+            else:
+                # 文字列形式（カンマ区切り）の場合
+                tags_in_file = [tag.strip() for tag in tags_string.split(',') if tag.strip()]
+        else:
+            # TXTファイルの読み込み
+            with open(file_path, 'r', encoding='utf-8') as f:
+                content = f.read()
+            tags_in_file = [tag.strip() for tag in content.split(',') if tag.strip()]
+        
         if not tags_in_file:
             return
 
@@ -209,7 +234,7 @@ def process_tag_file(file_path: str, tag_to_category: dict, tag_aliases: dict = 
                 tag_str_from_file = tag_str_after_alias
             
             search_key = tag_str_from_file.lower().replace('_', ' ')
-            search_key_no_escape_no_sd_norm = search_key.replace('\\(', '(').replace('\\)', ')')
+            search_key_no_escape_no_sd_norm = search_key.replace('\\\\(', '(').replace('\\\\)', ')')
             category = tag_to_category.get(search_key_no_escape_no_sd_norm)
             # normalize_tag_for_sd にデバッグフラグを渡す
             final_normalized_tag = normalize_tag_for_sd(tag_str_from_file, debug_print=debug_normalization)
@@ -276,21 +301,50 @@ def process_tag_file(file_path: str, tag_to_category: dict, tag_aliases: dict = 
             sorted_normalized_tags.extend(categorized_tags[cat_name])
         # sorted_normalized_tags.extend(unknown_tags) # 不要
         
-        new_content = ", ".join(sorted_normalized_tags)
+        new_tags_content = ", ".join(sorted_normalized_tags)
 
         if duplicate_count > 0:
             print(f"  Removed {duplicate_count} duplicate tag(s) in {file_path}")
 
-        if content.strip() != new_content.strip():
-            with open(file_path, 'w', encoding='utf-8') as f:
-                f.write(new_content)
-            print(f"Updated: {file_path}")
+        # 変更があった場合のみ保存
+        if is_json:
+            # JSON形式での保存
+            original_tags_string = json_data['tags']
+            if isinstance(original_tags_string, list):
+                # 元がリスト形式の場合はリスト形式で保存
+                json_data['tags'] = sorted_normalized_tags
+            else:
+                # 元が文字列形式の場合は文字列形式で保存
+                json_data['tags'] = new_tags_content
+            
+            # 元のJSON文字列と比較して変更があるかチェック
+            original_content = json.dumps(json_data, ensure_ascii=False, separators=(',', ':'))
+            if isinstance(original_tags_string, list):
+                temp_data = json_data.copy()
+                temp_data['tags'] = ", ".join(original_tags_string) if original_tags_string else ""
+                original_comparison = json.dumps(temp_data, ensure_ascii=False, separators=(',', ':'))
+            else:
+                original_comparison = json.dumps({**json_data, 'tags': original_tags_string}, ensure_ascii=False, separators=(',', ':'))
+            
+            if original_comparison != original_content:
+                with open(file_path, 'w', encoding='utf-8') as f:
+                    json.dump(json_data, f, ensure_ascii=False, indent=2)
+                print(f"Updated: {file_path}")
+        else:
+            # TXT形式での保存
+            with open(file_path, 'r', encoding='utf-8') as f:
+                original_content = f.read().strip()
+            
+            if original_content != new_tags_content:
+                with open(file_path, 'w', encoding='utf-8') as f:
+                    f.write(new_tags_content)
+                print(f"Updated: {file_path}")
 
     except Exception as e:
         print(f"Error processing file {file_path}: {e}")
 
 def main():
-    parser = argparse.ArgumentParser(description="Normalize and sort tags in text files for Stable Diffusion training. Example: 'tag with spaces (and parens)' -> 'tag with spaces \\(and parens\\)'")
+    parser = argparse.ArgumentParser(description="Normalize and sort tags in text files for Stable Diffusion training. Example: 'tag with spaces (and parens)' -> 'tag with spaces \\\\(and parens\\\\)'")
     parser.add_argument('directories', nargs='+', help='One or more directories to process recursively.')
     # parser.add_argument('--tag_mapping', type=str, required=True, help='Path to the tag_mapping.json file for category information.')
     parser.add_argument('--tag_group_dir', type=str, required=True, help='Path to the directory containing category JSON files (e.g., Character.json, General.json).')
@@ -344,7 +398,8 @@ def main():
         print(f"Processing directory: {directory}...")
         for root, _, files in os.walk(directory):
             for file in files:
-                if file.lower().endswith('.txt'):
+                # TXTファイルとJSONファイルの両方を処理
+                if file.lower().endswith('.txt') or file.lower().endswith('.json'):
                     file_path = os.path.join(root, file)
                     process_tag_file(file_path, tag_categories, tag_aliases, args.apply_aliases, args.debug_normalization, randomize_categories)
         print(f"Finished processing directory: {directory}")
