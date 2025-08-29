@@ -1601,6 +1601,30 @@ def normalize_tag(tag):
     
     return tag
 
+def denormalize_tag_for_output(tag, format_type='json'):
+    """タグを出力形式に変換する関数（アンダースコアをスペースに、括弧をエスケープ）
+    
+    Args:
+        tag: 内部形式のタグ（例: "aaaa_bbbb_(cccc)"）
+        format_type: 'json' または 'txt'
+    
+    Returns:
+        出力用に整形されたタグ
+        - JSON用: "aaaa bbbb \\(cccc\\)" (二重エスケープ)  
+        - TXT用: "aaaa bbbb \(cccc\)" (単一エスケープ)
+    """
+    # アンダースコアをスペースに変換
+    tag = tag.replace('_', ' ')
+    
+    if format_type == 'json':
+        # JSON用: 括弧を二重エスケープ
+        tag = tag.replace('(', '\\\\(').replace(')', '\\\\)')
+    elif format_type == 'txt':
+        # TXT用: 括弧を単一エスケープ  
+        tag = tag.replace('(', '\\(').replace(')', '\\)')
+    
+    return tag
+
 def load_tag_aliases(alias_file_path: str) -> Dict[str, str]:
     """
     エイリアスファイルを読み込んでタグの変換マップを作成する
@@ -4028,8 +4052,12 @@ def save_tag_mapping(output_dir, idx_to_tag, tag_to_category):
     for idx, tag in idx_to_tag.items():
         normalized_tag = tag.replace(' ', '_').replace('\\(', '(').replace('\\)', ')')
         category = tag_to_category.get(normalized_tag, 'General')  # デフォルトはGeneral
+        
+        # JSON用に適切にフォーマットされたタグを保存
+        formatted_tag = denormalize_tag_for_output(tag, 'json')
+        
         tag_mapping[idx] = {
-            'tag': tag,
+            'tag': formatted_tag,
             'category': category
         }
     
@@ -4039,7 +4067,16 @@ def save_tag_mapping(output_dir, idx_to_tag, tag_to_category):
     with open(mapping_path, 'w', encoding='utf-8') as f:
         json.dump(tag_mapping, f, indent=2, ensure_ascii=False)
     
+    # TXT用のタグリストも作成
+    txt_path = os.path.join(output_dir, 'tag_list.txt')
+    with open(txt_path, 'w', encoding='utf-8') as f:
+        for idx in sorted(idx_to_tag.keys()):
+            tag = idx_to_tag[idx]
+            formatted_tag = denormalize_tag_for_output(tag, 'txt')
+            f.write(f"{idx}: {formatted_tag}\n")
+    
     print(f"Tag mapping saved to {mapping_path}")
+    print(f"Tag list saved to {txt_path}")
     return mapping_path
 
 def main():

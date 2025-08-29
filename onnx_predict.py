@@ -62,47 +62,102 @@ def pil_pad_square(image: Image.Image) -> Image.Image:
     return new_image
 
 def normalize_tag(tag):
-    # タグの正規化
+    """
+    重複チェック用のタグ正規化（比較専用）
+    全てのフォーマットを統一した形式に正規化して比較に使用
+    """
+    import re
+    
+    # タグの基本正規化
     tag = tag.lower().strip()
-    tag = tag.replace("_", " ")
-    # 括弧をエスケープするケースも正規化
+    
+    # 各種エスケープパターンを正規化
+    # 三重以上のエスケープを除去
+    tag = re.sub(r'\\{2,}\(', '(', tag)  # \\\\\\( → (
+    tag = re.sub(r'\\{2,}\)', ')', tag)  # \\\\\\) → )
+    # 単一エスケープも除去
     tag = tag.replace('\\(', '(').replace('\\)', ')')
+    
+    # アンダースコアをスペースに正規化
+    tag = tag.replace("_", " ")
+    
     return tag
 
 def standardize_tag_format(tag):
     """
     タグ形式を標準化する (エクスポート用)
-    aaaa bbbb (cccc) → aaaa_bbbb_(cccc)
+    既存のエスケープを正規化し、適切な学習用フォーマットに変換
     
     Args:
         tag: 変換前のタグ
     Returns:
-        変換後のタグ
+        変換後のタグ (学習用: スペース区切り、括弧単一エスケープ)
     """
-    # スペースをアンダースコアに変換
-    # エスケープされた括弧を通常の括弧に変換
-    tag = tag.replace('\\(', '(').replace('\\)', ')')
-    tag = tag.replace(' ', '_')
+    import re
+    
+    # 既存の各種エスケープパターンを正規化
+    # 三重以上のエスケープを単一に正規化
+    tag = re.sub(r'\\{3,}\(', r'\\(', tag)  # \\\\\\\( → \(
+    tag = re.sub(r'\\{3,}\)', r'\\)', tag)  # \\\\\\\) → \)
+    
+    # 二重エスケープを単一エスケープに変換
+    tag = tag.replace('\\\\(', '\\(').replace('\\\\)', '\\)')
+    
+    # アンダースコアをスペースに変換
+    tag = tag.replace('_', ' ')
+    
+    # 括弧が未エスケープの場合のみエスケープ
+    # すでに\(や\)になっている場合はそのまま
+    if '(' in tag and '\\(' not in tag:
+        tag = tag.replace('(', '\\(')
+    if ')' in tag and '\\)' not in tag:
+        tag = tag.replace(')', '\\)')
+    
     return tag
 
-def sort_tags(tags, tag_to_category):
+def sort_tags(tags, tag_to_category, debug=False):
     """
     タグをカテゴリ順で整列する
     
     Args:
         tags: タグのリスト
         tag_to_category: タグからカテゴリへのマッピング辞書
+        debug: デバッグ出力フラグ
     
     Returns:
         整列されたタグのリスト
     """
     import re
     
+    # 人数関連タグを識別するための正規表現パターン
+    PERSON_COUNT_TAG_PATTERNS = [
+        re.compile(r"^\d+girls?$"),
+        re.compile(r"^\d+boys?$"),
+        re.compile(r"^\d+others?$"),
+        re.compile(r"^no_humans$"),
+        re.compile(r"^multiple_girls$"),
+        re.compile(r"^multiple_boys$"),
+        re.compile(r"^multiple_others$"),
+        re.compile(r"^group$"),
+        re.compile(r"^solo$"),
+        re.compile(r"^.*_focus$"),  # 任意の*_focusタグ（solo_focus, male_focus等）
+        re.compile(r"^still_life$")
+    ]
+    
+    def is_person_count_tag(normalized_tag: str) -> bool:
+        """指定されたタグが人数関連タグかどうかを判定する。"""
+        tag_for_pattern_check = normalized_tag.replace(' ', '_')
+        for pattern in PERSON_COUNT_TAG_PATTERNS:
+            if pattern.match(tag_for_pattern_check):
+                return True
+        return False
+    
     # カテゴリ別にタグを分類
     categorized_tags = {
         'Rating': [],
         'Quality': [],
         'General_Special': [],  # a@xxx形式の学習除外タグ
+        'General_Person_Count': [],  # 人数関連タグ
         'General': [],
         'Character': [],
         'Copyright': [],
@@ -116,13 +171,23 @@ def sort_tags(tags, tag_to_category):
         normalized_tag = normalize_tag(tag)
         category = tag_to_category.get(normalized_tag, 'Unknown')
         
+        if debug and ('quality' in tag.lower() or 'rating' in tag.lower()):
+            print(f"[DEBUG SORT] Tag: '{tag}' -> normalized: '{normalized_tag}' -> category: '{category}'")
+        
         # 学習除外タグ（a@xxx形式）の特別処理
         if re.match(r'^[a-zA-Z]@', tag):
             categorized_tags['General_Special'].append(tag)
+        # 人数関連タグの処理（General カテゴリの場合のみ）
+        elif category == 'General' and is_person_count_tag(normalized_tag):
+            categorized_tags['General_Person_Count'].append(tag)
         elif category in categorized_tags:
             categorized_tags[category].append(tag)
+            if debug and ('quality' in tag.lower() or 'rating' in tag.lower()):
+                print(f"[DEBUG SORT] Added '{tag}' to category '{category}'")
         else:
             categorized_tags['Unknown'].append(tag)
+            if debug and ('quality' in tag.lower() or 'rating' in tag.lower()):
+                print(f"[DEBUG SORT] Added '{tag}' to 'Unknown' category")
     
     # 各カテゴリ内でアルファベット順に整列
     for category in categorized_tags:
@@ -146,8 +211,9 @@ def sort_tags(tags, tag_to_category):
     # Artist
     sorted_tags.extend(categorized_tags['Artist'])
     
-    # General (学習除外タグを先頭に)
+    # General (学習除外タグ → 人数関連タグ → その他の順)
     sorted_tags.extend(categorized_tags['General_Special'])
+    sorted_tags.extend(categorized_tags['General_Person_Count'])
     sorted_tags.extend(categorized_tags['General'])
     
     # Unknown
@@ -157,6 +223,162 @@ def sort_tags(tags, tag_to_category):
     sorted_tags.extend(categorized_tags['Meta'])
     
     # Model
+    sorted_tags.extend(categorized_tags['Model'])
+    
+    return sorted_tags
+
+def sort_tags_from_predictions(predictions, formatted_tags, debug=False):
+    """
+    既にカテゴリ分類済みの予測結果を使ってタグを整列する
+    
+    Args:
+        predictions: カテゴリ別の予測結果辞書 (get_tags の結果)
+        formatted_tags: フォーマット済みのタグのリスト
+        debug: デバッグ出力フラグ
+
+    Returns:
+        整列されたタグのリスト
+    """
+    import re
+    
+    # 人数関連タグを識別するための正規表現パターン
+    PERSON_COUNT_TAG_PATTERNS = [
+        re.compile(r"^\d+girls?$"),
+        re.compile(r"^\d+boys?$"),
+        re.compile(r"^\d+others?$"),
+        re.compile(r"^no_humans$"),
+        re.compile(r"^multiple_girls$"),
+        re.compile(r"^multiple_boys$"),
+        re.compile(r"^multiple_others$"),
+        re.compile(r"^group$"),
+        re.compile(r"^solo$"),
+        re.compile(r"^.*_focus$"),
+        re.compile(r"^still_life$")
+    ]
+    
+    def is_person_count_tag(normalized_tag: str) -> bool:
+        """指定されたタグが人数関連タグかどうかを判定する。"""
+        tag_for_pattern_check = normalized_tag.replace(' ', '_')
+        for pattern in PERSON_COUNT_TAG_PATTERNS:
+            if pattern.match(tag_for_pattern_check):
+                return True
+        return False
+    
+    # formatted_tagsから正規化タグへのマッピングを作成
+    # これにより、formatted_tagsの既存フォーマットを保持できる
+    normalized_to_formatted = {}
+    for formatted_tag in formatted_tags:
+        # 正規化用に一時的に逆変換（bracket escapeとunderscoreをspaceに戻す）
+        normalized_tag = formatted_tag.replace('\\(', '(').replace('\\)', ')').replace('_', ' ')
+        normalized_to_formatted[normalized_tag] = formatted_tag
+    
+    # 各カテゴリのタグを取得
+    categorized_tags = {
+        'Rating': [],
+        'Quality': [],
+        'Character': [],
+        'Copyright': [],
+        'Artist': [],
+        'General_Special': [],  # a@xxx形式の学習除外タグ
+        'General_Person_Count': [],  # 人数関連タグ
+        'General': [],
+        'Unknown': [],
+        'Meta': [],
+        'Model': []
+    }
+    
+    # 予測結果からタグを収集
+    matched_formatted_tags = set()
+    
+    # Rating
+    for tag, _ in predictions.get("rating", []):
+        if tag in normalized_to_formatted:
+            formatted_tag = normalized_to_formatted[tag]
+            categorized_tags['Rating'].append(formatted_tag)
+            matched_formatted_tags.add(formatted_tag)
+    
+    # Quality
+    for tag, _ in predictions.get("quality", []):
+        if tag in normalized_to_formatted:
+            formatted_tag = normalized_to_formatted[tag]
+            categorized_tags['Quality'].append(formatted_tag)
+            matched_formatted_tags.add(formatted_tag)
+    
+    # Character
+    for tag, _ in predictions.get("character", []):
+        if tag in normalized_to_formatted:
+            formatted_tag = normalized_to_formatted[tag]
+            categorized_tags['Character'].append(formatted_tag)
+            matched_formatted_tags.add(formatted_tag)
+    
+    # Copyright
+    for tag, _ in predictions.get("copyright", []):
+        if tag in normalized_to_formatted:
+            formatted_tag = normalized_to_formatted[tag]
+            categorized_tags['Copyright'].append(formatted_tag)
+            matched_formatted_tags.add(formatted_tag)
+    
+    # Artist
+    for tag, _ in predictions.get("artist", []):
+        if tag in normalized_to_formatted:
+            formatted_tag = normalized_to_formatted[tag]
+            categorized_tags['Artist'].append(formatted_tag)
+            matched_formatted_tags.add(formatted_tag)
+    
+    # General (学習除外タグと人数関連タグを分離)
+    for tag, _ in predictions.get("general", []):
+        if tag in normalized_to_formatted:
+            formatted_tag = normalized_to_formatted[tag]
+            # 学習除外タグかどうかチェック
+            if re.match(r'^[a-zA-Z]@', tag):
+                categorized_tags['General_Special'].append(formatted_tag)
+            # 人数関連タグかどうかチェック
+            elif is_person_count_tag(tag):
+                categorized_tags['General_Person_Count'].append(formatted_tag)
+            else:
+                categorized_tags['General'].append(formatted_tag)
+            matched_formatted_tags.add(formatted_tag)
+    
+    # Meta
+    for tag, _ in predictions.get("meta", []):
+        if tag in normalized_to_formatted:
+            formatted_tag = normalized_to_formatted[tag]
+            categorized_tags['Meta'].append(formatted_tag)
+            matched_formatted_tags.add(formatted_tag)
+    
+    # Model
+    for tag, _ in predictions.get("model", []):
+        if tag in normalized_to_formatted:
+            formatted_tag = normalized_to_formatted[tag]
+            categorized_tags['Model'].append(formatted_tag)
+            matched_formatted_tags.add(formatted_tag)
+    
+    # 予測結果にないタグ（既存タグなど）はUnknownに分類
+    for formatted_tag in formatted_tags:
+        if formatted_tag not in matched_formatted_tags:
+            categorized_tags['Unknown'].append(formatted_tag)
+    
+    # 各カテゴリ内でアルファベット順に整列
+    for category in categorized_tags:
+        categorized_tags[category].sort()
+    
+    if debug:
+        for category, tags in categorized_tags.items():
+            if tags:
+                print(f"[DEBUG SORT] {category}: {len(tags)} tags - {tags[:3]}{'...' if len(tags) > 3 else ''}")
+    
+    # カテゴリ順で結合
+    sorted_tags = []
+    sorted_tags.extend(categorized_tags['Rating'])
+    sorted_tags.extend(categorized_tags['Quality'])
+    sorted_tags.extend(categorized_tags['Character'])
+    sorted_tags.extend(categorized_tags['Copyright'])
+    sorted_tags.extend(categorized_tags['Artist'])
+    sorted_tags.extend(categorized_tags['General_Special'])
+    sorted_tags.extend(categorized_tags['General_Person_Count'])
+    sorted_tags.extend(categorized_tags['General'])
+    sorted_tags.extend(categorized_tags['Unknown'])
+    sorted_tags.extend(categorized_tags['Meta'])
     sorted_tags.extend(categorized_tags['Model'])
     
     return sorted_tags
@@ -674,7 +896,8 @@ def save_tags_as_csv(predictions, # これは閾値などでフィルタリン�
                      mode="overwrite",
                      remove_threshold=None,
                      skip_rating=False,
-                     skip_quality=False):
+                     skip_quality=False,
+                     debug=False):
     """
     予測されたタグをカンマ区切りのテキストファイルとして保存する
     remove_threshold は全タグの確率を参照して判定する
@@ -690,6 +913,7 @@ def save_tags_as_csv(predictions, # これは閾値などでフィルタリン�
         remove_threshold: 既存タグを除去する閾値（Noneの場合は除去しない）
         skip_rating (bool): Rating タグの保存をスキップするかどうか
         skip_quality (bool): Quality タグの保存をスキップするかどうか
+        debug (bool): デバッグ出力を有効にするかどうか
     """
     # 1. 保存対象の「新規」タグリストを作成 (skipフラグ適用済み)
     predicted_tags_to_save = []
@@ -843,7 +1067,8 @@ def save_tags_as_csv(predictions, # これは閾値などでフィルタリン�
     formatted_tags = [standardize_tag_format(tag) for tag in final_tags if tag] # 空タグを除外
     
     # タグを整列（カテゴリ順、学習除外タグを考慮）
-    sorted_tags = sort_tags(formatted_tags, tag_to_category)
+    # タグを整列（既にカテゴリ分類済みの情報を活用）
+    sorted_tags = sort_tags_from_predictions(predictions, formatted_tags, debug=debug)
 
     try:
         with open(output_path, 'w', encoding='utf-8') as f:
@@ -863,7 +1088,8 @@ def save_tags_as_json(predictions,
                      mode="overwrite",
                      remove_threshold=None,
                      skip_rating=False,
-                     skip_quality=False):
+                     skip_quality=False,
+                     debug=False):
     """
     予測されたタグをJSON形式で保存する
     
@@ -878,31 +1104,51 @@ def save_tags_as_json(predictions,
         remove_threshold: 既存タグを除去する閾値（Noneの場合は除去しない）
         skip_rating (bool): Rating タグの保存をスキップするかどうか
         skip_quality (bool): Quality タグの保存をスキップするかどうか
+        debug (bool): デバッグ出力を有効にするかどうか
     """
+    if debug:
+        print(f"[DEBUG JSON] Starting save_tags_as_json, mode: {mode}")
+        print(f"[DEBUG JSON] Predictions summary: rating={len(predictions['rating'])}, general={len(predictions['general'])}, character={len(predictions['character'])}")
+    
     # 1. 保存対象の「新規」タグリストを作成 (skipフラグ適用済み)
     predicted_tags_to_save = []
     # Rating (スキップチェック)
     if not skip_rating and predictions["rating"]:
         tag, _ = predictions["rating"][0]
         predicted_tags_to_save.append(tag)
+        if debug:
+            print(f"[DEBUG JSON] Added rating tag: {tag}")
     # Quality (スキップチェック)
     if not skip_quality and predictions["quality"]:
         tag, _ = predictions["quality"][0]
         predicted_tags_to_save.append(tag)
+        if debug:
+            print(f"[DEBUG JSON] Added quality tag: {tag}")
     # Others (閾値超え)
     for category in ["character", "copyright", "artist", "general", "meta", "model"]:
         for tag, prob in predictions[category]:
             if category == "meta" and any(pattern in tag.lower() for pattern in ['id', 'commentary', 'mismatch']):
                 continue
             predicted_tags_to_save.append(tag)
+            if debug:
+                print(f"[DEBUG JSON] Added {category} tag: {tag} (prob: {prob:.3f})")
+    
+    if debug:
+        print(f"[DEBUG JSON] Total predicted_tags_to_save: {len(predicted_tags_to_save)}")
 
     # 2. 既存タグの読み込みとフィルタリング
     final_tags = []
     existing_json_data = {}  # 既存のJSON全体を保持
     
     # まず既存のJSONファイルを読み込む（他の属性も保持するため）
-    json_path = output_path.replace('.txt', '.json')
-    txt_path = output_path.replace('.json', '.txt')
+    # output_pathは既に.jsonのはずだが、念のため確認
+    if output_path.endswith('.json'):
+        json_path = output_path
+        txt_path = output_path[:-5] + '.txt'  # .jsonを.txtに置換
+    else:
+        # output_pathが.txtの場合（通常はないはずだが念のため）
+        json_path = output_path.replace('.txt', '.json')
+        txt_path = output_path
     
     # JSONファイルが存在する場合、全体を読み込む
     if os.path.exists(json_path):
@@ -1038,16 +1284,34 @@ def save_tags_as_json(predictions,
 
             print(f"Adding {len(unique_new_tags_added)} new unique tags.")
             final_tags.extend(unique_new_tags_added)
+        else:
+            # 既存タグがない場合は、新規タグをそのまま使用
+            if debug:
+                print(f"[DEBUG JSON] No existing tags found, using all predicted tags")
+            final_tags = predicted_tags_to_save
 
     else:
         # 上書きモードまたは既存ファイルがない場合
         final_tags = predicted_tags_to_save
+        if debug:
+            print(f"[DEBUG JSON] Overwrite/new mode: final_tags = {len(final_tags)} tags")
 
+    if debug:
+        print(f"[DEBUG JSON] Before formatting: final_tags = {len(final_tags)} tags")
     # 4. 出力フォーマットして整列保存
     formatted_tags = [standardize_tag_format(tag) for tag in final_tags if tag]
+    if debug:
+        print(f"[DEBUG JSON] After formatting: formatted_tags = {len(formatted_tags)} tags")
     
-    # タグを整列（カテゴリ順、学習除外タグを考慮）
-    sorted_tags = sort_tags(formatted_tags, tag_to_category)
+    # タグを整列（既にカテゴリ分類済みの情報を活用）
+    if debug:
+        print(f"[DEBUG JSON] Sorting tags using prediction categories")
+    
+    sorted_tags = sort_tags_from_predictions(predictions, formatted_tags, debug=debug)
+    if debug:
+        print(f"[DEBUG JSON] After sorting: sorted_tags = {len(sorted_tags)} tags")
+        # ソート後の最初の10個のタグを表示
+        print(f"[DEBUG JSON] First 10 sorted tags: {sorted_tags[:10]}")
 
     # JSON形式で保存（既存の属性を保持）
     if mode == "overwrite" and existing_json_data:
@@ -1125,7 +1389,7 @@ def predict_with_onnx(
         gen_threshold=0.45, char_threshold=0.45, output_path=None, 
         use_gpu=False, output_mode="visualization", tag_mode="add", 
         remove_threshold=None, batch_size=1, # batch_size は未使用だが維持
-        skip_rating=False, skip_quality=False): # ★ skip_* 引数を追加 ★
+        skip_rating=False, skip_quality=False, debug=False): # ★ skip_* 引数を追加 ★
     # ONNXモデルでの予測
     print(f"Loading ONNX model: {model_path}")
     
@@ -1359,7 +1623,8 @@ def predict_with_onnx(
             mode=tag_mode,
             remove_threshold=remove_threshold,
             skip_rating=skip_rating,
-            skip_quality=skip_quality
+            skip_quality=skip_quality,
+            debug=debug
         )
     elif output_mode == "json":
         # tag_output_pathは既に.jsonとして設定されている
@@ -1373,7 +1638,8 @@ def predict_with_onnx(
             mode=tag_mode,
             remove_threshold=remove_threshold,
             skip_rating=skip_rating,
-            skip_quality=skip_quality
+            skip_quality=skip_quality,
+            debug=debug
         )
     
     return predictions, tag_output_path
@@ -1423,7 +1689,7 @@ def debug_preprocessing(image_path):
 
 def batch_predict(dirs, model_path, tag_mapping_path, gen_threshold=0.45, char_threshold=0.45, video_frames=3,
                  use_gpu=False, output_mode="visualization", recursive=False, batch_size=1, tag_mode="add", 
-                 remove_threshold=None, skip_rating=False, skip_quality=False):  # remove_thresholdパラメータを追加
+                 remove_threshold=None, skip_rating=False, skip_quality=False, debug=False):  # remove_thresholdパラメータを追加
     """
     複数のディレクトリ内の画像に対してバッチ推論を実行する
     
@@ -1441,7 +1707,8 @@ def batch_predict(dirs, model_path, tag_mapping_path, gen_threshold=0.45, char_t
         tag_mode: タグ保存モード ("overwrite"=上書き, "add"=既存タグに追加)
         remove_threshold: 既存タグを除去する閾値（Noneの場合は除去しない）
         skip_rating (bool): Rating タグの保存をスキップするかどうか ★追加★
-        skip_quality (bool): Quality タグの保存をスキップするかどうか ★追加★
+        skip_quality (bool): Quality タグの保存をスキップするかどうか
+        debug (bool): デバッグ出力を有効にするかどうか ★追加★
     """
     print(f"モデルを読み込み中: {model_path}")
     
@@ -1633,7 +1900,8 @@ def batch_predict(dirs, model_path, tag_mapping_path, gen_threshold=0.45, char_t
                                 mode=tag_mode,
                                 remove_threshold=remove_threshold,
                                 skip_rating=skip_rating,
-                                skip_quality=skip_quality
+                                skip_quality=skip_quality,
+                                debug=debug
                             )
                         elif output_mode == "json":
                             # output_pathは既に.jsonとして設定されている
@@ -1647,7 +1915,8 @@ def batch_predict(dirs, model_path, tag_mapping_path, gen_threshold=0.45, char_t
                                 mode=tag_mode,
                                 remove_threshold=remove_threshold,
                                 skip_rating=skip_rating,
-                                skip_quality=skip_quality
+                                skip_quality=skip_quality,
+                                debug=debug
                             )
                         
                         print(f"処理完了 [{batch_start+idx+1}/{total_images}]: {image_path}")
@@ -2211,6 +2480,9 @@ def main():
     parser.add_argument('--skip_rating', action='store_true', help='Ratingタグをタグファイルに保存しない')
     parser.add_argument('--skip_quality', action='store_true', help='Qualityタグをタグファイルに保存しない')
     
+    # デバッグオプション
+    parser.add_argument('--debug', action='store_true', help='デバッグ情報を表示')
+    
     args = parser.parse_args()
     
     if args.image:
@@ -2228,7 +2500,8 @@ def main():
             remove_threshold=args.remove_threshold,
             batch_size=args.batch_size,
             skip_rating=args.skip_rating,
-            skip_quality=args.skip_quality
+            skip_quality=args.skip_quality,
+            debug=args.debug
         )
     elif args.video:
         # 動画処理
@@ -2263,7 +2536,8 @@ def main():
             tag_mode=args.tag_mode,
             remove_threshold=args.remove_threshold,
             skip_rating=args.skip_rating,
-            skip_quality=args.skip_quality
+            skip_quality=args.skip_quality,
+            debug=args.debug
         )
 
 # GPUが利用可能かチェックする関数
