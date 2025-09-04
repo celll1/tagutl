@@ -4053,11 +4053,10 @@ def save_tag_mapping(output_dir, idx_to_tag, tag_to_category):
         normalized_tag = tag.replace(' ', '_').replace('\\(', '(').replace('\\)', ')')
         category = tag_to_category.get(normalized_tag, 'General')  # デフォルトはGeneral
         
-        # JSON用に適切にフォーマットされたタグを保存
-        formatted_tag = denormalize_tag_for_output(tag, 'json')
-        
+        # tag_mapping.json内では内部形式（アンダースコア + エスケープなし）で保存
+        # JSON.dumpが自動的にエスケープするので手動エスケープは不要
         tag_mapping[idx] = {
-            'tag': formatted_tag,
+            'tag': tag,  # 内部形式をそのまま保存
             'category': category
         }
     
